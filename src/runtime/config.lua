@@ -74,7 +74,7 @@ return function(env)
 			-- thing here nobody is watching.
 			unlimitedTurns = true,
 			toolConcurrency = 8,
-			toolTimeout = 60,
+			toolTimeout = 45,
 			-- Seconds one model call may run before the transport gives up. No Roblox
 			-- transport delivers a body incrementally, so a reasoning model that thinks
 			-- for ninety seconds produces nothing on the wire until it answers -- and the
@@ -86,7 +86,7 @@ return function(env)
 			-- is a turn spent for nothing. Subagents run the same loop as the conversation
 			-- the user is watching, so their model calls inherit this too -- a child stopped
 			-- mid-think by the transport is a dispatch wasted.
-			requestTimeout = 86400,
+			requestTimeout = 240,
 			-- The switch below is now the semantic one rather than the escape hatch: it
 			-- reads as "no deadline at all" and means the same day as the default does,
 			-- which is the honest bound -- a request nobody collects is indistinguishable
@@ -99,7 +99,7 @@ return function(env)
 			-- The share of a model's known context window at which older turns are
 			-- summarised. contextTokens above is the hard ceiling; this is what makes
 			-- compaction adapt to a small-window model without retuning that number.
-			contextFraction = 0.8,
+			contextFraction = 0.7,
 			keepTurns = 14,
 			compaction = true,
 			stream = true,
