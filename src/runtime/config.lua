@@ -235,12 +235,12 @@ return function(env)
 		stored = type(stored) == "table" and stored or {}
 		local data = util.merge(DEFAULTS, stored)
 		local version = tonumber(stored.version) or 0
-		-- Migrate only values that match the previous defaults. Explicit custom
+		-- Migrate values that match known previous defaults. Non-default custom
 		-- budgets are preserved, while existing installs receive the safer defaults.
 		if version < 2 then
 			local oldAgent = type(stored.agent) == "table" and stored.agent or {}
 			if tonumber(oldAgent.contextTokens) == 1000000 then data.agent.contextTokens = 48000 end
-			if tonumber(oldAgent.contextFraction) == 0.7 then data.agent.contextFraction = 0.5 end
+			if tonumber(oldAgent.contextFraction) == 0.7 or tonumber(oldAgent.contextFraction) == 0.8 then data.agent.contextFraction = 0.5 end
 			if tonumber(oldAgent.resultCap) == 128000 then data.agent.resultCap = 32000 end
 		end
 		data.version = 2
