@@ -75,23 +75,11 @@ return function(env)
 			unlimitedTurns = true,
 			toolConcurrency = 8,
 			toolTimeout = 45,
-			-- Seconds one model call may run before the transport gives up. No Roblox
-			-- transport delivers a body incrementally, so a reasoning model that thinks
-			-- for ninety seconds produces nothing on the wire until it answers -- and the
-			-- executor's own default timeout is sixty.
-			--
-			-- A day, and it is the highest default of any clock in this client: this is the
-			-- one deadline nothing else can rescue, because a subagent or a tool that hits
-			-- its own budget still gets its report collected, while a request that times out
-			-- is a turn spent for nothing. Subagents run the same loop as the conversation
-			-- the user is watching, so their model calls inherit this too -- a child stopped
-			-- mid-think by the transport is a dispatch wasted.
+			-- Configured per-request budget in seconds. Native HTTP is capped by the
+			-- transport layer, and Delta/executor transports may impose a shorter limit.
 			requestTimeout = 240,
-			-- The switch below is now the semantic one rather than the escape hatch: it
-			-- reads as "no deadline at all" and means the same day as the default does,
-			-- which is the honest bound -- a request nobody collects is indistinguishable
-			-- from a hung client. It exists so the slider can be lowered for a quick model
-			-- without losing the day the heavy one needs.
+			-- When enabled, adapters request an 86400-second budget and bypass the
+			-- configured requestTimeout. The transport or executor may still cap the wait.
 			requestUnlimited = true,
 			-- Large contexts increase upload and prefill time under executor HTTP
 			-- deadlines; lower this budget when even short replies time out.
