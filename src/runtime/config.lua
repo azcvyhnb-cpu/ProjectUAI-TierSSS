@@ -14,7 +14,7 @@ return function(env)
 	local FILE = "config.json"
 
 	local DEFAULTS = {
-		version = 1,
+		version = 2,
 		ui = {
 			density = "comfortable",
 			accent = "claude",
@@ -95,11 +95,11 @@ return function(env)
 			requestUnlimited = true,
 			-- Large contexts increase upload and prefill time under executor HTTP
 			-- deadlines; lower this budget when even short replies time out.
-			contextTokens = 1000000,
+			contextTokens = 48000,
 			-- The share of a model's known context window at which older turns are
 			-- summarised. contextTokens above is the hard ceiling; this is what makes
 			-- compaction adapt to a small-window model without retuning that number.
-			contextFraction = 0.7,
+			contextFraction = 0.5,
 			keepTurns = 14,
 			compaction = true,
 			stream = true,
@@ -119,12 +119,10 @@ return function(env)
 			forceReasoning = {},
 			forceContext = {},
 			maxTokens = 128000,
-			-- Characters, not tokens, and it is the last word on how much of a tool
-			-- result reaches the model. Eight thousand rather than four so that the
-			-- tools' own defaults -- a six thousand character file read, a five thousand
-			-- character response body -- arrive whole instead of being cut in half by a
-			-- limit set somewhere the caller cannot see.
-			resultCap = 128000,
+			-- Characters, not tokens. Keep tool output bounded so a large response does
+			-- not crowd out the user request and recent conversation. Tools that handle
+			-- source and large datasets expose paging/slicing for retrieving more detail.
+			resultCap = 32000,
 			repeatLimit = 3,
 			subagentDepth = 4,
 			subagentTurns = 30,
@@ -245,15 +243,29 @@ return function(env)
 
 	local flush
 
+	local function mergedConfig(stored)
+		stored = type(stored) == "table" and stored or {}
+		local data = util.merge(DEFAULTS, stored)
+		local version = tonumber(stored.version) or 0
+		-- Migrate only values that match the previous defaults. Explicit custom
+		-- budgets are preserved, while existing installs receive the safer defaults.
+		if version < 2 then
+			local oldAgent = type(stored.agent) == "table" and stored.agent or {}
+			if tonumber(oldAgent.contextTokens) == 1000000 then data.agent.contextTokens = 48000 end
+			if tonumber(oldAgent.contextFraction) == 0.7 then data.agent.contextFraction = 0.5 end
+			if tonumber(oldAgent.resultCap) == 128000 then data.agent.resultCap = 32000 end
+		end
+		data.version = 2
+		return data
+	end
+
 	function M.load()
 		local stored = fsx.readJson(FILE, nil)
-		if type(stored) == "table" then
-			M.data = util.merge(DEFAULTS, stored)
-		else
-			M.data = util.deepCopy(DEFAULTS)
-		end
+		local priorVersion = type(stored) == "table" and (tonumber(stored.version) or 0) or 2
+		M.data = type(stored) == "table" and mergedConfig(stored) or util.deepCopy(DEFAULTS)
 		M.loaded = true
 		M.changed:fire(nil, M.data)
+		if type(stored) == "table" and priorVersion < 2 then M.save() end
 		return M.data
 	end
 
@@ -301,7 +313,7 @@ return function(env)
 	-- live table, and subscribers see the complete new configuration in one event.
 	function M.replace(snapshot)
 		if type(snapshot) ~= "table" then return false, "configuration must be a table" end
-		local nextData = util.merge(DEFAULTS, snapshot)
+		local nextData = mergedConfig(snapshot)
 		if fsx.enabled then
 			local ok = fsx.writeJson(FILE, nextData)
 			if not ok then return false, "Could not save imported settings. Your current configuration is unchanged." end
