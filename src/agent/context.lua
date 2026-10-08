@@ -134,7 +134,7 @@ return function(env)
 			local window = model and env.require("provider/traits").contextWindow(model) or nil
 			if not window then return configured end
 			local fraction = tonumber(config.get("agent.contextFraction", 0.7)) or 0.7
-			if fraction ~= fraction then fraction = 0.8 end
+			if fraction ~= fraction then fraction = 0.5 end
 			fraction = math.max(0.3, math.min(fraction, 0.95))
 			return math.max(1000, math.min(configured, math.floor(window * fraction)))
 		end
