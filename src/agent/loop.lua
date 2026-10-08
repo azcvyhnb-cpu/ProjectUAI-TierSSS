@@ -32,11 +32,36 @@ return function(env)
 		return text
 	end
 
+	-- Canonicalise parsed argument objects before repeat detection. JSON key order and
+	-- insignificant whitespace must not let an identical tool batch evade the breaker.
+	local function canonicalValue(value, depth)
+		if type(value) ~= "table" then return util.encode(value) end
+		depth = (depth or 0) + 1
+		if depth > 32 then return util.encode(value) end
+		if next(value) == nil then return "{}" end
+		if util.isArray(value) then
+			local items = {}
+			for index, item in ipairs(value) do items[#items + 1] = canonicalValue(item, depth) end
+			return "[" .. table.concat(items, ",") .. "]"
+		end
+		local keys = {}
+		for key in pairs(value) do keys[#keys + 1] = key end
+		table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+		local fields = {}
+		for _, key in ipairs(keys) do
+			fields[#fields + 1] = util.encode(tostring(key)) .. ":" .. canonicalValue(value[key], depth)
+		end
+		return "{" .. table.concat(fields, ",") .. "}"
+	end
+
 	local function callSignature(calls)
 		local parts = {}
 		for _, call in ipairs(calls or {}) do
 			local fn = call["function"] or {}
-			parts[#parts + 1] = tostring(fn.name) .. "(" .. tostring(fn.arguments) .. ")"
+			local raw = fn.arguments or call.arguments or "{}"
+			local args = util.decode(raw)
+			local signatureArgs = type(args) == "table" and canonicalValue(args) or tostring(raw)
+			parts[#parts + 1] = tostring(fn.name or call.name) .. "(" .. signatureArgs .. ")"
 		end
 		table.sort(parts)
 		return table.concat(parts, "|")
