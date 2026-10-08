@@ -265,7 +265,7 @@ return function(env)
 
 		if aborted(spec) then return nil, "aborted", 0 end
 		if workers >= MAX_WORKERS then return nil, "deadline: native HTTP worker limit reached", 0 end
-		local deadline = math.min(tonumber(spec.deadlineMs) or math.huge, started + math.max(1, math.min(300, tonumber(spec.timeout) or 120)) * 1000)
+		local deadline = math.min(tonumber(spec.deadlineMs) or math.huge, started + math.max(1, math.min(240, tonumber(spec.timeout) or 120)) * 1000)
 		if deadline <= started then return nil, "deadline: request budget expired", 0 end
 		local pending = { done = false, accepting = true }
 		workers = workers + 1
