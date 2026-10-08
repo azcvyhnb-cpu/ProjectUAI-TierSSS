@@ -1,0 +1,264 @@
+-- Built-in provider presets.
+--
+-- A preset is a base URL and an auth style, nothing more. It deliberately does not
+-- carry a model list: the only authority on which models an endpoint serves is the
+-- endpoint, so models come from GET /v1/models or from the user typing one in. A
+-- hardcoded list goes stale, and offering a model the provider does not have wastes
+-- a turn on a 404 that looks like a bug.
+return function(env)
+	local M = {}
+
+	-- authStyle: bearer | x-api-key | api-key | both | none
+	--   both sends Authorization and x-api-key together, which is what several
+	--   self-hosted relays expect and what the reference client did unconditionally.
+	-- Reachability is derived from the configured URL, including custom endpoints.
+	-- RequestAsync refuses loopback and private addresses.
+	M.presets = {
+		{
+			id = "hcnsec",
+			label = "HCNSEC",
+			baseUrl = "https://api.hcnsec.cn/v1",
+			authStyle = "bearer",
+			keyHint = "sk-...",
+			-- The sign-up address, referral parameter included exactly as provided.
+			docs = "https://api.hcnsec.cn/sign-up?aff=drd9",
+			-- Featured: shown at the top of the providers panel as the recommended
+			-- place to start, so a first-run user has one obvious road.
+			featured = true,
+			note = "An OpenAI-compatible relay. Use the optional free community key in setup, or create an account and use your own key. Fetch the current models before choosing one.",
+		},
+		{
+			id = "agentrouter",
+			label = "AgentRouter",
+			-- The normaliser adds /v1; the Messages adapter appends /messages.
+			baseUrl = "https://agentrouter.org",
+			authStyle = "x-api-key",
+			keyHint = "AgentRouter API key",
+			docs = "https://agentrouter.org/register?aff=4pqF",
+			api = "anthropic",
+			headers = { ["anthropic-version"] = "2023-06-01" },
+			featured = true,
+			requiresClaude = true,
+			note = "An Anthropic Messages gateway that routes to Claude, DeepSeek and more, and requires the Claude Code identity on every request -- which this client always sends here. Registration needs a GitHub account at least 1 year old. Recommended model: deepseek-v4-flash.",
+			noteHighlight = "a GitHub account at least 1 year old",
+		},
+		{
+			id = "openai",
+			label = "OpenAI",
+			baseUrl = "https://api.openai.com/v1",
+			authStyle = "bearer",
+			keyHint = "sk-...",
+			docs = "https://platform.openai.com/api-keys",
+		},
+		{
+			id = "openrouter",
+			label = "OpenRouter",
+			baseUrl = "https://openrouter.ai/api/v1",
+			authStyle = "bearer",
+			keyHint = "sk-or-...",
+			docs = "https://openrouter.ai/keys",
+			-- OpenRouter reads both of these for attribution, and sending only one of
+			-- them is a shape no real client produces.
+			headers = {
+				["X-Title"] = "Project UAI",
+				["X-OpenRouter-Title"] = "Project UAI",
+				["HTTP-Referer"] = "https://carldv.github.io/ProjectUAI/",
+				["X-OpenRouter-Categories"] = "game,cli-agent",
+			},
+			claudeUa = false,
+			note = "Lists several hundred models. Fetch them and pick, or type the id shown on openrouter.ai.",
+		},
+		{
+			id = "zen",
+			label = "OpenCode Zen",
+			baseUrl = "https://opencode.ai/zen/v1",
+			authStyle = "bearer",
+			keyHint = "API key from opencode.ai/zen",
+			docs = "https://opencode.ai/zen",
+			-- Keep the existing OpenCode request compatibility headers, scoped to the
+			-- official host, without mixing in the Claude Code identity.
+			claudeUa = false,
+			-- Featured alongside HCNSEC: OpenCode's own relay, with free-tier models
+			-- and the compatibility headers the official client sends.
+			featured = true,
+			note = "OpenCode's relay with OpenCode-compatible request headers. Use your Zen key, fetch current models, and select a model supported by the configured API protocol.",
+		},
+		{
+			id = "azure-foundry",
+			label = "Azure AI Foundry",
+			-- The v1 surface rather than the per-deployment preview path: it speaks
+			-- /chat/completions and /models, so this client needs no adapter of its own.
+			-- The resource name is part of the URL the user has to edit.
+			baseUrl = "https://YOUR-RESOURCE.openai.azure.com/openai/v1",
+			authStyle = "api-key",
+			docs = "https://learn.microsoft.com/azure/ai-foundry/",
+			note = "The v1 endpoint of an Azure AI Foundry resource. Replace YOUR-RESOURCE, then fetch models or type a deployment name.",
+		},
+		{
+			id = "anthropic-messages",
+			label = "Anthropic (Messages API)",
+			baseUrl = "https://api.anthropic.com/v1",
+			authStyle = "x-api-key",
+			keyHint = "sk-ant-...",
+			docs = "https://console.anthropic.com/settings/keys",
+			-- The native API rather than the compatibility shim: thinking blocks and
+			-- tool_use content survive the round trip, and nothing is being translated
+			-- twice on the way through someone else's adapter.
+			api = "anthropic",
+			note = "Anthropic's own Messages API. Preferred over the OpenAI-compatible route: reasoning and tool calls arrive in their real shape.",
+		},
+		{
+			id = "anthropic",
+			label = "Anthropic (OpenAI-compatible)",
+			baseUrl = "https://api.anthropic.com/v1",
+			authStyle = "x-api-key",
+			keyHint = "sk-ant-...",
+			docs = "https://console.anthropic.com/settings/keys",
+			-- The compatibility route wants the version header; it is harmless
+			-- elsewhere but only defaulted on here.
+			headers = { ["anthropic-version"] = "2023-06-01" },
+			note = "Anthropic's OpenAI-compatible endpoint. Tool calling works; some sampling fields are ignored.",
+		},
+		{
+			id = "google",
+			label = "Google Gemini",
+			-- Google's OpenAI-compatible surface rather than generateContent: it speaks
+			-- /chat/completions and /models, so it needs no adapter of its own. The
+			-- path is part of the base URL here, which normaliseBaseUrl leaves alone.
+			baseUrl = "https://generativelanguage.googleapis.com/v1beta/openai",
+			authStyle = "bearer",
+			keyHint = "AIza...",
+			docs = "https://aistudio.google.com/apikey",
+			note = "Gemini through Google's OpenAI-compatible endpoint. Tool calling works. The native generateContent API is not implemented.",
+		},
+		{
+			id = "groq",
+			label = "Groq",
+			baseUrl = "https://api.groq.com/openai/v1",
+			authStyle = "bearer",
+			keyHint = "gsk_...",
+			docs = "https://console.groq.com/keys",
+		},
+		{
+			id = "deepseek",
+			label = "DeepSeek",
+			baseUrl = "https://api.deepseek.com/v1",
+			authStyle = "bearer",
+			keyHint = "sk-...",
+			docs = "https://platform.deepseek.com/api_keys",
+			note = "Reasoning models here stream their chain of thought as reasoning_content, which the transcript shows separately.",
+		},
+		{
+			id = "together",
+			label = "Together AI",
+			baseUrl = "https://api.together.xyz/v1",
+			authStyle = "bearer",
+			docs = "https://api.together.ai/settings/api-keys",
+		},
+		{
+			id = "mistral",
+			label = "Mistral",
+			baseUrl = "https://api.mistral.ai/v1",
+			authStyle = "bearer",
+			docs = "https://console.mistral.ai/api-keys",
+		},
+		{
+			id = "xai",
+			label = "xAI",
+			baseUrl = "https://api.x.ai/v1",
+			authStyle = "bearer",
+			keyHint = "xai-...",
+			docs = "https://console.x.ai",
+		},
+		{
+			id = "fireworks",
+			label = "Fireworks",
+			baseUrl = "https://api.fireworks.ai/inference/v1",
+			authStyle = "bearer",
+			docs = "https://fireworks.ai/api-keys",
+		},
+		{
+			id = "cerebras",
+			label = "Cerebras",
+			baseUrl = "https://api.cerebras.ai/v1",
+			authStyle = "bearer",
+			docs = "https://cloud.cerebras.ai",
+		},
+		{
+			id = "azure",
+			label = "Azure OpenAI",
+			baseUrl = "https://YOUR-RESOURCE.openai.azure.com/openai/deployments/YOUR-DEPLOYMENT",
+			authStyle = "api-key",
+			docs = "https://learn.microsoft.com/azure/ai-services/openai/",
+			query = { ["api-version"] = "2024-10-21" },
+			note = "The base URL must include the deployment path. Azure takes the model from the deployment, so the model field is not sent.",
+		},
+		{
+			id = "ollama",
+			label = "Ollama (local)",
+			baseUrl = "http://127.0.0.1:11434/v1",
+			authStyle = "none",
+			claudeUa = false,
+			docs = "https://docs.ollama.com/api/openai-compatibility",
+			note = "Uses Ollama's OpenAI-compatible /v1 API, not its native /api/chat route. Local models need no key. Tools depend on the selected model; local access needs executor HTTP.",
+		},
+		{
+			id = "lmstudio",
+			label = "LM Studio (local)",
+			baseUrl = "http://127.0.0.1:1234/v1",
+			authStyle = "none",
+			claudeUa = false,
+			docs = "https://lmstudio.ai/docs/developer/openai-compat",
+			note = "Start the LM Studio server, then fetch models. If server authentication is enabled, select Bearer and enter its token. Tools depend on the model and chat template.",
+		},
+		{
+			id = "vllm",
+			label = "vLLM / self-hosted",
+			baseUrl = "http://127.0.0.1:8000/v1",
+			authStyle = "none",
+			claudeUa = false,
+			docs = "https://docs.vllm.ai/en/latest/serving/online_serving/",
+			note = "No key by default; select Bearer if the server uses --api-key. Automatic tools need the server's tool-call parser, chat template and enable-auto-tool-choice settings.",
+		},
+		{
+			id = "llamacpp",
+			label = "llama.cpp (local)",
+			baseUrl = "http://127.0.0.1:8080/v1",
+			authStyle = "none",
+			claudeUa = false,
+			docs = "https://github.com/ggml-org/llama.cpp/tree/master/tools/server",
+			note = "Use llama-server's /v1 API. Select Bearer if --api-key is set. Tool calling needs a compatible model and chat template, often with --jinja.",
+		},
+		{
+			id = "sglang",
+			label = "SGLang / self-hosted",
+			baseUrl = "http://127.0.0.1:30000/v1",
+			authStyle = "none",
+			claudeUa = false,
+			docs = "https://docs.sglang.io/docs/basic_usage/openai_api_completions.md",
+			note = "Use the server's OpenAI-compatible API. Select Bearer when authentication is configured. Tool support depends on the model, template and server tool-call parser.",
+		},
+		{
+			id = "custom",
+			label = "Custom endpoint",
+			baseUrl = "",
+			authStyle = "bearer",
+			note = "An endpoint implementing Chat Completions or Anthropic Messages. Choose its protocol and auth style; enter a model id if discovery is unavailable.",
+		},
+	}
+
+	function M.get(id)
+		for _, preset in ipairs(M.presets) do
+			if preset.id == id then return preset end
+		end
+		return nil
+	end
+
+	function M.ids()
+		local out = {}
+		for _, preset in ipairs(M.presets) do out[#out + 1] = preset.id end
+		return out
+	end
+
+	return M
+end

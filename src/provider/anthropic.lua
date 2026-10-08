@@ -1,0 +1,679 @@
+-- The Anthropic Messages adapter.
+--
+-- Same contract as provider/openai: one request in, one normalised result out. The
+-- wire format is a different API rather than a dialect of the same one -- the system
+-- prompt is hoisted to a top-level field, a tool declares `input_schema` instead of
+-- nesting under `function`, a tool call arrives as a `tool_use` content block, and
+-- its result goes back as a `tool_result` block inside a USER turn. All of that
+-- conversion lives here so the context store, the loop and the transcript keep
+-- speaking one internal shape.
+--
+-- Deliberately absent from the body: `temperature`, `top_p` and `top_k`. They were
+-- removed on Opus 4.7 and answer 400 on every model since, and this client's
+-- default is an Opus 5. A record that needs them on an older Claude can set them
+-- through `record.params`, which is spread in last.
+return function(env)
+	local util = env.require("runtime/util")
+	local config = env.require("runtime/config")
+	local clock = env.require("runtime/clock")
+	local log = env.require("runtime/log")
+	local http = env.require("net/http")
+	local sse = env.require("net/sse")
+	local registry = env.require("provider/registry")
+	local proxy = env.require("provider/proxy")
+	local openai = env.require("provider/openai")
+	local traits = env.require("provider/traits")
+	local headerMap = env.require("net/headers")
+
+	local M = {}
+
+	-- Requested budget; native HTTP caps its wait at 300 seconds and the executor
+	-- or provider may impose a shorter deadline.
+	local function requestTimeout(request)
+		if request.timeout then return request.timeout end
+		if config.get("agent.requestUnlimited", false) then return 86400 end
+		return config.get("agent.requestTimeout", 86400)
+	end
+
+	-- The executor's transport wall, answered with a smaller ask. Same reasoning as
+	-- the chat adapter: executors may hard-cap HTTP at thirty or sixty seconds
+	-- and ignore the Timeout option entirely, so no config value lifts that wall. A
+	-- model that thinks for ninety seconds finishes inside sixty when asked to think
+	-- less. The effort lives in `output_config.effort` on this wire; the reply ceiling
+	-- is `max_tokens`, which is mandatory here.
+	local function smallerAsk(body)
+		local changes = {}
+		local lowered = util.copy(body)
+
+		local order = { "low", "medium", "high", "xhigh", "max" }
+		local current = 0
+		for index, level in ipairs(order) do
+			if level == tostring(body.output_config and body.output_config.effort or "") then current = index break end
+		end
+		if current > 1 then
+			lowered.output_config = util.copy(body.output_config)
+			lowered.output_config.effort = order[current - 1]
+			changes[#changes + 1] = "effort " .. order[current - 1]
+		end
+
+		local ceiling = tonumber(body.max_tokens)
+		if ceiling and ceiling > 4000 then
+			lowered.max_tokens = math.floor(ceiling / 2)
+			changes[#changes + 1] = "max_tokens " .. lowered.max_tokens
+		end
+
+		if #changes == 0 then return nil end
+		return lowered, table.concat(changes, ", ")
+	end
+
+
+	local VERSION = "2023-06-01"
+
+	-- Anthropic stop reasons mapped onto the finish reasons the loop already reads,
+	-- so nothing downstream has to learn a second vocabulary.
+	local FINISH = {
+		end_turn = "stop",
+		stop_sequence = "stop",
+		pause_turn = "stop",
+		max_tokens = "length",
+		tool_use = "tool_calls",
+		refusal = "refusal",
+	}
+
+	function M.endpoint(record)
+		return registry.endpoint(record, "/messages")
+	end
+
+	function M.headers(record, explicitKey)
+		-- Native Anthropic presets select x-api-key. Explicit bearer auth is useful
+		-- for compatible Messages gateways and must remain a real choice.
+		local authRecord = record
+		if record.authStyle == nil then authRecord = util.copy(record); authRecord.authStyle = "x-api-key" end
+		return headerMap.merge(registry.authHeaders(authRecord, explicitKey), { ["anthropic-version"] = VERSION }, record.headers)
+	end
+
+	-- Internal messages are OpenAI-shaped. Anthropic wants the system prompt lifted
+	-- out, tool results carried inside user turns, and every result for one assistant
+	-- turn merged into a SINGLE user message -- splitting them across several is
+	-- documented to train the model out of calling tools in parallel.
+	function M.wireMessages(messages)
+		local system, out = {}, {}
+
+		local function push(role, content)
+			out[#out + 1] = { role = role, content = content }
+		end
+
+		for _, message in ipairs(messages or {}) do
+			local role = message.role
+			if role == "system" then
+				local text = util.trim(tostring(message.content or ""))
+				if text ~= "" then system[#system + 1] = text end
+			elseif role == "tool" then
+				local block = {
+					type = "tool_result",
+					tool_use_id = message.tool_call_id,
+					content = tostring(message.content or ""),
+				}
+				local last = out[#out]
+				if last and last.role == "user" and type(last.content) == "table"
+					and last.content[1] and last.content[1].type == "tool_result" then
+					last.content[#last.content + 1] = block
+				else
+					push("user", { block })
+				end
+			elseif role == "assistant" then
+				if type(message.raw) == "table" and #message.raw > 0 then
+					-- Replayed verbatim. Thinking blocks in particular have to come back
+					-- unchanged on the same model -- they carry a signature that cannot
+					-- be rebuilt -- and reassembling them from text would not be
+					-- unchanged. The one repair is a tool_use input that decoded to an
+					-- empty table, which would re-encode as [] and be rejected.
+					local blocks = {}
+					for index, block in ipairs(message.raw) do
+						if type(block) == "table" and block.type == "tool_use"
+							and (type(block.input) ~= "table" or util.count(block.input) == 0) then
+							blocks[index] = util.merge(block, { input = util.emptyObject() })
+						else
+							blocks[index] = block
+						end
+					end
+					push("assistant", blocks)
+				else
+					local blocks = {}
+					local text = tostring(message.content or "")
+					if util.trim(text) ~= "" then
+						blocks[#blocks + 1] = { type = "text", text = text }
+					end
+					for _, call in ipairs(message.toolCalls or {}) do
+						local fn = call["function"] or {}
+						local input = util.decode(fn.arguments or call.arguments or "{}")
+						-- `input` is a schema-shaped object, so an empty one has to encode
+						-- as {} rather than as [].
+						if type(input) ~= "table" or util.count(input) == 0 then
+							input = util.emptyObject()
+						end
+						blocks[#blocks + 1] = {
+							type = "tool_use",
+							id = call.id,
+							name = fn.name or call.name,
+							input = input,
+						}
+					end
+					if #blocks > 0 then push("assistant", blocks) end
+				end
+			else
+				push("user", env.require("runtime/images").anthropic(message.content, message.images))
+			end
+		end
+
+		-- The API requires the first turn to be a user one.
+		if out[1] and out[1].role ~= "user" then
+			table.insert(out, 1, { role = "user", content = "Continue." })
+		end
+		return out, table.concat(system, "\n\n")
+	end
+
+	-- A tool definition loses its `function` wrapper and its schema is renamed.
+	function M.wireTools(tools)
+		local out = {}
+		for _, definition in ipairs(tools or {}) do
+			local fn = definition["function"] or definition
+			if fn.name then
+				out[#out + 1] = {
+					name = fn.name,
+					description = fn.description,
+					input_schema = fn.parameters or fn.input_schema or util.emptyObject(),
+				}
+			end
+		end
+		return out
+	end
+
+	function M.buildBody(record, request)
+		local messages, system = M.wireMessages(request.messages)
+		-- Clamped to whatever this record's model was last told it allows, which is
+		-- shared with the chat-completions adapter because the lesson is the same one.
+		local maxTokens = openai.cappedMaxTokens(record,
+			request.maxTokens or config.get("agent.maxTokens", 4096))
+		local body = {
+			model = record.model,
+			messages = messages,
+			-- Required here, unlike chat completions, and it must be positive.
+			max_tokens = (maxTokens and maxTokens > 0) and maxTokens or 4096,
+		}
+		if system ~= "" then body.system = system end
+		local tools = M.wireTools(request.tools)
+		if #tools > 0 then body.tools = tools end
+		if request.stream then body.stream = true end
+
+		-- Reasoning. Adaptive is the only shape the current generations accept: a
+		-- fixed `budget_tokens` was removed after 4.6 and answers 400 on everything
+		-- since. `display` is the part that matters to a client with a transcript --
+		-- it defaults to omitted, so the thinking blocks arrive with empty text, and a
+		-- client that never asks for a summary looks like it has no reasoning support
+		-- at all rather than like one that was never told to show any.
+		if traits.thinkingStyle(record.model) == "adaptive" then
+			body.thinking = {
+				type = "adaptive",
+				display = (config.get("ui.showReasoning", true) ~= false) and "summarized" or "omitted",
+			}
+		end
+
+		-- Depth, on the wire field the Messages API uses for it. Same setting and same
+		-- clamping as the chat-completions adapter, which spells it differently.
+		local effort = openai.effortFor(record, request)
+		if effort then body.output_config = { effort = effort } end
+
+		for key, value in pairs(record.params or {}) do body[key] = value end
+		for key, value in pairs(request.extra or {}) do body[key] = value end
+		-- This adapter has no WebSocket path; SSE here still arrives over HTTP.
+		return body
+	end
+
+	-- Anthropic reports failures as {"type":"error","error":{"type":...,"message":...}},
+	-- which is the shape provider/openai already extracts, so the status-to-prose
+	-- table and the empty-body handling are shared rather than duplicated.
+	function M.errorText(res, err)
+		return openai.errorText(res, err)
+	end
+
+	local function normaliseUsage(usage)
+		usage = usage or {}
+		local input = usage.input_tokens or 0
+		local output = usage.output_tokens or 0
+		-- Renamed to the OpenAI keys the usage panel reads, originals kept alongside.
+		return {
+			prompt_tokens = input,
+			completion_tokens = output,
+			total_tokens = input + output,
+			cache_read_input_tokens = usage.cache_read_input_tokens,
+			cache_creation_input_tokens = usage.cache_creation_input_tokens,
+		}
+	end
+
+	-- One whole Anthropic message -> the result shape provider/openai returns.
+	function M.fromMessage(decoded)
+		local content, reasoning, calls = {}, {}, {}
+		for _, block in ipairs(decoded.content or {}) do
+			if type(block) == "table" then
+				if block.type == "text" and type(block.text) == "string" then
+					content[#content + 1] = block.text
+				elseif block.type == "thinking" and type(block.thinking) == "string" then
+					reasoning[#reasoning + 1] = block.thinking
+				elseif block.type == "tool_use" then
+					calls[#calls + 1] = {
+						id = block.id,
+						type = "function",
+						["function"] = {
+							name = block.name,
+							arguments = util.encode(block.input or util.emptyObject()),
+						},
+					}
+				end
+			end
+		end
+		return {
+			role = "assistant",
+			content = table.concat(content),
+			reasoning = table.concat(reasoning),
+			toolCalls = calls,
+			finish = FINISH[tostring(decoded.stop_reason or "")] or decoded.stop_reason,
+			stopReason = decoded.stop_reason,
+			model = decoded.model,
+			id = decoded.id,
+			usage = normaliseUsage(decoded.usage),
+			-- Kept so the next turn can replay this assistant message byte for byte.
+			raw = decoded.content,
+			chunks = 0,
+			frames = 0,
+		}
+	end
+
+	-- The streamed form. Frame splitting is shared with net/sse -- that part is the
+	-- SSE spec, not a vendor decision -- but the events inside are Anthropic's own:
+	-- message_start, content_block_start/delta/stop, message_delta, message_stop.
+	local function parseStream(body)
+		local content, reasoning = {}, {}
+		local slots, order = {}, {}
+		local model, id, usage, stop, streamError
+		local frameCount = 0
+		local done = false
+		local function validIndex(index)
+			if index ~= nil and (type(index) ~= "number" or index < 0 or index > 1024 or index ~= math.floor(index)) then error("invalid block index", 0) end
+		end
+
+		local function slotFor(index)
+			validIndex(index)
+			local key = tostring(index or 0)
+			if not slots[key] then
+				if #order >= sse.limits.calls then error("tool call limit", 0) end
+				slots[key] = { index = tonumber(index) or 0, json = {}, bytes = 0 }
+				order[#order + 1] = key
+			end
+			return slots[key]
+		end
+
+		-- Thinking is collected per block rather than only as flat text, because a
+		-- thinking block carries a signature and the next turn has to hand both back
+		-- exactly as they arrived. Rebuilding one from its text would produce a block
+		-- the API cannot verify, and dropping it -- which this path used to do -- makes
+		-- extended thinking unusable the moment a turn calls a tool.
+		local thinking, thinkingOrder = {}, {}
+
+		local function thinkingFor(index)
+			validIndex(index)
+			local key = tostring(index or 0)
+			if not thinking[key] then
+				if #thinkingOrder >= sse.limits.calls then error("thinking block limit", 0) end
+				thinking[key] = { index = tonumber(index) or 0, text = {} }
+				thinkingOrder[#thinkingOrder + 1] = key
+			end
+			return thinking[key]
+		end
+
+		local decoder = sse.decoder(function(frame)
+			frameCount = frameCount + 1
+			local payload = util.trim(frame.data)
+			if payload ~= "" and payload ~= "[DONE]" then
+				local event = util.decode(payload)
+				if type(event) == "table" then
+					local kind = event.type or frame.event
+					if kind == "error" then
+						streamError = "malformed_stream: provider reported a stream error"
+					elseif kind == "message_stop" then done = true
+					elseif kind == "message_start" and type(event.message) == "table" then
+						model, id, usage = event.message.model, event.message.id, event.message.usage
+					elseif kind == "content_block_start" and type(event.content_block) == "table" then
+						local block = event.content_block
+						if block.type == "tool_use" then
+							local slot = slotFor(event.index)
+							slot.id, slot.name = block.id, block.name
+							if type(block.input) == "table" and next(block.input) ~= nil then
+								slot.input = util.encode(block.input)
+								if #slot.input > sse.limits.arguments then error("tool argument limit", 0) end
+							end
+						elseif block.type == "text" and type(block.text) == "string" and block.text ~= "" then
+							content[#content + 1] = block.text
+						elseif block.type == "thinking" then
+							local slot = thinkingFor(event.index)
+							if type(block.thinking) == "string" and block.thinking ~= "" then
+								slot.text[#slot.text + 1] = block.thinking
+								reasoning[#reasoning + 1] = block.thinking
+							end
+							if type(block.signature) == "string" then slot.signature = block.signature end
+						elseif block.type == "redacted_thinking" then
+							-- Nothing to show and nothing to read, but it still has to be
+							-- replayed: the turn it belongs to is incomplete without it.
+							thinkingFor(event.index).redacted = block.data
+						end
+					elseif kind == "content_block_delta" and type(event.delta) == "table" then
+						local delta = event.delta
+						if delta.type == "text_delta" and type(delta.text) == "string" then
+							content[#content + 1] = delta.text
+						elseif delta.type == "thinking_delta" and type(delta.thinking) == "string" then
+							reasoning[#reasoning + 1] = delta.thinking
+							local slot = thinkingFor(event.index)
+							slot.text[#slot.text + 1] = delta.thinking
+						elseif delta.type == "signature_delta" and type(delta.signature) == "string" then
+							local slot = thinkingFor(event.index)
+							slot.signature = (slot.signature or "") .. delta.signature
+						elseif delta.type == "input_json_delta" and type(delta.partial_json) == "string" then
+							local slot = slotFor(event.index)
+							if slot.input and delta.partial_json ~= "" then error("mixed object and fragmented tool input", 0) end
+							slot.bytes = slot.bytes + #delta.partial_json
+							if slot.bytes > sse.limits.arguments then error("tool argument limit", 0) end
+							slot.json[#slot.json + 1] = delta.partial_json
+						end
+					elseif kind == "message_delta" then
+						if type(event.delta) == "table" and event.delta.stop_reason then
+							stop = event.delta.stop_reason
+						end
+						if type(event.usage) == "table" then
+							usage = usage and util.merge(usage, event.usage) or event.usage
+						end
+					end
+				else streamError = "malformed_stream: invalid JSON frame" end
+			end
+			return true
+		end)
+		local pushed, why = decoder.push(body)
+		if pushed then pushed, why = decoder.finish() end
+		streamError = streamError or why
+
+		local text = table.concat(content)
+		local calls, raw = {}, {}
+
+		-- Thinking leads the content array, and the order is not cosmetic: a replayed
+		-- assistant turn has to present its thinking before its text and its tool calls.
+		table.sort(thinkingOrder, function(a, b) return thinking[a].index < thinking[b].index end)
+		for _, key in ipairs(thinkingOrder) do
+			local slot = thinking[key]
+			if slot.redacted ~= nil then
+				raw[#raw + 1] = { type = "redacted_thinking", data = slot.redacted }
+			elseif slot.signature and slot.signature ~= "" then
+				-- Only a signed block is worth replaying. An unsigned one cannot be
+				-- verified, so sending it back is a refusal where omitting it is merely
+				-- an incomplete record of the turn.
+				raw[#raw + 1] = {
+					type = "thinking",
+					thinking = table.concat(slot.text),
+					signature = slot.signature,
+				}
+			end
+		end
+
+		if util.trim(text) ~= "" then raw[#raw + 1] = { type = "text", text = text } end
+		table.sort(order, function(a, b) return slots[a].index < slots[b].index end)
+		for _, key in ipairs(order) do
+			local slot = slots[key]
+			if slot.name then
+				local arguments = slot.input or table.concat(slot.json)
+				if util.trim(arguments) == "" then arguments = "{}" end
+				calls[#calls + 1] = {
+					id = slot.id or ("toolu_" .. tostring(slot.index)),
+					type = "function",
+					["function"] = { name = slot.name, arguments = arguments },
+				}
+				local input = util.decode(arguments)
+				if type(input) ~= "table" or util.count(input) == 0 then input = util.emptyObject() end
+				raw[#raw + 1] = { type = "tool_use", id = slot.id, name = slot.name, input = input }
+			end
+		end
+
+		return {
+			role = "assistant",
+			content = text,
+			reasoning = table.concat(reasoning),
+			toolCalls = calls,
+			finish = FINISH[tostring(stop or "")] or stop,
+			stopReason = stop,
+			model = model,
+			id = id,
+			usage = normaliseUsage(usage),
+			raw = raw,
+			chunks = frameCount,
+			frames = frameCount,
+			streamError = streamError or (not done and not stop and "malformed_stream: stream ended before completion" or nil),
+		}
+	end
+	function M.parseStream(body)
+		local ok, result = pcall(parseStream, body)
+		if ok then return result end
+		return { role = "assistant", content = "", reasoning = "", toolCalls = {}, raw = {}, chunks = 0, frames = 0,
+			streamError = "malformed_stream: invalid chunk or stream budget exceeded" }
+	end
+
+	-- Performs one completion against one provider. Same return contract as
+	-- provider/openai: result, nil on success or nil, message, res on failure, so the
+	-- chain in agent/loop cannot tell the two adapters apart.
+	--
+	-- A record with several keys rotates on a 429 or quota refusal with no sleep
+	-- between keys, exactly as the chat adapter does: the next key's quota is
+	-- untouched, so waiting would only spend the deadline the reply still needs.
+	local function quotaRefusal(res)
+		if not res then return false end
+		if res.status == 429 then return true end
+		if res.status == 402 or res.status == 403 then
+			local body = tostring(res.body or ""):lower()
+			if body:find("resource_exhausted", 1, true) then return true end
+			if body:find("quota", 1, true) then return true end
+			if body:find("rate limit", 1, true) then return true end
+		end
+		return false
+	end
+
+	function M.complete(record, request)
+		local problem = registry.protocolProblem(record)
+		if problem then return nil, problem end
+		request = util.copy(request or {})
+		if request.onRetry then
+			local callback = request.onRetry
+			request.onRetry = function(info) if not pcall(callback, info) then log.warn("provider", "retry callback failed safely") end end
+		end
+		local wantStream = request.stream
+		if wantStream == nil then
+			wantStream = record.stream ~= false and config.get("agent.stream", true)
+		end
+		if config.get("bridge.enabled", false) and config.get("bridge.runtime", "game") == "web" then wantStream = true end
+
+		local body = M.buildBody(record, util.merge(request, { stream = wantStream }))
+		local requestScope = registry.compatibilityKey(record)
+		local url = M.endpoint(record)
+		local pool = registry.keysOf(record)
+		local currentKey = nil
+
+		local function rebuildHeaders()
+			if #pool > 1 then currentKey = registry.nextKey(record) end
+			return headerMap.merge(M.headers(record, currentKey), registry.opencodeHeaders(record, request),
+				{ Accept = body.stream and "text/event-stream" or "application/json" })
+		end
+
+		local headers = rebuildHeaders()
+
+		local started = clock.ms()
+		local deadline = started + math.max(1, math.min(300, tonumber(requestTimeout(request)) or 120)) * 1000
+		local recovery = proxy.new(record, { aborted = request.aborted, onRetry = request.onRetry, deadlineMs = deadline })
+		local lastRequestMs = 0
+		local rotationsLeft = math.max(#pool - 1, 0)
+		-- Same as the chat adapter: with a pool, a 429 is rotation's to answer, not
+		-- the transport's to sleep on.
+		local skip429 = (#pool > 1) and { [429] = true } or nil
+
+		local function fire(payload)
+			if registry.compatibilityKey(record) ~= requestScope then return nil, "aborted" end
+			if clock.ms() >= deadline then return nil, "deadline: request budget expired" end
+			local requestStarted = clock.ms()
+			local res, err = http.send({
+				relay = env.require("runtime/images").hasReferences(request.messages)
+					or (config.get("bridge.enabled", false) and config.get("bridge.runtime", "game") == "web"),
+				sessionId = request.sessionId,
+				url = url,
+				method = "POST",
+				headers = headers,
+				body = util.encode(payload),
+				identity = registry.identityFor(record),
+				identityRequired = registry.requiresClaude(record),
+				attempts = request.attempts or config.get("agent.retries", 5),
+				skipStatus = skip429,
+				aborted = request.aborted,
+				onRetry = request.onRetry,
+				tag = "messages:" .. record.id,
+				-- Same reasoning as the chat adapter: a thinking model emits nothing
+				-- until it answers, so the wall has to outlast the think.
+				timeout = requestTimeout(request),
+				deadlineMs = deadline,
+			})
+			lastRequestMs = clock.since(requestStarted)
+			if request.aborted and request.aborted() then return nil, "aborted" end
+			if recovery.recover(res, err) then
+				requestScope = registry.compatibilityKey(record)
+				url = M.endpoint(record)
+				headers = rebuildHeaders()
+				return fire(payload)
+			end
+			return res, err
+		end
+
+		local function fireWithRotation(payload)
+			local res, err = fire(payload)
+			while res and not res.ok and quotaRefusal(res) and rotationsLeft > 0 do
+				rotationsLeft = rotationsLeft - 1
+				registry.cooldownKey(record, currentKey or pool[1])
+				headers = rebuildHeaders()
+				local index = 0
+				for position, key in ipairs(pool) do
+					if key == currentKey then index = position end
+				end
+				local label = "rate limited, rotating to key #" .. index
+				log.info("provider", record.label .. ": " .. label)
+				if request.onRetry then
+					request.onRetry({ attempt = 1, attempts = 2, wait = 0, reason = label, status = res.status })
+				end
+				res, err = fire(payload)
+			end
+			return res, err
+		end
+
+		local res, err = fireWithRotation(body)
+
+		-- max_tokens is mandatory on this API and its limit is per model, so a reply
+		-- ceiling chosen for the widest Claude is a hard 400 on a narrower one -- and
+		-- there is no alternative shape to fall back to, the way chat completions can
+		-- rename a field. Lower it to the number the refusal names, try once more, and
+		-- keep it on the record so no later turn pays for the lesson twice. One retry:
+		-- a second refusal is a different problem and belongs in the transcript.
+		if res and res.status == 400 and tonumber(body.max_tokens) then
+			local message = M.errorText(res, nil)
+			if not openai.isContextError(message) and tostring(message):lower():find("max_tokens", 1, true) then
+				local allowed = openai.ceilingFromMessage(message, body.max_tokens)
+				if allowed and allowed < body.max_tokens then
+					local note = string.format("lowered max_tokens from %d to %d", body.max_tokens, allowed)
+					log.info("provider", record.label .. ": " .. note .. ", retrying")
+					body.max_tokens = allowed
+					if registry.compatibilityKey(record) == requestScope then openai.rememberMaxTokens(record, allowed) end
+					if request.onRetry then
+						request.onRetry({ attempt = 1, attempts = 2, wait = 0, reason = note, status = 400 })
+					end
+					res, err = fireWithRotation(body)
+				end
+			end
+		end
+
+		-- The executor's transport wall: no body, no headers, an executor raise for
+		-- the error text. Same one smaller-ask retry as the chat adapter, so a model
+		-- can finish inside the wall. Only after 20-130 seconds without a response,
+		-- and only when the smaller ask is actually smaller.
+		local recoveredTokens
+		if not res and err and not http.terminal(err) and lastRequestMs >= 20000 and lastRequestMs <= 130000 then
+			local lowered, note = smallerAsk(body)
+			if lowered and util.encode(lowered) ~= util.encode(body) then
+				log.info("provider", record.label .. ": hit the transport wall, retrying smaller (" .. note .. ")")
+				if request.onRetry then
+					request.onRetry({ attempt = 1, attempts = 2, wait = 0, reason = note, status = 0 })
+				end
+				res, err = fireWithRotation(lowered)
+				if res and res.ok then recoveredTokens = lowered.max_tokens end
+			end
+		end
+
+		if not res or not res.ok then
+			if registry.compatibilityKey(record) == requestScope then openai.learnContextWindow(record, res) end
+			local message = M.errorText(res, err)
+			registry.markFail(record, message)
+			return nil, message, res
+		end
+
+		local parsed
+		if sse.looksStreamed(res.body) then
+			parsed = M.parseStream(res.body)
+		else
+			local decoded, decodeErr = util.decode(res.body)
+			if type(decoded) ~= "table" then
+				local message = "provider returned a body that is not JSON: " .. tostring(decodeErr)
+				registry.markFail(record, message)
+				return nil, message, res
+			end
+			if decoded.type == "error" or decoded.error then
+				local message = M.errorText(res, nil)
+				registry.markFail(record, message)
+				return nil, message, res
+			end
+			parsed = M.fromMessage(decoded)
+		end
+
+		if parsed.streamError then
+			registry.markFail(record, parsed.streamError)
+			return nil, "stream error: " .. parsed.streamError, res
+		end
+
+		-- A policy refusal is a 200 with nothing to act on, so it is reported as the
+		-- reason rather than as an empty completion.
+		if parsed.stopReason == "refusal" then
+			local message = "the model declined this request (stop_reason refusal)"
+			registry.markFail(record, message)
+			return nil, message, res
+		end
+
+		local hasText = util.trim(parsed.content) ~= ""
+		local hasCalls = #(parsed.toolCalls or {}) > 0
+		if not hasText and not hasCalls and util.trim(parsed.reasoning) == "" then
+			local message = "the provider returned an empty completion"
+			registry.markFail(record, message)
+			return nil, message, res
+		end
+
+		if recoveredTokens and registry.compatibilityKey(record) == requestScope then
+			openai.rememberMaxTokens(record, recoveredTokens)
+			log.info("provider", record.label .. ": smaller request succeeded; remembered max_tokens " .. tostring(recoveredTokens))
+		end
+		parsed.ms = clock.since(started)
+		parsed.provider = record.id
+		parsed.providerLabel = record.label
+		parsed.via = res.via
+		parsed.requestId = res.inferenceId
+		parsed.streamed = (parsed.frames or 0) > 0
+		registry.markOk(record, parsed.ms)
+		return parsed, nil, res
+	end
+	return M
+end

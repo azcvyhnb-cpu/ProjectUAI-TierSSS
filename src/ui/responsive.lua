@@ -1,0 +1,494 @@
+-- Responsiveness.
+--
+-- The reference client decided phone-or-desktop once at boot from
+-- TouchEnabled-and-not-KeyboardEnabled, and baked two tables of pixel metrics off
+-- that. It gets the common cases right and everything else wrong: a tablet, a
+-- phone that rotates, a desktop window resized to half width, a console, a device
+-- with both touch and a keyboard.
+--
+-- This module holds no metrics. It reports what the viewport is right now and
+-- republishes when that changes, so a surface either adapts continuously (scale
+-- based layout, list layouts, automatic sizing) or rebuilds itself when the layout
+-- mode genuinely changes -- and the second is debounced, because a desktop window
+-- drag fires viewport changes every frame.
+return function(env)
+	local util = env.require("runtime/util")
+	local clock = env.require("runtime/clock")
+	local signal = env.require("runtime/signal")
+	local log = env.require("runtime/log")
+	local dispose = env.require("runtime/dispose")
+
+	local BREAKPOINTS = {
+		{ name = "xs", max = 520 },
+		{ name = "sm", max = 900 },
+		{ name = "md", max = 1280 },
+		{ name = "lg", max = 1700 },
+		{ name = "xl", max = math.huge },
+	}
+
+	local M = {
+		viewport = Vector2.new(1280, 720),
+		breakpoint = "md",
+		mode = "window",
+		orientation = "landscape",
+		touch = false,
+		pointer = true,
+		gamepad = false,
+		console = false,
+		reduceMotion = false,
+		transparency = 1,
+		keyboardHeight = 0,
+		keyboardTop = nil,
+		inset = Vector2.new(0, 0),
+		bottomInset = 0,
+		changed = signal.new("responsive"),
+		modeChanged = signal.new("responsive:mode"),
+		ready = false,
+	}
+
+	local function breakpointFor(width)
+		for _, entry in ipairs(BREAKPOINTS) do
+			if width < entry.max then return entry.name end
+		end
+		return "xl"
+	end
+
+	-- Layout mode is the only thing surfaces branch on, and it is derived rather
+	-- than configured: a console is gamepad-first regardless of resolution, a
+	-- narrow viewport is a sheet whether it is a phone or a small window, and the
+	-- user can still pin it by hand in settings.
+	--
+	-- Orientation matters as much as width. A tablet held portrait is 834 points
+	-- wide and 1112 tall; a floating window in that space is a tall thin box, while
+	-- a full-height dock reads properly.
+	local function modeFor(breakpoint, forced)
+		if forced and forced ~= "auto" then return forced end
+		if M.console then return "tv" end
+		if breakpoint == "xs" then return "sheet" end
+		if M.touch and not M.pointer then return "panel" end
+		if breakpoint == "sm" then return "panel" end
+		if M.orientation == "portrait" then return "panel" end
+		return "window"
+	end
+
+	local function sample()
+		local width, height = 1280, 720
+
+		-- The camera's viewport is the honest number: a ScreenGui's AbsoluteSize is
+		-- zero until it renders, and IgnoreGuiInset changes it underneath you.
+		local okCamera, camera = pcall(function() return env.services.Workspace.CurrentCamera end)
+		if okCamera and camera and camera.ViewportSize and camera.ViewportSize.Y > 0 then
+			width, height = camera.ViewportSize.X, camera.ViewportSize.Y
+		elseif M.screen and M.screen.AbsoluteSize and M.screen.AbsoluteSize.Y > 0 then
+			width, height = M.screen.AbsoluteSize.X, M.screen.AbsoluteSize.Y
+		end
+
+		M.viewport = Vector2.new(width, height)
+		M.orientation = (height > width) and "portrait" or "landscape"
+
+		local okInput = pcall(function()
+			M.touch = env.uis.TouchEnabled == true
+			M.pointer = env.uis.MouseEnabled == true
+			M.gamepad = env.uis.GamepadEnabled == true
+		end)
+		if not okInput then M.touch, M.pointer = false, true end
+		-- Mobile GUI coordinates can differ from the camera's render resolution.
+		-- Use the same measured space for breakpoints, placement and keyboard bounds.
+		if M.touch and not M.pointer and M.screenFrame then
+			local size = M.screenFrame.AbsoluteSize
+			if size.X > 0 and size.Y > 0 then
+				width, height = size.X, size.Y
+				M.viewport = Vector2.new(width, height)
+				M.orientation = height > width and "portrait" or "landscape"
+			end
+		end
+
+		pcall(function()
+			M.console = env.guisvc:IsTenFootInterface() == true
+		end)
+		pcall(function()
+			M.reduceMotion = env.guisvc.ReducedMotionEnabled == true
+		end)
+		-- The platform preference is the default, not the last word: someone who wants
+		-- the motion off in this client and on everywhere else has to be able to say so,
+		-- and someone whose platform reports it wrongly has to be able to say the
+		-- opposite. "auto" is the setting that defers.
+		do
+			local wanted = tostring(env.require("runtime/config").get("ui.reduceMotion", "auto"))
+			if wanted == "on" then
+				M.reduceMotion = true
+			elseif wanted == "off" then
+				M.reduceMotion = false
+			end
+		end
+		pcall(function()
+			local value = tonumber(env.guisvc.PreferredTransparency)
+			M.transparency = value and util.clamp(value, 0, 1) or 1
+		end)
+
+		-- The topbar overlaps the top of the screen; GetGuiInset reports by how much.
+		local platformBottom = 0
+		pcall(function()
+			local top, bottom = env.guisvc:GetGuiInset()
+			if top then M.inset = Vector2.new(top.X, top.Y) end
+			if bottom then platformBottom = math.max(0, bottom.Y) end
+		end)
+
+		-- Mobile chat and the jump button sit at the bottom on a touch device.
+		M.bottomInset = math.max(platformBottom, M.touch and 24 or 0)
+
+		M.keyboardHeight, M.keyboardTop = 0, nil
+		pcall(function()
+			if env.uis.OnScreenKeyboardVisible then
+				local size = env.uis.OnScreenKeyboardSize
+				M.keyboardHeight = math.max(0, math.min(height, size and size.Y or 0))
+				-- A keyboard can sit above the bottom edge (floating keyboards and
+				-- accessory bars). Its reported top is the actual obstruction.
+				if M.touch then
+					local position = env.uis.OnScreenKeyboardPosition
+					if position and position.Y > 0 and size and size.Y > 0 then
+						M.keyboardTop = position.Y
+					end
+				end
+			end
+		end)
+
+		local config = env.require("runtime/config")
+		local previousBreakpoint, previousMode = M.breakpoint, M.mode
+		M.breakpoint = breakpointFor(width)
+		M.mode = modeFor(M.breakpoint, config.get("ui.layout", "auto"))
+
+		return previousBreakpoint ~= M.breakpoint or previousMode ~= M.mode
+	end
+
+	local generation = 0
+	local revealScheduled = false
+	local function queueReveal()
+		if revealScheduled then return end
+		revealScheduled = true
+		local mine = generation
+		clock.delay(0.05, function()
+			if mine ~= generation then return end
+			revealScheduled = false
+			if M.ready then M.revealFocused() end
+		end)
+	end
+
+	-- Continuous changes fire `changed`; a real mode switch also fires
+	-- `modeChanged`, which is the only one that triggers a rebuild.
+	local function refresh(reason)
+		local wasMobile = M.isMobile()
+		local switched = sample()
+		switched = switched or wasMobile ~= M.isMobile()
+		M.changed:fire({ reason = reason, mode = M.mode, breakpoint = M.breakpoint, viewport = M.viewport })
+		if switched then
+			log.debug("responsive", string.format("%s -> %s at %dx%d (%s)",
+				M.breakpoint, M.mode, M.viewport.X, M.viewport.Y, tostring(reason)))
+			M.modeChanged:fire({ mode = M.mode, breakpoint = M.breakpoint })
+		end
+		if M.isMobile() and M.keyboardHeight > 0 then
+			queueReveal()
+		end
+	end
+
+	local debouncedRefresh
+	local releases = {}
+	local cameraRelease
+
+	function M.destroy()
+		generation = generation + 1
+		revealScheduled = false
+		for _, release in ipairs(releases) do release() end
+		releases = {}
+		if cameraRelease then cameraRelease(); cameraRelease = nil end
+		if M.screenFrame then M.screenFrame:Destroy(); M.screenFrame = nil end
+		M.ready = false
+		M.screen = nil
+	end
+
+	function M.init(screenGui)
+		M.destroy()
+		M.screen = screenGui
+		-- Measure the coordinate space children actually occupy. ScreenGui's own
+		-- origin is not a reliable stand-in for its device-safe content origin.
+		local frame = Instance.new("Frame")
+		frame.Name = "Viewport"
+		frame.BackgroundTransparency = 1
+		frame.BorderSizePixel = 0
+		frame.Size = UDim2.fromScale(1, 1)
+		frame.Active = false
+		frame.Parent = screenGui
+		M.screenFrame = frame
+		sample()
+		M.ready = true
+
+		local mine = generation
+		debouncedRefresh = clock.debounce(function()
+			if mine == generation then refresh("viewport") end
+		end, 0.12)
+		local function watch(connection)
+			releases[#releases + 1] = dispose.connection(connection, "responsive")
+		end
+		local function bindCamera()
+			if cameraRelease then cameraRelease(); cameraRelease = nil end
+			local okCamera, camera = pcall(function() return env.services.Workspace.CurrentCamera end)
+			if okCamera and camera then
+				cameraRelease = dispose.connection(camera:GetPropertyChangedSignal("ViewportSize"):Connect(debouncedRefresh), "viewport")
+			end
+		end
+
+		bindCamera()
+		for _, property in ipairs({ "AbsoluteSize", "AbsolutePosition" }) do
+			watch(frame:GetPropertyChangedSignal(property):Connect(debouncedRefresh))
+		end
+		-- The camera instance itself is replaced on respawn in some games, so the
+		-- workspace is watched too.
+		pcall(function()
+			watch(env.services.Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+				bindCamera()
+				refresh("camera")
+			end))
+		end)
+
+		-- The on-screen keyboard is not a resize: the viewport does not change, so
+		-- it has to be watched separately or the composer ends up behind it.
+		for _, property in ipairs({ "OnScreenKeyboardVisible", "OnScreenKeyboardSize", "OnScreenKeyboardPosition" }) do
+			pcall(function()
+				watch(env.uis:GetPropertyChangedSignal(property):Connect(function() refresh("keyboard") end))
+			end)
+		end
+		pcall(function()
+			watch(env.uis.TextBoxFocused:Connect(function()
+				if M.isMobile() then queueReveal() end
+			end))
+		end)
+		-- A trackpad or keyboard can be attached after mounting. Re-sample input
+		-- capability changes so layout and touch targets reflect the current host.
+		for _, property in ipairs({ "TouchEnabled", "MouseEnabled", "GamepadEnabled" }) do
+			pcall(function()
+				watch(env.uis:GetPropertyChangedSignal(property):Connect(function() refresh("input") end))
+			end)
+		end
+
+		for _, property in ipairs({ "ReducedMotionEnabled", "PreferredTransparency" }) do
+			pcall(function()
+				watch(env.guisvc:GetPropertyChangedSignal(property):Connect(function() refresh(property) end))
+			end)
+		end
+
+		pcall(function()
+			watch(env.uis.LastInputTypeChanged:Connect(function(inputType)
+				local name = tostring(inputType and inputType.Name or "")
+				local wasGamepad = M.gamepad
+				if name:find("Gamepad") then M.gamepad = true end
+				if wasGamepad ~= M.gamepad then refresh("input") end
+			end))
+		end)
+
+		local config = env.require("runtime/config")
+		releases[#releases + 1] = dispose.add(config.changed:connect(function(path)
+			if path == "ui.layout" or path == "ui.reduceMotion" then refresh("setting") end
+		end), "responsive settings")
+		watch(screenGui.Destroying:Connect(function()
+			if M.screen == screenGui then M.destroy() end
+		end))
+		releases[#releases + 1] = dispose.add(function()
+			generation = generation + 1
+			M.ready = false
+			M.screen = nil
+			M.screenFrame = nil
+		end, "responsive lifetime")
+
+		log.info("responsive", string.format("%s / %s at %dx%d, touch %s, gamepad %s",
+			M.breakpoint, M.mode, M.viewport.X, M.viewport.Y,
+			M.touch and "yes" or "no", M.gamepad and "yes" or "no"))
+		return M
+	end
+
+	function M.refresh(reason)
+		refresh(reason or "manual")
+	end
+
+	-- The shared compact interface uses native control metrics on handhelds.
+	-- Touch capability still governs gestures and keyboard behavior, not an
+	-- oversized alternate presentation. Individual fields also fit their text.
+	function M.minTarget()
+		if M.console then return 48 end
+		if M.isMobile() then return 15 end
+		return M.touch and 44 or 28
+	end
+
+	function M.isNarrow()
+		return M.mode == "sheet"
+	end
+
+	function M.isMobile()
+		return M.touch and not M.console
+			and (not M.pointer or M.mode == "sheet" or M.mode == "panel")
+	end
+
+	function M.isCompactHeight()
+		return M.viewport.Y < 520 or M.keyboardHeight > 0
+	end
+
+	-- Default geometry per mode, in pixels, clamped to the viewport so the window
+	-- can never open larger than the screen it is on.
+	function M.geometry()
+		local width, height = M.viewport.X, M.viewport.Y
+		if M.isMobile() then
+			local theme = env.require("ui/theme")
+			local scale = theme.metricScale
+			local portrait = M.orientation == "portrait"
+			local minimumWidth = theme.size.sidebar + theme.size.modalMin + theme.space.xl * 2
+			local automatic = env.require("runtime/config").get("ui.layout", "auto") == "auto"
+			-- Auto retains the compact rectangle. Explicit modes change the same
+			-- desktop surface's dimensions and placement without changing its controls.
+			if not automatic and M.mode == "sheet" then
+				return { width = width, height = math.floor(height * (portrait and 0.72 or 0.9)), anchored = "bottom" }
+			elseif not automatic and M.mode == "panel" then
+				return {
+					width = math.floor(math.max(minimumWidth, util.clamp(width / scale * 0.52, 320, 460) * scale)),
+					height = math.floor(height - M.inset.Y - 24 * scale),
+					anchored = "right",
+				}
+			end
+			return {
+				width = math.floor(math.max(minimumWidth,
+					util.clamp(width / scale * 0.44, 460, 780) * scale)),
+				height = math.floor(util.clamp(height / scale * 0.68, 360, 620) * scale),
+				anchored = automatic and (portrait and "bottom" or "right") or "center",
+			}
+		end
+		if M.mode == "sheet" then
+			return {
+				width = width,
+				height = math.floor(height * (M.orientation == "portrait" and 0.72 or 0.9)),
+				anchored = "bottom",
+			}
+		end
+		if M.mode == "panel" then
+			return {
+				width = math.floor(util.clamp(width * 0.52, 320, 460)),
+				height = math.floor(height - M.inset.Y - 24),
+				anchored = "right",
+			}
+		end
+		if M.mode == "tv" then
+			return {
+				width = math.floor(util.clamp(width * 0.62, 720, 1200)),
+				height = math.floor(util.clamp(height * 0.7, 420, 760)),
+				anchored = "center",
+			}
+		end
+		return {
+			width = math.floor(util.clamp(width * 0.44, 460, 780)),
+			height = math.floor(util.clamp(height * 0.68, 360, 620)),
+			anchored = "center",
+		}
+	end
+
+	-- How much of the bottom of the screen is unusable: the on-screen keyboard when
+	-- it is up, otherwise the platform's own bottom furniture.
+	function M.bottomObstruction()
+		return math.max(M.keyboardHeight, M.bottomInset)
+	end
+
+	function M.parentGeometry(relative)
+		if relative == M.screen and M.screenFrame then relative = M.screenFrame end
+		local origin = relative and relative.AbsolutePosition or Vector2.new(0, 0)
+		local size = relative and relative.AbsoluteSize or M.viewport
+		if size.X <= 0 or size.Y <= 0 then size = M.viewport end
+		return origin, size
+	end
+
+	-- Default placement avoids the top bar. Moving a surface can use the entire
+	-- device-safe parent: GetGuiInset describes CoreGui's reserved band, not a
+	-- physical obstruction across the whole screen. Treating it as a drag limit
+	-- strands both the window and launcher far below the top on some clients.
+	function M.usableRect(relative, margin, avoidTopbar)
+		margin = margin or 0
+		if avoidTopbar == nil and M.isMobile() then avoidTopbar = false end
+		local origin, size = M.parentGeometry(relative)
+		margin = math.max(0, math.min(margin, (math.min(size.X, size.Y) - 1) / 2))
+		local left = (avoidTopbar == false and 0 or math.max(0, M.inset.X - origin.X)) + margin
+		local top = (avoidTopbar == false and 0 or math.max(0, M.inset.Y - origin.Y)) + margin
+		-- Camera.ViewportSize and GUI pixels can differ under client/display scaling.
+		-- Mixing them caps movement at a fraction of the visible screen. Use the
+		-- measured GUI extent for both axes, keeping the camera as a boot fallback.
+		local screenOrigin, screenSize = M.parentGeometry(M.screen)
+		local right = math.min(size.X, screenOrigin.X + screenSize.X - origin.X) - margin
+		local bottom = math.min(size.Y, screenOrigin.Y + screenSize.Y - M.bottomObstruction() - origin.Y) - margin
+		if M.isMobile() and M.keyboardTop then
+			bottom = math.min(size.Y - margin, screenOrigin.Y + screenSize.Y - M.bottomInset - origin.Y - margin,
+				M.keyboardTop - origin.Y - margin)
+		end
+		return { x = left, y = top, width = math.max(1, right - left), height = math.max(1, bottom - top) }
+	end
+
+	function M.describe()
+		return string.format("%s / %s  %dx%d  %s%s%s",
+			M.breakpoint, M.mode, M.viewport.X, M.viewport.Y,
+			M.touch and "touch " or "",
+			M.gamepad and "gamepad " or "",
+			M.reduceMotion and "reduced-motion" or "")
+	end
+
+	-- Reveal the active mobile field after the keyboard and its ancestors finish
+	-- resizing. Only its scrolling ancestors move; reading another panel stays put.
+	function M.revealFocused()
+		if not M.isMobile() then return end
+		local ok, field = pcall(function() return env.uis:GetFocusedTextBox() end)
+		if not ok or not field or not field.Parent or not M.screen or not field:IsDescendantOf(M.screen) then return end
+		local ancestor = field
+		while ancestor and ancestor ~= M.screen do
+			if ancestor:IsA("GuiObject") and not ancestor.Visible then return end
+			ancestor = ancestor.Parent
+		end
+		local bounds = M.usableRect(M.screen, 0, false)
+		local origin = M.parentGeometry(M.screen)
+		local safeTop, safeBottom = origin.Y + bounds.y, origin.Y + bounds.y + bounds.height
+		-- Track the requested movement ourselves: AbsolutePosition can be updated
+		-- one layout pass later, causing an outer scroller to repeat the inner move.
+		local y, height = field.AbsolutePosition.Y, field.AbsoluteSize.Y
+		local node = field.Parent
+		while node and node ~= M.screen do
+			if node:IsA("ScrollingFrame") and node.ScrollingEnabled
+				and node.ScrollingDirection ~= Enum.ScrollingDirection.X then
+				local visible = node.AbsoluteWindowSize.Y
+				if visible <= 0 then visible = node.AbsoluteSize.Y end
+				local top, bottom = node.AbsolutePosition.Y, node.AbsolutePosition.Y + visible
+				if math.min(safeBottom, bottom) > math.max(safeTop, top) then
+					top, bottom = math.max(safeTop, top), math.min(safeBottom, bottom)
+				end
+				ancestor = node.Parent
+				while ancestor and ancestor ~= M.screen do
+					if ancestor:IsA("GuiObject") and ancestor.ClipsDescendants then
+						local clipHeight = ancestor:IsA("ScrollingFrame") and ancestor.AbsoluteWindowSize.Y or 0
+						if clipHeight <= 0 then clipHeight = ancestor.AbsoluteSize.Y end
+						local clipTop = math.max(top, ancestor.AbsolutePosition.Y)
+						local clipBottom = math.min(bottom, ancestor.AbsolutePosition.Y + clipHeight)
+						-- An entirely offscreen inner scroller first reveals its own field;
+						-- the outer scroller can then bring that region into view.
+						if clipBottom > clipTop then top, bottom = clipTop, clipBottom end
+					end
+					ancestor = ancestor.Parent
+				end
+				if visible > 0 and bottom > top then
+					local margin = math.min(M.minTarget() / 4, math.max(0, (bottom - top - math.min(height, M.minTarget())) / 2))
+					top, bottom = top + margin, bottom - margin
+					local delta = y < top and y - top or (y + height > bottom and math.min(y - top, y + height - bottom) or 0)
+					local maximum = math.max(0, node.AbsoluteCanvasSize.Y - visible)
+					local previous = node.CanvasPosition.Y
+					local nextY = util.clamp(previous + delta, 0, maximum)
+					if nextY ~= previous then
+						node.CanvasPosition = Vector2.new(node.CanvasPosition.X, nextY)
+						y = y - (nextY - previous)
+					end
+				end
+			end
+			node = node.Parent
+		end
+	end
+
+	return M
+end

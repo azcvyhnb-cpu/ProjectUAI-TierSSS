@@ -1,0 +1,836 @@
+# Project UAI
+
+A universal AI agent that runs inside a Roblox client. It works in any game,
+with Chat Completions and Anthropic Messages endpoints, including compatible
+local servers and relays.
+
+**Version 2.5.0 — October 2, 2026.** Mobile shares the desktop interface, with
+layout dimensions, spacing and radii reduced to 55% before density settings.
+Text has a 10px minimum before text scaling, and standard icons start at 12px.
+Auto, Sheet, Panel and Window change placement while keeping live fields and
+drafts. Forms and Code panels adapt through reflow and scrolling.
+Ten new script project tools add scaffolding, source maps, coordinated file edits,
+syntax/dependency diagnostics, managed tests and standalone Lua bundles.
+UI LIB remains v1.2.1 and the embedding SDK remains 1.0.0.
+See the [release notes](CHANGELOG.md) and [UI library guide](docs/UI_LIBRARY.md).
+
+```lua
+loadstring(game:HttpGet("https://raw.githubusercontent.com/Project-Ptolemy/ProjectUAI/main/dist/uai.lua"))()
+```
+
+Nothing about a specific game, gateway or host script is assumed. Under an
+executor it uses the executor's HTTP function; in a plain client it falls back to
+`HttpService` and says which capabilities it lost. Embedded in a host script it
+takes a context table and adds that script's own instructions and hooks.
+
+Running the same bundle again toggles the existing interface; embedding hosts can
+pass `{ reuse = true }` to reuse it without toggling. A changed bundle
+reloads an idle client after saving its settings and conversations. If work, an
+unsent draft, or an isolated conversation would be lost, the current instance stays
+open with a notice; finish that work before running the updated loader again.
+
+In **Settings → Import & export → Full configuration**, use **Copy config · includes
+API keys** to transfer all saved configuration, including providers, key pools,
+custom headers, permissions, preferences, and saved memory. On the other device,
+choose **Paste configuration to import**, paste the JSON, select **Review**, then
+**Apply**. This private export contains credentials. Conversations, activity history,
+workspace files, and skill files are separate from configuration.
+
+## What it is
+
+**Our own script UI library.** [Project UAI UI LIB](docs/UI_LIBRARY.md) provides
+standalone, responsive windows and a complete set of script controls using UAI's
+visual language. Agents read its bundled `ui_library_docs` reference and write
+declarative controls plus application logic. The library handles layout, input,
+configuration, cleanup, and the fixed `Project UAI | UI LIB.` footer.
+The existing agent client interface is unchanged.
+
+```lua
+local UI = loadstring(game:HttpGet("https://raw.githubusercontent.com/Project-Ptolemy/ProjectUAI/main/dist/uai-ui.lua"))()
+```
+
+See the [starter](ui-lib/examples/starter.lua), [component showcase](ui-lib/examples/showcase.lua),
+[full API and application guide](docs/UI_LIBRARY.md), and
+[complete assistant workbench](examples/embedding/README.md).
+The [embedding reference](docs/EMBEDDING.md) covers host scripts, custom UIs,
+sessions, tools, hooks, providers, state binding, and cleanup.
+
+**Embedding SDK 1.0.0.** Load the client with `{ ui = false, reuse = true }` to
+use sessions and tools without mounting its application. `uai.sdk` provides
+owned integration scopes and requests with structured results, cancellation,
+completion callbacks, and optional waiting. Open named conversations without
+changing the user's selection, and explicitly mount the app when needed with
+`uai.show(...)` or `uai.openSession(id)`. Start with the
+[UI-free SDK example](examples/embedding/sdk.lua) and
+[SDK quickstart](docs/EMBEDDING.md#sdk-quickstart). Providers and permissions remain
+shared client settings; runtime capabilities still depend on the host.
+
+**A real agent loop.** Streaming, parallel tool calls, retry with backoff that
+honours `Retry-After`, provider fallback, automatic context compaction with a
+summary, permission gating, hooks, a task list, persistent memory, subagents that
+run several at a time, token and cost accounting, abort, and a request log. Every
+stage emits an event, and the interface is a subscriber -- the loop never touches a
+GUI.
+
+Context windows are learned automatically from provider context-length errors and
+saved per model. A rejected turn compacts older history and retries once before
+falling back. Repeated compactions merge the previous summary, and a failed summary
+request preserves earlier facts. Open **Message options → Context breakdown** for a
+colored usage bar, category totals, model window, and compaction point. Compaction
+notices show the estimated token reduction. Individual saved facts can be deleted
+in **Settings → Skills → Memory**.
+
+A turn stops after twenty-four tool rounds by default, which is there to catch a
+runaway rather than to end the work; **Unlimited tool calls** in Settings removes
+that ceiling and the fifteen-minute turn deadline with it, leaving the repeat
+breaker, each tool's own timeout and Stop as what bounds a turn. A subagent keeps its
+own step and time budget under that switch -- it is the one session nobody is
+watching -- and **Unlimited subagents** is the separate switch that lifts a child's
+too, so a delegated job runs until it answers instead of coming back with "I reached
+this session's step limit before finishing".
+
+**Any provider.** A provider is a base URL, an auth style, a key and a model.
+Presets exist for the common hosts -- with HCNSEC, AgentRouter, and OpenCode Zen featured as
+starting points in the providers panel -- and "Custom endpoint" takes anything
+that speaks `/v1/chat/completions` -- a relay, a self-hosted vLLM, Ollama on
+localhost. Model lists are never guessed: they come from `GET /v1/models` or from
+you typing one in.
+
+For the shared HCNSEC key, open **Providers → Add → HCNSEC → Use free key**,
+fetch the current models or enter a model ID, then save. Your other providers and
+personal keys stay as configured. OpenCode and AgentRouter automatically recover
+from explicit unauthorized-client errors using the
+[Project UAI proxy](docs/PROVIDER_COMPATIBILITY.md#automatic-unauthorized-client-recovery).
+The proxy receives the provider key and request and has a shared limit of 90,000
+requests per day; the resulting Base URL remains editable.
+
+AgentRouter uses the Anthropic Messages API and always sends its required Claude
+Code identity. Registration requires a GitHub account at least one year old; its
+recommended model is `deepseek-v4-flash`.
+
+**The Claude Code identity.** Providers that enable this compatibility identity carry
+`User-Agent: claude-cli/<version> (external, cli)`, `x-app: cli` and the
+`X-Stainless-*` client-metadata set, applied inside the transport so no call site
+can omit it accidentally. OpenCode Zen retains its OpenCode compatibility headers. Its free-tier access is
+provider-controlled, so compatibility headers do not guarantee availability.
+`HttpService:RequestAsync` refuses to send a custom `User-Agent`, so
+on a host with no executor HTTP function the client says the identity did not
+reach the wire rather than pretending it did.
+
+**Native tools for any game**: the instance tree,
+properties with type-aware conversion, bounded Luau execution, files, HTTP, web
+search and page reading, players, your character, raycasts and lighting and the
+camera, remotes (discover, fire, watch), on-screen interfaces, diagnostics, place
+and account metadata, plus the agent's own task list, memory, searching and
+reading its earlier conversations, and subagent dispatch.
+
+**Code workspace — v1.7.0, September 24, 2026.** Open **Code** and
+choose Editor, Files, Explorer, Remotes, Output, History, Library, or Game changes.
+The user and agent share live Luau documents and revisions. Source highlighting,
+line numbers, Find, Go to line, indentation, explicit Run/Stop, retained output,
+versions, comparison/proposals and typed reusable actions use the same model.
+Focused editing uses the native TextBox for input, selection and IME, with visible
+syntax colors and a caret while typing. Closing a view preserves its script in the
+library. Source documents use two verified snapshots under `UAI/code/`.
+
+Inspected Source and decompiled text are read-only snapshots. **Extract editable
+copy** creates a separate document; opening source never runs it or writes back to
+the live script. Source requests share bounded workers and a cache, with explicit
+provenance, refresh, cancellation and expiry. Search/selection use UTF-8 byte
+boundaries; displayed columns count Unicode code points.
+
+Files browses the `UAI` workspace through expandable folders. Open a file in the
+editor, then use Save or Save as; disk-conflict checks protect edited drafts.
+Run and Save stay adjacent. Buttons and tabs retain padding across narrow layouts,
+touch input and larger text, with horizontal scrolling for crowded action strips.
+
+Explorer provides lazy child pages, name/class/tag search, multiple selection,
+supported properties, typed attributes/tags, guarded edits, hierarchy operations,
+bookmarks, world picking, source opening and selected metadata export. Stable
+object references survive renaming and moving. **Game changes → Undo** covers
+recorded property and attribute changes with conflict checks. Tags, hierarchy,
+remote effects and arbitrary Luau side effects are outside that Undo coverage.
+Inspector actions carry the displayed selection's IDs, primary object and revision.
+Search and branch pages show partial results and limits: 20,000 runtime children or
+scanned nodes, 4,000 displayed rows, and a 64-level reveal path.
+
+Remotes starts only through an explicit scoped **Start**. It supports UAI calls,
+incoming events and host-dependent outgoing interception, with bounded capture
+lists, typed values, filters, replay drafts, reviewed one-shot replay, generated
+source and offline export/import. Excluding logs and blocking traffic are separate
+controls. Stop disarms traffic rules; capture stays visible on the minimized
+launcher. A timed-out InvokeServer may remain outstanding and must not be retried
+automatically. **More → Capture coverage** explains the actual backend and limits;
+intercepted Invoke outcomes remain unverified and incoming function callbacks are
+unavailable.
+
+The default capture lasts 30 seconds and requires a selected target. Game-wide
+capture and continuous capture are explicit choices. Caller actions resolve the
+captured script identity after capture and can open read-only source with likely
+remote name/path matches. Generated portable scripts require current review before
+copy/export. Hooked traffic is labelled `hooked_unknown` unless attribution has
+been verified; routing probes do not invoke the predecessor, but network behavior
+depends on the host. Stop can retain an inert forwarding wrapper.
+
+See [the native feature contract](docs/NATIVE_CLIENT.md) for current features and
+limits and [the native testing guide](docs/CODE_WORKSPACE_TESTING.md) for
+desktop/mobile/gamepad scenarios. Native input, hook forwarding and performance
+require Roblox client validation.
+
+**Batch inspection and file workflows.** Prefer a combined query or batch when
+the work is independent; this reduces model round trips and unnecessary local
+scanning without changing the inference provider's speed.
+The prompt asks for successive batches of normally 1–4 independent calls, with
+results inspected between batches. Tool-call limits and concurrency stay unchanged.
+
+**Script projects.** Stage modular scripts with `project_scaffold`, inspect their
+file hashes and dependencies with `project_map`, and apply coordinated edits with
+`project_patch`. `script_analyze` reports syntax/dependency diagnostics;
+`project_build` exports one runnable Lua file; `script_test` runs declared cases
+through the managed client engine. Proposals include temporary, conditional
+recovery checkpoints. See [the script project guide](docs/SCRIPT_PROJECTS.md) for
+the manifest, test API and limits. These are native tools, without an LSP or an
+isolated test process.
+
+**Long inputs are files.** Inputs over 8,000 UTF-8 bytes are saved intact under
+`UAI/pastes/`, up to 2 MiB per file. The AI receives a compact path reference and
+reads relevant sections with `file_read`, `file_read_many`, or `file_search`.
+Saved-paste reads return at most 6,000 source bytes per slice with continuation
+offsets. Ordinary messages stay inline. A large paste becomes an attachment while
+keeping the text already around it editable, and an attachment can be sent by
+itself. The browser transfers large files in separate chunks before sending the
+message. Saving must succeed and the Files tools must be available; failures keep
+the draft instead of sending the full source. These are files in the executor's
+workspace, so the workflow works across inference providers without requiring a
+provider-specific file API.
+
+**A folder per game.** Game work is organised under `UAI/files/<place name>
+(<PlaceId>)/`: scripts the agent writes or edits sit in that folder's root, and
+decompiled or dumped source lands in its `dump/` subfolder, apart from the code
+being authored. The name is taken from the live place and stripped of any
+path-reserved characters. This is the default home, not a wall -- shared
+utilities, another place's folder, cross-game notes, and `pastes/` all stay
+reachable, so the agent still reads and writes elsewhere under `files/` when the
+task or the user calls for it.
+
+**Project Gravity.** Run the updated [Project Gravity](https://github.com/Project-Ptolemy/Project-Gravity-02)
+loader and open its **PROJECT UAI** button. Both desktop and mobile pass their live
+context; UAI can also discover Gravity when either application starts first, or run
+the loader itself with `gravity_launch` when Gravity is not already present.
+`gravity_status` and `gravity_shapes` inspect the real engine and shape controls.
+`gravity_control`, `gravity_configure`, `gravity_shape`, and `gravity_target` use
+Gravity's native handlers for physics, settings, shape switching, buttons, and
+player targets. The Project Gravity tool group uses UAI's normal permissions.
+
+`gravity_parts` pages through held parts with session-scoped IDs and their current
+selection, targets, and overrides. Use those IDs with `gravity_part_control` to
+select parts, pin them, assign a shape, move a group while preserving its spacing,
+set rideability or physics, and release overrides. `clear` deselects;
+`release_all` clears overrides even on unselected parts. Selection follows
+Gravity's native 512-part ceiling. Read fresh IDs after Gravity reloads.
+
+`gravity_keybind` sets core or shape shortcuts and rejects conflicting keys;
+an empty key clears a binding. `gravity_favorite` manages the native favorites
+list. `gravity_configure` also exposes interface and visual performance settings,
+FPS (when supported), RGB core color, ignore tags, and Part Control panel defaults.
+`gravity_control` supports `reset_settings` and manual Slingshot `launch`/`charge`.
+The companion Gravity update applies settings to the live world and interface,
+restores reset effects and bindings, and supplies the same shape/hotkey handlers
+on desktop and mobile. Check `gravity_status.capabilities` after reloading it.
+
+For custom shapes, read the guide with `gravity_plugin_read`, or request
+`section="template"`. Pass `plugin="My Shape", path="pastes/..."` to
+`gravity_plugin_write` to reuse uploaded source without copying it into tool
+arguments. It verifies the file in `GravityShapes/`, validates setup once, and
+registers it with the running Gravity session. Select an inactive shape explicitly
+with `gravity_shape`; replacing an existing shape requires `overwrite=true`.
+`load=false` checks syntax and saves without executing the source. Gravity's live
+physics and mobile touch behavior still need in-game testing.
+
+| Tool | Use |
+| --- | --- |
+| `instance_query` | Filter by name, class, and tag while reading selected properties and attributes. Pages stop early and include a traversal offset. |
+| `instance_get_many` | Inspect up to 20 known paths with individual errors and a continuation index. |
+| `file_search` | Find literal text across workspace files, with filename globs, case selection, line numbers, byte offsets, and a cursor. |
+| `file_read_many` | Read up to 12 files or saved pastes with a shared output budget, individual failures, and per-file continuation offsets. |
+| `file_edit_many` | Apply up to 20 ordered exact edits to one file after all edits validate, using one write. |
+
+Instance projections accept up to 12 property names and 12 attribute names.
+Copy returned instance paths exactly: `Workspace["Map.v2"]["Door[1]"]` refers to
+names that contain punctuation. Query pages inspect at most 20,000 nodes; narrow
+the root if a scan is incomplete. Traversal offsets describe the live tree, so
+restart after it changes.
+
+File searches default to `UAI/files/`; pass an explicit `pastes/` path to search
+saved inputs. Both scopes exclude client configuration and conversations.
+Searches skip binary files and files over 2 MB, bound inventories to
+128 directories, 1,000 files, and 6,000 entries, and process at most 8 MB and 50,000
+new lines per page. The read budget counts skipped data too and is checked between
+whole-file reads; the host must read a file before its size is known.
+Follow the returned cursor with the same query and restart
+after editing sources. Batch reads support files up to 2 MB and reuse repeated
+slices within that call. Edits preflight against the original file, refuse stale
+contents, avoid no-op writes, and limit the original and resulting file to 2 MB.
+The existing Files and Instance tree permissions and capability checks apply.
+
+**An interface built from tokens.** No use site writes a colour or a number. One
+warm neutral ramp and one accent, surfaces separated by two steps of lightness and
+a hairline rather than by shadows, a cream fill for the single loud action per view,
+and the accent kept for meaning -- inline code, a running turn, a risk level. Type
+comes from `FontFace` where the client has it, so a family yields a real
+regular/medium/semibold axis instead of whichever weights the legacy `Enum.Font`
+happened to pair it with; the families on offer are probed against the engine rather
+than declared, so the list is shorter on an older client instead of containing dead
+entries. A reply is the page rather than a bubble on it: the agent's prose sits flat
+on the canvas, tool rows and reasoning are lines of text rather than cards, reasoning
+sits behind a rule as an aside, and sent prompts group their speaker and text inside a quiet bordered surface.
+The compact composer stays pinned to the bottom edge, with context details behind
+its overflow menu. The model stays inline when space permits; model, permission,
+and usage controls are always available from the same menu. The contrast
+of every pair the interface puts together is computed in the test suite, so a retune
+cannot quietly make something unreadable.
+
+**Markdown tables and compact thinking.** Replies support aligned pipe tables with
+formatted cells and horizontal scrolling on narrow screens. Long tables and thinking
+traces have bounded scroll areas without dropping their content. Thinking starts
+collapsed; consecutive trace updates share a disclosure until a tool separates them.
+The model picker keeps search and selection stable, and its provider selector and
+the composer's model chip size to their actual labels.
+
+**Mobile layout.** The desktop header, sidebar, welcome view, composer, Quick Chat
+and Code tabs share one structure at 55% layout dimensions, spacing and radii
+before density settings. Controls have a 15px minimum, text starts at 10px before
+text scaling, and standard icons at 12px. Enter adds a line; the Send button
+submits. Expand the composer for a longer draft, or use Message options for
+models, attachments and context. The sidebar and app menu keep conversation
+search. Settings categories and providers reflow between columns and scrolling
+strips while preserving their mounted forms.
+
+Auto keeps a compact placement; Sheet, Panel and Window select bottom, right
+and centred placement, with separate saved positions. Drag the title to move,
+use the corner grip to resize, or expand to fill the available screen. Rotation
+preserves drafts, selections and open forms; the keyboard temporarily lifts the
+window and keeps focused fields in view. The launcher returns when minimized.
+
+**Managed in-game chat loops.** Ask for a quiz, rotating announcements, or keyword
+replies. `quiz_bot`, `auto_chat`, and `auto_reply` return a background job immediately;
+`chat_loop_status` reports progress and quiz scores, and `chat_loop_stop` stops jobs.
+Active jobs also have a Stop all control in chat. Loops have configurable intervals,
+counts, and durations, and stop when their conversation is cleared or removed, chat
+is disabled, or the client unloads.
+
+**Infinite Yield control and plugin authoring.** `iy_control` inspects and changes
+IY's native event bindings, keybinds, aliases, waypoints, command prefix, and supported settings. It
+supports `OnExecute`, `OnSpawn`, `OnDied`, `OnDamage`, `OnKilled`, `OnJoin`,
+`OnLeave`, and `OnChatted`, including player/message/health filters, delays, and
+`$1`/`$2` command arguments. Changes refresh IY's editor and request its normal
+save; results say when only live session state is available. Inspect first for
+current binding indexes. `stop_loops` sends IY's `breakloops` command, which stops
+repeat prefixes; event bindings and individual commands' own loops are managed
+separately. The adapter follows the upstream
+[event editor and plugin loader](https://github.com/EdgeIY/infiniteyield/blob/master/source),
+reviewed September 20, 2026.
+
+`iy_cmds` includes argument signatures and short descriptions when the running IY
+exposes them. `iy_players` resolves selectors such as `others`, `rad50`, and
+`all-me` to live names before a targeting command. It uses IY's own selector
+engine, including comma-separated lists and `@name` username-only prefix matching.
+Its text is bounded by `limit`; structured results retain the complete name list.
+
+Use `alias_add`, `alias_remove`, or `alias_clear` to manage aliases. An alias
+targets a command name, including an existing command alias; arguments are not
+stored in it. `waypoint_add` accepts `{x,y,z}` coordinates or uses your character's
+current root position, flooring each coordinate to match IY. `waypoint_remove`
+and `waypoint_clear` affect the current place; `waypoint_clear` with
+`all_places=true` also clears saved waypoints in other places. Inspect
+`section="aliases"` or `section="waypoints"` and follow `nextOffset` for more.
+Edits preserve the live table references used by IY's GUI and request its save.
+
+`configure` also supports `gui_scale` (0.4–2) and `logs_webhook` (an HTTP(S) URL,
+or an empty string to disable). These dispatch IY's own commands asynchronously;
+inspect settings to confirm the resulting values. Those commands save through
+IY, so they reject `persist=false`; other native edits support session-only changes.
+
+`iy_plugin_read` without a filename returns a multi-command template. Pass a
+filename to read an existing plugin, then use `iy_plugin_write` to create or
+update it. Source can declare globals or shared locals above `local Plugin`,
+and returns the normal IY table with `PluginName`, `PluginDescription`, and
+`Commands`. Every command has `ListName`, `Description`, `Aliases`, and
+`Function(args, speaker)`. The writer checks syntax before saving, executes setup
+once when loading, validates the returned table before replacing commands, and
+reports their actual registered names, including IY's collision suffixes.
+`load=false` saves without executing; replacing a file requires `overwrite=true`.
+Plugin source and commands appear in the tool transcript. Plugin-owned connections
+and loops should have their own cleanup command so reloads do not duplicate them.
+
+For example, `iy_control` can bind `speed 40` to your next spawn:
+
+```json
+{"action":"event_add","event":"OnSpawn","command":"speed 40","conditions":{"player":"me"},"delay":0.5}
+```
+
+Resolve nearby players with `iy_players`:
+
+```json
+{"selector":"rad50-me","limit":20}
+```
+
+Create an alias or a waypoint with `iy_control`:
+
+```json
+{"action":"alias_add","alias":"quick","command":"speed"}
+```
+
+```json
+{"action":"waypoint_add","name":"Home","position":{"x":100,"y":20,"z":-50}}
+```
+
+**Task and notification layout.** Task markers share their text's line box at each
+font scale, long plans scroll within a bounded area, and disclosure choices stay
+with their conversation. Skipped steps are reported separately from completion.
+Notifications have a clear outcome, conversation title, and an **Open chat**
+action. Opening a conversation acknowledges its own notifications; other unread
+conversations keep their badge. Long notifications scroll, hover/focus pauses
+expiry, and the stack fits the available screen and keyboard space.
+
+**Independent in-game chatbot.** `chat_bot` listens to new player messages and
+answers with the selected AI provider/model using its own short conversation memory.
+Set `instructions` for its personality, `prefix` (default `[AGENT]`), and optionally
+`user_ids` to choose players. It returns immediately and appears in the chat-loop
+indicator; `chat_loop_status` reports its progress and `chat_loop_stop` stops it.
+By default it runs for 600 seconds, sends at most 100 replies, and waits at least
+5 seconds between sends. Rapid messages are batched into one response. Incoming
+message IDs and short-window repeats are deduplicated, self/system/tagged-bot
+messages are ignored, and repeated reply text is suppressed for the entire run.
+Only one managed job owns a channel, and manual `chat_send` calls are blocked there
+while the chatbot runs. A failed or ambiguous chat send stops the bot without retrying.
+
+**Every listing the model produced, in the transcript.** A tool call that carries
+code -- the Luau it is about to execute, the body it is about to write to a file, the
+property map it is about to apply -- draws it under the row as numbered, horizontally
+scrolled, copyable monospace, outside the fold and on by default. A call's listing
+folds at a dozen lines rather than sixty, because a turn produces several of them and
+the answer they were working towards has to stay on screen. Long blocks fold with a
+control that opens them rather than a sentence saying how much was hidden. The
+remaining arguments and the result sit behind the row's own caret, and a failure opens
+its own. Subagents forward their calls whole, so work delegated to a child is as
+readable as work done in the main conversation.
+
+**A turn's machinery is one block, not a wall.** The calls, the thinking between them
+and any retry notice go into a single activity block with tight lines inside it and a
+paragraph of air around it -- so a turn that called eight tools reads as one thing
+that happened rather than as eight events with the reply lost at the bottom. The
+header counts the run and its duration, and a finished run of more than four folds
+itself away behind that line; anything still outstanding keeps it open.
+
+**Conversations run at the same time.** Switching conversation does not stop the one
+you left: its loop is on its own thread, the sidebar spins on it while it works, the
+header says how many are going, and the launcher's dot pulses with the window closed.
+Each conversation keeps its own task list, and a permission prompt raised by one that
+is not on screen still appears -- named with the conversation that is asking, rather
+than timing out three minutes later and reporting to that model that you refused.
+
+**Subagents are managed, not just watched.** The Subagents panel is the register: every
+dispatch this session made, running ones first, with the task, which conversation asked,
+what it is allowed to touch, the tools it has called, how long it has been going, and a
+stop for each one that does not stop the turn that dispatched it. Finished dispatches
+stay with their report. The four ceilings -- budget, how many run at once, steps per
+subagent, and how deep delegation may go -- are on the same panel, and the last two had
+no control anywhere before it.
+
+**A dispatch is a conversation, not one question.** Every report carries the
+subagent's id, and `agent_followup` sends that same child another message with
+everything it found still in context: carry on where the step limit stopped you, now
+check this too, quote that line exactly. The transcript shows the second turn as a
+follow-up on the same subagent rather than as a new dispatch, and the newest few
+finished dispatches keep their context so there is something to follow up on.
+
+A sidebar holds the conversations, grouped by the place each happened in, with
+search across their transcripts and two arrows that walk where you have been. It
+collapses from the header and comes back the same way, and a conversation reopened
+after a restart shows what was said in it rather than a greeting -- the transcript is
+written to disk alongside the model's own context, which is the half that used to
+travel alone. An
+empty conversation opens with prompt starters and an expandable activity card: conversations, messages, tokens,
+active days, streaks, the busiest hour, the model that did the most work, and six
+months of daily activity as a grid. Every figure on it is counted from what this
+client observed and kept -- there is no sample data anywhere in the interface, and
+a number with nothing behind it is rendered as a zero and says why.
+
+Long conversations keep dialogue separate from tool activity, so a busy group of
+workers cannot push out your questions and replies. History limits are shown when
+older detail is removed. Resizing and maximizing preserve the live view; layout
+rebuilds remember where you were reading. **Message options → Refresh conversation**
+redraws messages and current activity without restarting the script or losing the
+draft. Older saves recover missing text when it still exists in saved model context.
+
+**Providers are a list and a detail pane**, not a card grid and a modal form. The
+detail names the endpoint a request will actually go to, the model-list route, the
+wire protocol, whether a socket is configured (and therefore whether a long reply can
+arrive at all), the health counters, the last observed latency, how long a benched
+provider has left, and the extra headers, body fields and query parameters the record
+sends. The API key is never rendered: it is set through a prompt and shown as its last
+four characters.
+
+The layout follows the live viewport: compact desktop controls on handhelds,
+a floating resizable window on a desktop, and a large centred panel on a console.
+It reflows on rotation and resize, lifts above the on-screen keyboard, and
+respects `ReducedMotionEnabled`. Handheld placement follows the selected Auto,
+Sheet, Panel or Window mode.
+
+## Layout
+
+```
+init.lua              bootstrap: builds env, mounts the app
+src/runtime/          util, signal, clock, caps, place, fsx, log, config, dispose
+src/net/              ua, http, sse, ws, bridge
+src/provider/         catalog, registry, openai, anthropic, chat, models, traits
+src/agent/            prompt, context, schema, registry, permissions,
+                      hooks, state, usage, stats, loop, session, subagent
+src/tools/            native tool groups behind one registry
+src/ui/               theme, responsive, icons, primitives, controls,
+                      overlay, markdown, window, sidebar, app,
+                      settingsrows, settingspanes, chat/*, panels/*
+bridge/               the optional web chat: node server plus its page
+dist/uai.lua          the built single file
+```
+
+`SPEC.md` is the contract every module is written against: the loader, the `env`
+table, the provider record, the tool handler signature, the event stream, what is
+counted and where it is persisted, and the authoring rules.
+
+## Building and testing
+
+Complete all source, test, build-tool and documentation edits before verification.
+The native command runs build, freshness, static checks, the main and every focused
+native suite, performance contracts and the official Luau compiler, in that order.
+It stops at the first failed stage; after any fix, restart the entire command.
+
+```bash
+node tools/test_native.js
+```
+
+Prerequisites are Node.js, LuaJIT and the official `luau-compile` executable. Set
+`LUAJIT` or `LUAU_COMPILE` to override paths. Stage logs and a behavioral coverage
+summary are written to ignored `refer/native-verification/`. There is no line
+coverage claim. Sources use a LuaJIT-compatible dialect; the native static checker
+enforces it, and the official compiler checks actual Luau syntax. See the testing
+guide for the exact stages and compiler setup.
+
+Build-only commands, also after implementation is complete:
+
+```bash
+luajit tools/bundle.lua --native
+node tools/build_site.js --bundle-only --check
+```
+
+The bundle includes a deterministic build ID and per-module hashes in
+`dist/uai.manifest.json`. Freshness is read-only and also detects stale embedded
+icons. These hashes identify content; they are not cryptographic signatures.
+
+`test/run.lua` loads `dist/uai.lua` -- the actual artifact -- into a mocked
+client: a virtual clock so nothing sleeps, an in-memory filesystem, a programmable
+HTTP layer that records every request, and an instance mock that resolves absolute
+geometry, type-checks property assignments and reports any unknown property or
+enum. The scenarios cover boot, capability degradation, the identity headers on
+the wire, model discovery, the tool loop, parallel calls, SSE assembly, retry,
+provider fallover, permissions, the repeat breaker, abort, context trimming,
+payload shape, argument repair, path traversal, viewport changes, theme changes,
+markdown, subagents and the parallel dispatch of several at once, a subagent
+resumed with a follow-up in the context it already had, the unlimited step budget
+for a turn and the separate one for a child, persistence, error surfaces, window
+drag and resize, overlay interaction, the layout invariants every surface has to
+hold, and the contrast of every colour pair the interface puts on screen. They
+also cover the two failure
+modes that are invisible from inside a single turn: that the sidebar's collapse
+control actually collapses it and offers a way back, and that no string leaves this
+client without being valid UTF-8 -- a scraped snippet with one Latin-1 byte in it
+used to poison the message history and kill every following request with a
+positionless "Can't convert to JSON".
+
+They also pin the interface to real state, which is the part that is easy to fake:
+that the activity card counts only what was recorded and survives a restart, that a
+history from before the counters existed is recovered from the transcripts rather
+than invented, that the conversation list is the threads the client has, that the
+permission chip reads the mode actually in force, that an attached file travels with
+the message, that a tool family switched off leaves the wire, that every settings
+pane builds, and that search finds a conversation by something said inside it.
+
+```bash
+luajit test/run.lua --native identity # run one native scenario
+luajit test/mock/selftest.lua     # check the mocks themselves
+```
+
+Lune can also compile all source modules and the shipped bundle with the real
+Luau compiler, then run a scenario file through the same offline harness:
+
+```bash
+lune run test/lune_runner.luau test/mobile_ui.lua
+lune run test/lune_runner.luau test/mobile_workflows.lua
+lune run test/lune_runner.luau test/shared_ui_layout.lua
+```
+
+These checks use mocked Roblox services. They verify code, geometry and
+interactions, but do not render native Roblox text or GUI layouts.
+
+For landscape image review, `test/mobile_snapshots.lua` exports UI trees from the
+built bundle under Lune. `node test/render_mobile.js <snapshot directory>` renders
+those trees with Playwright/Chromium; set `PLAYWRIGHT_MODULE` to an external
+Playwright installation if needed. These are approximate layout previews. Passing
+a second snapshot directory compares desktop UI trees with the previous build.
+Native rendering and keyboard behavior should also be checked in the Roblox client.
+
+## Public showcase website
+
+The public site lives in root `index.html`, `style.css`, and `script.js`. The
+`docs/` copies support GitHub Pages configured to publish from that directory.
+Edit the root files, then regenerate the marked catalog and release regions:
+
+```bash
+luajit tools/bundle.lua
+node tools/build_site.js
+node tools/build_site.js --check
+node --check script.js
+python test/site_static.py
+```
+
+The site build uses Node and LuaJIT without npm dependencies. It reads the actual
+bundled registry through the offline client harness and refuses stale bundles.
+The check mode does not write files. Static checks verify HTML structure, local
+links, accessibility references, copy targets, catalog coverage, and publishing
+parity without opening a browser or loading media.
+
+For manual browser review, check narrow and wide layouts, 200% zoom, keyboard
+navigation and Escape, repeated copying and denied clipboard access, search with
+no results, clearing filters, and video playback. The catalog and navigation
+remain usable without JavaScript; only search and copy controls need it.
+
+## First run
+
+The interface opens with a floating orb. There is nothing configured, so the
+conversation says so and points at the inference configuration. Add an endpoint,
+fetch its models or type one, and send a message.
+
+Permissions default to **Ask first**: reads run freely, anything that changes the
+game waits for you, and the prompt shows the arguments -- which for `run_luau`
+means the code. Read only, Auto and Allow everything are the other three modes, and
+the chip under the composer always names the one in force.
+
+Nothing on disk until then, and only three things after: `config.json`,
+`sessions/<id>.json` per conversation, and `stats.json` for the activity counters.
+A conversation can be marked isolated from the composer, which keeps it out of the
+first two entirely.
+
+## Cowork: your browser workspace
+
+Cowork gives your Roblox conversation more room in the browser. Keep Roblox and
+its local bridge running on the same computer. **Node.js 18+** is required; there
+are no production npm dependencies.
+
+1. In Roblox, open **UAI → Cowork → Download bridge files**. Open a terminal in
+   your executor workspace (the folder containing `UAI`) and run:
+
+   ```powershell
+   node UAI/bridge/start.txt
+   ```
+
+   From a Git checkout, run `node bridge/server.js` from the repository folder.
+2. Paste the terminal's **Token** into **UAI → Cowork**, match the printed
+   **Port**, and turn **Enabled** on.
+3. Open the terminal's browser link, choose a provider and model, and send a
+   message. Keep both Roblox and the terminal open.
+
+The installer saves `.txt` files so executors that block executable extensions
+can download them. Node verifies the package and restores its real filenames.
+No manual renaming is needed. A failed download preserves the previous launcher.
+After restarting the bridge, use its new token and browser link.
+
+Choose **Web runtime** in Cowork for live responses when your provider supports
+streaming. **Game runtime** uses the provider connection in Roblox. Switch while
+work is idle. The provider deadline defaults to 180 seconds and can be changed
+in Cowork's advanced settings.
+
+The browser includes conversations, provider/model controls, code attachments,
+permissions, tool forms, subagents, chat loops, memory, logs, exports and settings.
+Drafts are saved per conversation using asynchronous browser storage. System,
+light, dark, and Match Roblox themes work on desktop and small screens.
+
+PNG, JPEG and WebP pictures can be pasted, dropped, or attached for models that
+support **image input**. The bridge inserts the actual bytes into Chat Completions
+or Anthropic Messages image blocks, including when Game runtime is selected.
+Reload the updated client and restart the updated bridge for this capability.
+Image bytes remain in bridge memory and expire after 15 idle minutes or restart;
+reattach an expired image when needed. Text/code attachments remain readable files.
+
+Roblox remains in control of tools, permissions, memory, accounting, and saved
+conversation history. It must stay connected to advance a turn. Refreshing the
+browser reconnects to the conversation; use **Stop** to cancel work. Delivery
+receipts and streamed replies reconcile without creating duplicate messages.
+
+The bridge binds to loopback, requires a token, checks browser origins, and loads
+local UI assets without a CDN. Full configuration exports include API keys;
+ordinary browser state does not. See the [bridge guide](bridge/README.md) for
+troubleshooting, limits, architecture, and organized Node/Lua/browser tests.
+
+## Embedding
+
+Use UI LIB by itself for a script-owned interface, or load the full client and
+connect your controls to its sessions and tools. Read the comprehensive
+[embedding guide](docs/EMBEDDING.md) and
+[runnable workbench example](examples/embedding/README.md).
+
+```lua
+local uai = loadstring(game:HttpGet(
+	"https://raw.githubusercontent.com/Project-Ptolemy/ProjectUAI/main/dist/uai.lua"
+))({
+	prompt = "This host provides workbench_status and workbench_configure for its local settings.",
+})
+assert(uai and uai.alive, "UAI did not start; inspect the console error")
+uai.show("providers")
+```
+
+Register the named host tools through `uai.tools.register` before asking the
+agent to use them; prompt text alone does not install capabilities. The returned
+handle exposes `env`, `app`, `sessions`, `config`, `providers`, `tools`, `caps`,
+`bridge`, and `log`. Runtime methods use dots; UI LIB methods use colons.
+
+The full client always mounts its standard app. UI LIB is independent and mounts
+nothing until `CreateWindow`. A same-build client loader rerun toggles the live
+instance and ignores new context; reuse a saved handle or `getgenv().UAI` when
+attaching another view. Changed builds replace the client only after active and
+unsaved work is protected. Pin all bundle/module URLs to one reviewed commit SHA
+for reproducible host releases.
+
+## Notes on the constraints
+
+No Roblox HTTP API can read a response body incrementally, so `stream: true` does
+not deliver tokens as they arrive -- the whole SSE body lands at once and is
+replayed through the parser. It is still requested, because the streamed shape is
+where providers put reasoning text and per-request usage. `net/ws.lua` does real
+token streaming for a gateway that implements UAI's `{path, headers, body}`
+envelope, when the executor exposes `WebSocket.connect`, `websocket.connect` or
+`syn.websocket.connect`. It opens one socket per completion. This is a custom
+gateway contract, distinct from OpenAI Responses/Realtime and ordinary local
+HTTP servers; replacing `http://` with `ws://` does not enable it. Leave the socket
+URL empty for normal provider connections. The gateway receives the provider's
+authentication headers. Connect/setup failures before sending can fall back to
+HTTP; once sending begins, an uncertain outcome cannot trigger a second request.
+
+See [Provider compatibility and WebSockets](docs/PROVIDER_COMPATIBILITY.md) for
+the protocol contract, local-server setup, provider matrix and offline coverage.
+Ollama, LM Studio, vLLM, llama.cpp and SGLang presets use their Chat Completions
+APIs. Authentication defaults to none for these local servers; select Bearer when
+server authentication is enabled. Tools require a capable model and server
+template/parser. Compatibility fixtures require no models, keys or paid inference.
+
+Actual socket frames update the transcript immediately, with coalesced live
+previews and one final message. Buffered replies render in full when received;
+there is no simulated typing delay. The assistant is instructed to give brief
+progress messages between work steps. No prompt can expose tokens still buffered
+by the host or force a provider to speak while it is reasoning internally.
+
+Some executors stop HTTP requests after roughly 30–60 seconds even when given a
+longer timeout. The old 8,192-token executor ceiling has been removed, including
+HTTP fallback. Requests use `agent.maxTokens` (128,000 by default), explicit
+overrides, documented model limits and limits learned from provider refusals.
+Old saved `agent.executorReplyCeiling` values are ignored.
+Native request deadlines and long unanswered
+transport failures are terminal: the client does not resend a smaller request or
+fall back to another provider after an unknown outcome. A dispatched socket
+failure cannot silently send a second HTTP request. Explicit token-limit refusals
+can still teach a smaller ceiling. Large prompts can still spend the request
+window uploading and prefilling; `agent.contextTokens` remains 1,000,000 by
+default and can be lowered when short replies also time out.
+
+Automatic compaction summarises the oldest turns before a request would cross the
+budget, and the budget adapts to the model: when its context window is known,
+compaction starts at **Compact at** (`agent.contextFraction`, 80% by default) of
+that window, with `agent.contextTokens` as the hard ceiling. Pressure includes
+estimated messages, the rolling summary, and the system prompt/tool schemas from
+the prepared request. Provider usage calibrates that overhead against the history
+actually sent; changing providers, endpoints or models does not reuse another
+measurement. The context breakdown shares this calculation, labels estimates,
+and shows partial totals until the first request is prepared.
+**Compact now**, in the composer's message-options menu, folds older turns on
+demand; the **Summarise old turns** switch turns the paid summary off while the
+conversation is still trimmed to fit. The composer shows a live context-window
+counter beside the model -- the share of that budget the next request is expected
+to spend -- so the pressure is visible before a compaction happens.
+
+`check_luau` checks syntax without executing code. Both it and `run_luau` accept
+either inline `code` or a saved file `path`. Use `check_luau` with
+`{"path":"scripts/build.lua"}` to validate a script you edited, then run it by
+the same path. Its source stays on the client instead of being generated and sent again. Saved-paste
+references resolve the same way as `file_read`.
+
+`run_luau` captures print/warn, tables, and multiple return values, and inserts
+cooperative checkpoints in loop
+bodies without changing strings or comments. Its `timeout` argument accepts 1–60
+seconds and defaults to 10. It waits for functions started through its
+`task.spawn`, `task.defer`, and `task.delay` wrappers; errors, Stop, deadlines, and
+unload stop those managed tasks cooperatively. An endless spawned task therefore ends at the
+deadline rather than continuing silently after the tool returns.
+
+This is not a security sandbox. Dynamically compiled code, blocking engine calls,
+and callbacks registered on engine signals can bypass these controls. Later work
+in a persistent engine callback is outside a successfully completed call. UAI leaves
+native coroutines alive so pending Roblox/executor callbacks cannot resume a thread
+it closed. Managed waits and delayed callbacks check cancellation flags, including
+after a successful parent returns; `task.cancel` accepts only this script's task
+handles. Work suspended outside managed waits can still resume before its next
+checkpoint, and the result reports that uncertainty. Changes already made are not
+rolled back.
+
+`file_read` and `script_source` return contiguous slices and a continuation
+`offset` when more remains. Offsets count bytes and preserve UTF-8 boundaries.
+After reading a workspace file, use `file_edit` with exact `old_text` and `new_text`
+to change it. The default requires a unique match; `replace_all=true` replaces all
+non-overlapping matches. Empty replacement text deletes the match. The tool refuses
+a file that changed while the edit was being prepared.
+Prefer `file_edit` or `file_edit_many` for targeted changes to large files.
+`file_write` is for new files or replacing most of a file; it and `file_append`
+reject content over 2 MiB per call before writing.
+Build large new scripts in small sections, waiting for each write before the next
+append or edit to that file. Each section must be a complete tool call. Interrupted
+write arguments are rejected instead of repairing them into a partial edit. If a
+provider reports that its tool batch hit the token limit, none of those calls run;
+the model receives results asking it to retry with smaller, complete calls.
+
+See [CHANGELOG.md](CHANGELOG.md) or **App menu → What's new** (also under **About**)
+for the latest release notes. The in-game notes are bundled with the client;
+reload the updated bundle to see them. Updated notes restore the unread marker
+even when the client version stays the same.
+
+## Skills
+
+The main and subagent prompts require reading every enabled skill before the first
+reply or other work in each new or resumed conversation. Skill bodies are read
+through `skills_read`; the inventory alone does not count. Long bodies and
+`skills_list` results have byte-offset continuations that fit the tool result
+budget. Restricted subagents can read skills without gaining skill-writing tools.
+Disabled skills are skipped, and unavailable or denied reads are reported once.
+
+## Unloading
+
+The interface can be removed and everything it started stopped:
+
+```lua
+getgenv().UAI.destroy()
+```
+
+or from Settings, at the bottom: **Unload UAI**. Destroying the ScreenGui on its
+own is not enough -- timers keep ticking, input handlers stay bound to
+`UserInputService`, and a later config write would rebuild a window that is no
+longer on screen -- so anything outliving the instance tree registers a cleanup in
+`runtime/dispose` and the unload drains it. A turn in flight is aborted first and
+settings are flushed before the tree goes.
+
+## Community
+
+[Join our Discord](https://discord.gg/9xYyyYuKap).
+
+## License
+
+MIT. Do whatever you like with it, including commercially and in closed source --
+the only condition is that the copyright notice and permission notice travel with
+any substantial portion of it. See [LICENSE](LICENSE).

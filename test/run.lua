@@ -1,0 +1,7310 @@
+-- Headless scenarios against the built bundle.
+--
+--   luajit tools/bundle.lua && luajit test/run.lua
+--   luajit test/run.lua boot ua        (run only scenarios whose name matches)
+--
+-- Each scenario gets a fresh client: a new virtual clock, a new filesystem, a new
+-- interface. Nothing carries over, so a failure is always reproducible on its own.
+package.path = "test/?.lua;test/mock/?.lua;" .. package.path
+
+local envMock = require("env")
+local json = require("json")
+
+local suite = { passed = 0, failed = 0, scenarios = 0, failures = {} }
+local filters, nativeOnly = {}, false
+for index = 1, #(arg or {}) do
+	if arg[index] == "--native" then nativeOnly = true else filters[#filters + 1] = tostring(arg[index]):lower() end
+end
+
+local current = "?"
+
+local function report(ok, label, detail)
+	if ok then
+		suite.passed = suite.passed + 1
+		print("    ok   " .. label)
+	else
+		suite.failed = suite.failed + 1
+		suite.failures[#suite.failures + 1] = current .. " / " .. label
+		print("    FAIL " .. label)
+		if detail then
+			for line in tostring(detail):gmatch("[^\n]+") do print("           " .. line) end
+		end
+	end
+end
+
+local function check(label, got, want)
+	report(got == want, label, got == want and nil
+		or ("got  " .. tostring(got) .. "\nwant " .. tostring(want)))
+end
+
+local function truthy(label, value, detail)
+	report(value and true or false, label, (not value) and (detail or "value was falsy") or nil)
+end
+
+-- The negative of truthy, for asserting an absence rather than a presence.
+local function falsy(label, value)
+	report(not value, label, value ~= nil and ("got " .. tostring(value)) or nil)
+end
+
+local function contains(label, haystack, needle)
+	local found = type(haystack) == "string" and haystack:find(needle, 1, true) ~= nil
+	report(found, label, found and nil
+		or ("looking for: " .. tostring(needle) .. "\nin: " .. tostring(haystack):sub(1, 400)))
+end
+
+-- Compare rendered source as the reader sees it, independently of syntax colours.
+local function renderedText(text)
+	return (tostring(text or "")
+		:gsub("<[^>]+>", "")
+		:gsub("&lt;", "<"):gsub("&gt;", ">")
+		:gsub("&quot;", '"'):gsub("&apos;", "'")
+		:gsub("&amp;", "&"))
+end
+
+local function scenario(name, fn)
+	if nativeOnly and (name:lower():find("bridge", 1, true) or name:lower():find("cowork", 1, true)) then return end
+	if #filters > 0 then
+		local matched = false
+		for _, filter in ipairs(filters) do
+			if name:lower():find(filter, 1, true) then matched = true end
+		end
+		if not matched then return end
+	end
+	suite.scenarios = suite.scenarios + 1
+	current = name
+	print("  " .. name)
+	local ok, err = pcall(fn)
+	if not ok then
+		suite.failed = suite.failed + 1
+		suite.failures[#suite.failures + 1] = name .. " / crashed"
+		print("    FAIL scenario crashed")
+		for line in tostring(err):gmatch("[^\n]+") do print("           " .. line) end
+	end
+end
+
+-- Shared fixtures ----------------------------------------------------------
+
+local function chatBody(opts)
+	opts = opts or {}
+	local message = { role = "assistant", content = opts.content or "" }
+	if opts.reasoning then message.reasoning_content = opts.reasoning end
+	if opts.toolCalls then message.tool_calls = opts.toolCalls end
+	return json.encode({
+		id = "cmpl_1",
+		model = opts.model or "harness-model",
+		choices = { { index = 0, message = message, finish_reason = opts.finish or (opts.toolCalls and "tool_calls" or "stop") } },
+		usage = { prompt_tokens = 120, completion_tokens = 40, total_tokens = 160 },
+	})
+end
+
+-- An Anthropic Messages response, which is a different shape entirely: content is a
+-- list of typed blocks and the stop reason names tool_use rather than tool_calls.
+local function messagesBody(opts)
+	opts = opts or {}
+	local content = {}
+	if opts.text then content[#content + 1] = { type = "text", text = opts.text } end
+	if opts.toolUse then
+		content[#content + 1] = {
+			type = "tool_use",
+			id = opts.toolUse.id,
+			name = opts.toolUse.name,
+			input = opts.toolUse.input or {},
+		}
+	end
+	return json.encode({
+		id = "msg_harness",
+		type = "message",
+		role = "assistant",
+		model = opts.model or "claude-opus-5",
+		content = content,
+		stop_reason = opts.stop or (opts.toolUse and "tool_use" or "end_turn"),
+		usage = { input_tokens = 100, output_tokens = 20 },
+	})
+end
+
+local function toolCall(id, name, args)
+	return {
+		id = id,
+		type = "function",
+		["function"] = { name = name, arguments = json.encode(args or {}) },
+	}
+end
+
+-- Boots a client with one provider configured and a scripted HTTP handler.
+local function bootWith(opts)
+	opts = opts or {}
+	local harness = envMock.new({ executor = opts.executor })
+	harness.http.handler = opts.handler
+	local handle, err = harness.boot()
+	if not handle then error("boot failed: " .. tostring(err), 0) end
+	harness.settle(1)
+
+	if opts.provider ~= false then
+		local record = handle.providers.blank(opts.preset or "custom")
+		record.label = opts.label or "Harness"
+		record.baseUrl = opts.baseUrl or "https://harness.test/v1"
+		record.apiKey = "sk-harness-key-1234"
+		record.model = opts.model or "harness-model"
+		record.models = { opts.model or "harness-model" }
+		record.stream = opts.stream == true
+		local saved, problems = handle.providers.save(record)
+		if not saved then error("provider rejected: " .. table.concat(problems or {}, ", "), 0) end
+	end
+
+	harness.settle(1)
+	return harness, handle
+end
+
+local function chatRequests(harness)
+	local out = {}
+	for _, entry in ipairs(harness.http.log) do
+		if tostring(entry.url):find("/chat/completions") then out[#out + 1] = entry end
+	end
+	return out
+end
+
+local function providerCall(harness, adapter, record, request, seconds)
+	request = request or {}
+	request.messages = request.messages or { { role = "user", content = "hello" } }
+	request.attempts = request.attempts or 1
+	local result, err, response, done
+	harness.sched.spawn(function()
+		result, err, response = adapter.complete(record, request)
+		done = true
+	end)
+	harness.sched.advance(seconds or 0.25)
+	assert(done, "provider call did not finish: " .. tostring(harness.errors()[1] and harness.errors()[1].message))
+	return result, err, response
+end
+
+print("uai scenarios")
+print(("="):rep(72))
+
+-- 1. Boot ------------------------------------------------------------------
+
+scenario("boot mounts the interface", function()
+	local harness, handle = bootWith({ provider = false })
+
+	truthy("bootstrap returned a handle", handle ~= nil)
+	-- The version is asserted against the changelog's newest entry rather than
+	-- a hardcoded string: the two must agree or the What's New marker can never
+	-- clear, and this way a bump that forgets one of them fails here instead.
+	check("version reported", handle.version,
+		handle.env.require("runtime/changelog").latest().version)
+	truthy("handle is alive", handle.alive)
+
+	local screen = harness.screen()
+	truthy("a ScreenGui was created", screen ~= nil, harness.dump(harness.coreGui))
+	truthy("the launcher exists", screen:FindFirstChild("Launcher") ~= nil)
+	truthy("the window exists", screen:FindFirstChild("UAI_Window") ~= nil)
+	truthy("the overlay layer exists", screen:FindFirstChild("Overlay") ~= nil)
+
+	check("no thread errors during boot", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+	check("nothing was warned", #harness.console.warnings, 0,
+		table.concat(harness.console.warnings, "\n"))
+
+	local text = harness.textOf(screen)
+	contains("the sidebar offers a new conversation", text, "New conversation")
+	contains("and names the place the client is in", text, "Mock Place")
+	contains("the empty state explains what to do", text, "No provider configured")
+
+	-- Navigation is the sidebar's, and in a client whose panels are its surfaces the
+	-- panel list has to be reachable rather than hidden behind an invisible control.
+	local menuButton = harness.byName("Nav_menu", handle.app.sideHolder)
+	truthy("the app menu is reachable", menuButton ~= nil and menuButton.Visible)
+	harness.click(harness.byName("More"))
+	truthy("the panel list opens", harness.byName("NavRow_providers") ~= nil,
+		harness.dump(harness.byName("Sidebar")))
+	harness.click(harness.byName("NavRow_providers"))
+	check("and switches panel", handle.app.panel, "providers")
+end)
+
+-- 2. Capabilities ----------------------------------------------------------
+
+scenario("capabilities are detected from the host", function()
+	local harness, handle = bootWith({ provider = false })
+	check("executor transport chosen", handle.caps.http, "executor")
+	check("user agent supported", handle.caps.uaSupported, true)
+	check("filesystem detected", handle.caps.fs, true)
+	check("code execution detected", handle.caps.exec, true)
+	check("executor identified", handle.caps.executor, "OfflineHarness 1.0")
+
+	local vanilla = envMock.new({ executor = false })
+	local vanillaHandle = select(1, vanilla.boot())
+	truthy("a client with no executor still boots", vanillaHandle ~= nil)
+	check("falls back to HttpService", vanillaHandle.caps.http, "roblox")
+	check("reports that it cannot set a user agent", vanillaHandle.caps.uaSupported, false)
+	check("reports no filesystem", vanillaHandle.caps.fs, false)
+end)
+
+-- 3. Claude Code identity --------------------------------------------------
+
+scenario("requests carry the Claude Code identity", function()
+	local harness, handle = bootWith({
+		handler = function() return { StatusCode = 200, Body = chatBody({ content = "Ready." }) } end,
+	})
+
+	handle.sessions.current().send("hello")
+	harness.settle(6)
+
+	local requests = chatRequests(harness)
+	check("one chat request was sent", #requests, 1)
+	local headers = requests[1] and requests[1].headers or {}
+
+	contains("user agent is the claude-cli string", tostring(headers["User-Agent"]), "claude-cli/")
+	contains("user agent marks itself external", tostring(headers["User-Agent"]), "(external, cli)")
+	check("x-app identifies the cli", headers["x-app"], "cli")
+	check("stainless language header", headers["X-Stainless-Lang"], "js")
+	check("stainless runtime header", headers["X-Stainless-Runtime"], "node")
+	truthy("stainless os header present", headers["X-Stainless-OS"] ~= nil)
+	truthy("stainless arch header present", headers["X-Stainless-Arch"] ~= nil)
+	check("retry count starts at zero", headers["X-Stainless-Retry-Count"], "0")
+	check("authorization uses the key", headers["Authorization"], "Bearer sk-harness-key-1234")
+	check("the executor transport was used", requests[1].via, "executor")
+
+	-- And the identity is genuinely gone on a transport that cannot carry it.
+	local vanilla = envMock.new({ executor = false })
+	vanilla.http.handler = function() return { StatusCode = 200, Body = chatBody({ content = "ok" }) } end
+	local vanillaHandle = select(1, vanilla.boot())
+	local record = vanillaHandle.providers.blank("custom")
+	record.label = "Vanilla"
+	record.baseUrl = "https://harness.test/v1"
+	record.apiKey = "sk-key"
+	record.model = "m"
+	record.models = { "m" }
+	vanillaHandle.providers.save(record)
+	vanillaHandle.sessions.current().send("hello")
+	vanilla.settle(6)
+
+	local vanillaRequests = chatRequests(vanilla)
+	truthy("the vanilla client still sent the request", #vanillaRequests >= 1)
+	local dropped = vanillaRequests[1] and vanillaRequests[1].droppedHeaders or {}
+	local sawUserAgent = false
+	for _, name in ipairs(dropped) do
+		if tostring(name):lower() == "user-agent" then sawUserAgent = true end
+	end
+	truthy("RequestAsync dropped the user agent, as the real one does", sawUserAgent,
+		"dropped: " .. table.concat(dropped, ", "))
+
+	-- The client's own request log is what the Logs panel shows, so it has to say
+	-- the identity did not make it rather than implying it did.
+	local clientHistory = vanillaHandle.env.require("net/http").history
+	local lastEntry = clientHistory[#clientHistory]
+	truthy("the client logged the request", lastEntry ~= nil)
+	check("and records that the identity did not reach the wire", lastEntry.uaSent, false)
+	check("while the executor client records that it did",
+		(function()
+			local history = handle.env.require("net/http").history
+			return history[#history].uaSent
+		end)(), true)
+end)
+
+-- 4. Models ----------------------------------------------------------------
+
+scenario("models come from the endpoint, never from a guess", function()
+	local harness, handle = bootWith({
+		handler = function(entry)
+			if tostring(entry.url):find("/models") then
+				return {
+					StatusCode = 200,
+					Body = json.encode({ data = {
+						{ id = "zeta-1" }, { id = "alpha-2" }, { id = "text-embedding-9" },
+					} }),
+				}
+			end
+			return { StatusCode = 200, Body = chatBody({ content = "hi" }) }
+		end,
+	})
+
+	local catalog = handle.env.require("provider/catalog")
+	local seeded = 0
+	for _, preset in ipairs(catalog.presets) do
+		seeded = seeded + #(preset.models or {})
+	end
+	check("no preset ships a model list", seeded, 0)
+
+	local models = handle.env.require("provider/models")
+	local record = handle.providers.active()
+	local found, note = models.discover(record, { force = true })
+	harness.settle(1)
+
+	check("every id the endpoint returned is offered", #found, 3)
+	check("sorted", found[1], "alpha-2")
+	contains("the note names the endpoint", note, "/models")
+	truthy("nothing was filtered out",
+		table.concat(found, ","):find("text-embedding-9", 1, true) ~= nil,
+		table.concat(found, ","))
+
+	local listed = models.list(record)
+	check("the manual entry still ranks first", listed[1], "harness-model")
+
+	-- Manual addition is a first-class path, for endpoints with no /models route.
+	local added, result = models.add(record, "typed-by-hand")
+	check("a typed id is accepted", added, true)
+	check("and becomes the selection", handle.providers.active().model, "typed-by-hand")
+	check("the second add of the same id is rejected", select(1, models.add(record, "typed-by-hand")), false)
+
+	models.remove(record, "typed-by-hand")
+	truthy("removal falls back to another model", handle.providers.active().model ~= "typed-by-hand")
+
+	local strict = handle.providers.blank("custom")
+	strict.label = "No model"
+	strict.baseUrl = "https://x.test/v1"
+	strict.apiKey = "sk-y"
+	local okSave, problems = handle.providers.save(strict)
+	check("a provider with no model is refused", okSave, false)
+	contains("and says why", table.concat(problems or {}, " "), "model")
+end)
+
+-- 5. Tool loop -------------------------------------------------------------
+
+scenario("the loop runs tools and answers", function()
+	local step = 0
+	local harness, handle = bootWith({
+		handler = function(entry)
+			if not tostring(entry.url):find("/chat/completions") then
+				return { StatusCode = 404, Body = "{}" }
+			end
+			step = step + 1
+			if step == 1 then
+				return { StatusCode = 200, Body = chatBody({
+					content = "Let me look.",
+					toolCalls = { toolCall("call_1", "game_info", {}) },
+				}) }
+			end
+			return { StatusCode = 200, Body = chatBody({ content = "This place is Mock Place 123456789." }) }
+		end,
+	})
+
+	local session = handle.sessions.current()
+	session.send("what game is this")
+	harness.settle(8)
+
+	check("two requests were made", #chatRequests(harness), 2)
+	check("the session is idle again", session.busy, false)
+
+	local kinds = {}
+	for _, event in ipairs(session.log) do kinds[event.kind] = (kinds[event.kind] or 0) + 1 end
+	check("a tool call was announced", kinds["tool:call"], 1)
+	check("a tool result came back", kinds["tool:result"], 1)
+	check("the turn ended", kinds["turn:end"], 1)
+	check("nothing errored", kinds["error"], nil)
+
+	local roles = {}
+	for _, message in ipairs(session.ctx.messages) do roles[#roles + 1] = message.role end
+	check("context holds user, assistant, tool, assistant", table.concat(roles, ","),
+		"user,assistant,tool,assistant")
+
+	local toolMessage = session.ctx.messages[3]
+	contains("the tool result reached the model", toolMessage.content, "PlaceId")
+	check("the tool result is addressed to its call", toolMessage.tool_call_id, "call_1")
+
+	local screen = harness.textOf()
+	contains("the transcript shows the tool", screen, "game_info")
+	contains("the transcript shows the answer", screen, "Mock Place")
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+-- 6. Parallel tool calls ---------------------------------------------------
+
+scenario("tool calls in one turn run together", function()
+	local step = 0
+	local harness, handle = bootWith({
+		handler = function(entry)
+			if not tostring(entry.url):find("/chat/completions") then return { StatusCode = 404, Body = "{}" } end
+			step = step + 1
+			if step == 1 then
+				return { StatusCode = 200, Body = chatBody({
+					toolCalls = {
+						toolCall("a", "game_info", {}),
+						toolCall("b", "players_list", {}),
+						toolCall("c", "agent_status", {}),
+					},
+				}) }
+			end
+			return { StatusCode = 200, Body = chatBody({ content = "Done." }) }
+		end,
+	})
+
+	local session = handle.sessions.current()
+	session.send("three things at once")
+	harness.settle(10)
+
+	local results = 0
+	for _, event in ipairs(session.log) do
+		if event.kind == "tool:result" then results = results + 1 end
+	end
+	check("all three results came back", results, 3)
+
+	local toolMessages = 0
+	for _, message in ipairs(session.ctx.messages) do
+		if message.role == "tool" then toolMessages = toolMessages + 1 end
+	end
+	check("all three reached the model", toolMessages, 3)
+	check("nothing errored", #harness.errors(), 0)
+end)
+
+-- 7. Streaming -------------------------------------------------------------
+
+scenario("a streamed body is assembled", function()
+	local frames = {
+		{ choices = { { index = 0, delta = { role = "assistant", content = "The " } } } },
+		{ choices = { { index = 0, delta = { content = "answer" } } } },
+		{ choices = { { index = 0, delta = { reasoning_content = "thinking about it" } } } },
+		{ choices = { { index = 0, delta = { content = " is 42." } } } },
+		{ choices = { { index = 0, delta = {}, finish_reason = "stop" } },
+			usage = { prompt_tokens = 7, completion_tokens = 3, total_tokens = 10 } },
+	}
+	local body = {}
+	for _, frame in ipairs(frames) do body[#body + 1] = "data: " .. json.encode(frame) end
+	body[#body + 1] = "data: [DONE]"
+
+	local harness, handle = bootWith({
+		stream = true,
+		handler = function() return { StatusCode = 200, Body = table.concat(body, "\n\n") .. "\n\n" } end,
+	})
+
+	local session = handle.sessions.current()
+	session.send("what is the answer")
+	harness.settle(6)
+
+	local last = session.ctx.messages[#session.ctx.messages]
+	check("content was concatenated in order", last.content, "The answer is 42.")
+	check("reasoning was kept separately", last.reasoning, "thinking about it")
+
+	local requests = chatRequests(harness)
+	contains("stream was requested", requests[1].body, '"stream":true')
+	contains("usage was requested with it", requests[1].body, "include_usage")
+
+	-- The tool_calls fragment assembly is the part that actually needs testing:
+	-- name arrives once, arguments arrive in pieces.
+	local sse = handle.env.require("net/sse")
+	local pieces = {
+		{ choices = { { delta = { tool_calls = { { index = 0, id = "call_x", ["function"] = { name = "instance_get" } } } } } } },
+		{ choices = { { delta = { tool_calls = { { index = 0, ["function"] = { arguments = '{"pa' } } } } } } },
+		{ choices = { { delta = { tool_calls = { { index = 0, ["function"] = { arguments = 'th":"Workspace"}' } } } } } } },
+		{ choices = { { delta = {}, finish_reason = "tool_calls" } } },
+	}
+	local raw = {}
+	for _, piece in ipairs(pieces) do raw[#raw + 1] = "data: " .. json.encode(piece) end
+	local parsed = sse.parse(table.concat(raw, "\n\n") .. "\n\ndata: [DONE]\n\n")
+	check("one call was assembled", #parsed.toolCalls, 1)
+	check("its id survived", parsed.toolCalls[1].id, "call_x")
+	check("its name survived", parsed.toolCalls[1]["function"].name, "instance_get")
+	check("its arguments were joined", parsed.toolCalls[1]["function"].arguments, '{"path":"Workspace"}')
+	check("finish reason read", parsed.finish, "tool_calls")
+end)
+
+-- 8. Retry and fallback ----------------------------------------------------
+
+scenario("a rate limit is retried and a dead provider is skipped", function()
+	local attempts = 0
+	local harness, handle = bootWith({
+		handler = function(entry)
+			if not tostring(entry.url):find("/chat/completions") then return { StatusCode = 404, Body = "{}" } end
+			attempts = attempts + 1
+			if attempts == 1 then
+				return { StatusCode = 429, Body = '{"error":{"message":"slow down"}}', Headers = { ["Retry-After"] = "1" } }
+			end
+			return { StatusCode = 200, Body = chatBody({ content = "Recovered." }) }
+		end,
+	})
+
+	local session = handle.sessions.current()
+	session.send("hello")
+	harness.settle(20)
+
+	check("it retried once and then succeeded", attempts, 2)
+	local retried = false
+	for _, event in ipairs(session.log) do
+		if event.kind == "request:retry" then retried = true end
+	end
+	truthy("the retry was reported to the interface", retried)
+	check("the answer landed", session.ctx.messages[#session.ctx.messages].content, "Recovered.")
+end)
+
+scenario("a failing provider hands over to the next", function()
+	local harness, handle = bootWith({
+		label = "Primary",
+		baseUrl = "https://primary.test/v1",
+		handler = function(entry)
+			if tostring(entry.url):find("primary") then
+				return { StatusCode = 500, Body = '{"error":{"message":"boom"}}' }
+			end
+			return { StatusCode = 200, Body = chatBody({ content = "Secondary answered." }) }
+		end,
+	})
+
+	local second = handle.providers.blank("custom")
+	second.label = "Secondary"
+	second.baseUrl = "https://secondary.test/v1"
+	second.apiKey = "sk-second"
+	second.model = "second-model"
+	second.models = { "second-model" }
+	handle.providers.save(second)
+
+	-- Fallback ships off by default, so the behaviour under test is turned on
+	-- explicitly here rather than relying on the default.
+	handle.config.set("agent.fallback", true)
+
+	local session = handle.sessions.current()
+	session.send("hello")
+	harness.settle(30)
+
+	local switched = false
+	for _, event in ipairs(session.log) do
+		if event.kind == "provider:switch" then switched = true end
+	end
+	truthy("the switch was reported", switched)
+	check("the second provider answered", session.ctx.messages[#session.ctx.messages].content,
+		"Secondary answered.")
+
+	local primary = handle.providers.get(handle.providers.list()[1].id)
+	truthy("the failure was recorded against a provider",
+		(handle.providers.get("primary") or primary).health.fail > 0)
+end)
+
+scenario("transient failures are retried and real refusals are not", function()
+	local _, handle = bootWith({ provider = false })
+	local http = handle.env.require("net/http")
+
+	-- The policy is a predicate, so it is cheaper and far clearer to state it
+	-- exhaustively here than to script fifteen handlers. The 403 rows are the point:
+	-- these gateways return one for an exhausted shared quota or an edge filter and
+	-- interleave them with 200s, so the body is what separates "busy" from "no".
+	local cases = {
+		{ "a transient connection error", nil, "connection reset", true },
+		{ "a transport timeout with unknown outcome", nil, "timed out", false },
+		{ "408", { status = 408, body = "" }, nil, true },
+		{ "429", { status = 429, body = "" }, nil, true },
+		{ "500", { status = 500, body = "" }, nil, true },
+		{ "529", { status = 529, body = "" }, nil, true },
+		{ "a 502 HTML error page", { status = 502, body = "<html>bad gateway</html>" }, nil, true },
+		{ "a 403 with no body at all", { status = 403, body = "" }, nil, true },
+		{ "a 403 naming an exhausted quota", { status = 403,
+			body = '{"error":{"message":"用户额度不足"}}' }, nil, true },
+		{ "a 403 refusing the model", { status = 403,
+			body = '{"error":{"message":"You do not have access to this model"}}' }, nil, false },
+		{ "401", { status = 401, body = '{"error":{"message":"bad key"}}' }, nil, false },
+		{ "404", { status = 404, body = '{"error":{"message":"no such model"}}' }, nil, false },
+		{ "a 400 schema complaint", { status = 400,
+			body = '{"error":{"message":"TOOL_SCHEMA_INVALID"}}' }, nil, false },
+		{ "a 200 hiding an overload", { status = 200, ok = true,
+			body = '{"error":{"message":"server_is_overloaded"}}' }, nil, true },
+		{ "a 200 hiding a rate limit in an SSE frame", { status = 200, ok = true,
+			body = 'data: {"type":"error","error":{"message":"upstream_provider_rate_limit"}}' }, nil, true },
+		{ "a 200 whose reply merely mentions rate limits", { status = 200, ok = true,
+			body = '{"choices":[{"message":{"content":"You will hit a rate_limit if you loop."}}]}' }, nil, false },
+	}
+	for _, case in ipairs(cases) do
+		local got = http.shouldRetry(case[2], case[3]) and true or false
+		check(case[1] .. " -> " .. (case[4] and "retry" or "report"), got, case[4])
+	end
+
+	-- And end to end, because the unit table proves the predicate and not the wiring:
+	-- a bodyless 403 followed by a 200 has to produce an answer rather than an error,
+	-- which is exactly the sequence in the log that prompted this.
+	local hits = 0
+	local live, liveHandle = bootWith({
+		handler = function(entry)
+			if not tostring(entry.url):find("/chat/completions") then
+				return { StatusCode = 404, Body = "{}" }
+			end
+			hits = hits + 1
+			if hits == 1 then return { StatusCode = 403, Body = "" } end
+			return { StatusCode = 200, Body = chatBody({ content = "Recovered after a 403." }) }
+		end,
+	})
+	local session = liveHandle.sessions.current()
+	session.send("hello")
+	live.settle(30)
+
+	check("the bodyless 403 was retried once", hits, 2)
+	check("and the answer landed", session.ctx.messages[#session.ctx.messages].content,
+		"Recovered after a 403.")
+	local reason
+	for _, event in ipairs(session.log) do
+		if event.kind == "request:retry" then reason = event.reason end
+	end
+	truthy("the transcript was told a retry happened", reason ~= nil, "no request:retry event")
+	contains("and why", tostring(reason), "403")
+	check("no thread errors", #live.errors(), 0,
+		live.errors()[1] and live.errors()[1].traceback or nil)
+end)
+
+scenario("a minimal request that dies on a deadline is not paid for twice", function()
+	-- The gateway accepts the request and bills the whole prompt; the transport gives
+	-- up a minute later with no status and no headers of its own. Read as a bodyless
+	-- refusal worth another go, one turn became three identical billed requests.
+	local harness, handle = bootWith({
+		handler = function(entry)
+			if not tostring(entry.url):find("/chat/completions") then
+				return { StatusCode = 404, Body = "{}" }
+			end
+			return { StatusCode = 403, Body = "", headerless = true, delay = 20 }
+		end,
+	})
+
+	handle.config.set("agent.maxTokens", 2000)
+	handle.config.set("agent.effort", "off")
+	local session = handle.sessions.current()
+	session.send("hello")
+	harness.settle(180)
+
+	check("the dead request was sent once", #chatRequests(harness), 1)
+
+	local retried, errorEvent
+	for _, event in ipairs(session.log) do
+		if event.kind == "request:retry" then retried = event end
+		if event.kind == "error" then errorEvent = event end
+	end
+	truthy("and never repeated", retried == nil)
+	truthy("an error was reported", errorEvent ~= nil)
+	contains("naming the wait, not a status the server never sent",
+		errorEvent and errorEvent.message or "", "nothing returned after")
+	check("the session recovered", session.busy, false)
+
+	-- Headers present means a real server answered, and the rule that retries an
+	-- unexplained 403 still applies to it.
+	local http = handle.env.require("net/http")
+	check("a prompt bodyless 403 is still retried",
+		http.shouldRetry({ status = 403, body = "" }, nil, { elapsed = 400 }) and true or false, true)
+	check("the same 403 after a minute is not",
+		http.shouldRetry({ status = 403, body = "" }, nil, { elapsed = 60000 }) and true or false, false)
+	check("nor a transport error that took a minute to produce nothing",
+		http.shouldRetry(nil, "gave up", { elapsed = 60000 }) and true or false, false)
+	check("while a quick one still is",
+		http.shouldRetry(nil, "connection reset", { elapsed = 120 }) and true or false, true)
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+-- 9. Permissions -----------------------------------------------------------
+
+scenario("a write tool waits for permission", function()
+	local step = 0
+	local harness, handle = bootWith({
+		handler = function(entry)
+			if not tostring(entry.url):find("/chat/completions") then return { StatusCode = 404, Body = "{}" } end
+			step = step + 1
+			if step == 1 then
+				return { StatusCode = 200, Body = chatBody({
+					toolCalls = { toolCall("w1", "instance_create", { class = "Folder", name = "Made", parent = "Workspace" }) },
+				}) }
+			end
+			return { StatusCode = 200, Body = chatBody({ content = "Created it." }) }
+		end,
+	})
+
+	handle.config.set("permissions.mode", "ask")
+
+	local asked = nil
+	local session = handle.sessions.current()
+	session.events:connect(function(event)
+		if event.kind == "permission:ask" then
+			asked = event
+			event.resolve(true, false)
+		end
+	end)
+
+	session.send("make a folder called Made")
+	harness.settle(10)
+
+	truthy("permission was requested", asked ~= nil)
+	check("for the right tool", asked and asked.name, "instance_create")
+	check("marked as a write", asked and asked.risk, "write")
+	truthy("the arguments were passed to the prompt", asked and asked.args and asked.args.class == "Folder")
+	truthy("the folder now exists", harness.workspace:FindFirstChild("Made") ~= nil,
+		harness.dump(harness.workspace))
+
+	-- And a denial stops it.
+	local denied = envMock.new({})
+	local deniedRequests = 0
+	denied.http.handler = function(entry)
+		if not tostring(entry.url):find("/chat/completions") then return { StatusCode = 404, Body = "{}" } end
+		deniedRequests = deniedRequests + 1
+		if deniedRequests > 1 then return { StatusCode = 200, Body = chatBody({ content = "The requested change was not approved." }) } end
+		return { StatusCode = 200, Body = chatBody({
+			toolCalls = { toolCall("w2", "instance_create", { class = "Folder", name = "Nope", parent = "Workspace" }) },
+		}) }
+	end
+	local deniedHandle = select(1, denied.boot())
+	local record = deniedHandle.providers.blank("custom")
+	record.label = "D"
+	record.baseUrl = "https://harness.test/v1"
+	record.apiKey = "sk-d"
+	record.model = "m"
+	record.models = { "m" }
+	deniedHandle.providers.save(record)
+	deniedHandle.config.set("permissions.mode", "ask")
+	local deniedSession = deniedHandle.sessions.current()
+	deniedSession.events:connect(function(event)
+		if event.kind == "permission:ask" then event.resolve(false, false) end
+	end)
+	deniedSession.send("make a folder")
+	denied.settle(12)
+	check("a denied tool creates nothing", denied.workspace:FindFirstChild("Nope"), nil)
+	local sawDenial = false
+	for _, message in ipairs(deniedSession.ctx.messages) do
+		if message.role == "tool" and tostring(message.content):find("did not approve") then sawDenial = true end
+	end
+	truthy("the model was told it was refused", sawDenial)
+end)
+
+scenario("read-only mode hides everything that writes", function()
+	local harness, handle = bootWith({ provider = false })
+	handle.config.set("permissions.mode", "readonly")
+	local definitions = handle.tools.definitions()
+	local writes = 0
+	for _, definition in ipairs(definitions) do
+		local tool = handle.tools.get(definition["function"].name)
+		if tool and tool.risk ~= "read" then writes = writes + 1 end
+	end
+	check("no write tool is offered", writes, 0)
+	truthy("read tools are still offered", #definitions > 10)
+
+	handle.config.set("permissions.mode", "auto")
+	local all = handle.tools.definitions()
+	truthy("auto mode offers more", #all > #definitions)
+end)
+
+-- 10. Loop safety ----------------------------------------------------------
+
+scenario("an identical repeated call is broken", function()
+	local harness, handle = bootWith({
+		handler = function(entry)
+			if not tostring(entry.url):find("/chat/completions") then return { StatusCode = 404, Body = "{}" } end
+			return { StatusCode = 200, Body = chatBody({
+				toolCalls = { toolCall("same", "game_info", {}) },
+			}) }
+		end,
+	})
+	handle.config.set("agent.maxTurns", 8)
+	handle.config.set("agent.unlimitedTurns", false)
+
+	local session = handle.sessions.current()
+	session.send("loop please")
+	harness.settle(30)
+
+	local rejected = false
+	for _, message in ipairs(session.ctx.messages) do
+		if message.role == "tool" and tostring(message.content):find("will not be run again") then
+			rejected = true
+		end
+	end
+	truthy("the repeat was refused rather than run forever", rejected)
+	check("the session finished", session.busy, false)
+end)
+
+scenario("a stop request ends the turn", function()
+	local harness, handle = bootWith({
+		handler = function(entry)
+			if not tostring(entry.url):find("/chat/completions") then return { StatusCode = 404, Body = "{}" } end
+			return { StatusCode = 200, Body = chatBody({
+				toolCalls = { toolCall("w" .. tostring(math.floor(1)), "wait", { seconds = 2 }) },
+			}) }
+		end,
+	})
+	handle.config.set("permissions.mode", "full")
+
+	local session = handle.sessions.current()
+	session.send("wait around")
+	harness.settle(0.5)
+	session.abort()
+	harness.settle(12)
+
+	check("the session is idle", session.busy, false)
+	local aborted = false
+	for _, event in ipairs(session.log) do
+		if event.kind == "abort" then aborted = true end
+	end
+	truthy("an abort was reported", aborted)
+end)
+
+-- The step limit is there to stop a runaway, but on a long job it stops the work
+-- instead: the turn ends part-way through with "I reached this session's step limit"
+-- and the user has to ask it to continue. `agent.unlimitedTurns` removes it, and the
+-- turn deadline with it -- a fifteen-minute ceiling left standing behind a switch
+-- labelled unlimited stops the same job at roughly twice the step count and reports
+-- it as running out of time.
+scenario("unlimited tool calls runs past the step limit", function()
+	-- Alternating tool names, because the repeat breaker is the bound that stays in
+	-- force and three identical batches would trip it before the ninth step.
+	local function scripted()
+		local step = 0
+		return function(entry)
+			if not tostring(entry.url):find("/chat/completions") then return { StatusCode = 404, Body = "{}" } end
+			step = step + 1
+			if step <= 9 then
+				return { StatusCode = 200, Body = chatBody({
+					toolCalls = { toolCall("c" .. tostring(step),
+						(step % 2 == 0) and "todo_read" or "game_info", {}) },
+				}) }
+			end
+			return { StatusCode = 200, Body = chatBody({ content = "Finished after nine steps." }) }
+		end
+	end
+
+	local limited, limitedHandle = bootWith({ handler = scripted() })
+	limitedHandle.config.set("agent.maxTurns", 4)
+	limitedHandle.config.set("agent.unlimitedTurns", false)
+	local capped = limitedHandle.sessions.current()
+	capped.send("do a long job")
+	limited.settle(40)
+
+	local stopped
+	for _, event in ipairs(capped.log) do
+		if event.kind == "error" then stopped = event.message end
+	end
+	contains("the configured step limit stops a bounded turn", stopped or "", "Reached the step limit of 4")
+	check("after exactly that many requests", #chatRequests(limited), 4)
+
+	local free, freeHandle = bootWith({ handler = scripted() })
+	freeHandle.config.set("agent.maxTurns", 4)
+	freeHandle.config.set("agent.unlimitedTurns", true)
+	local session = freeHandle.sessions.current()
+	session.send("do the same long job")
+	free.settle(60)
+
+	check("with the switch on it works through to the answer",
+		session.ctx.messages[#session.ctx.messages].content, "Finished after nine steps.")
+	check("which took more steps than the limit allowed", #chatRequests(free), 10)
+
+	local reported, announced
+	for _, event in ipairs(session.log) do
+		if event.kind == "error" then reported = event.message end
+		if event.kind == "turn:start" then announced = event.unlimited end
+	end
+	check("nothing was reported as a limit", reported, nil)
+	check("and the turn said so when it started", announced, true)
+	check("the session is idle again", session.busy, false)
+	check("no thread errors", #free.errors(), 0,
+		free.errors()[1] and free.errors()[1].traceback or nil)
+end)
+
+-- A subagent runs this same loop, so the switch has to stop at the conversation the
+-- user is watching. A child is dispatched with a step budget of its own; if the
+-- toggle overrode that too, the one session nobody is looking at would be the one
+-- with no bound on it.
+scenario("unlimited tool calls does not reach a subagent", function()
+	local parentStep, childStep = 0, 0
+	local harness, handle = bootWith({
+		handler = function(entry)
+			if not tostring(entry.url):find("/chat/completions") then return { StatusCode = 404, Body = "{}" } end
+			-- The child's requests are the ones carrying the subagent brief.
+			if tostring(entry.body):find("You are a subagent", 1, true) then
+				childStep = childStep + 1
+				return { StatusCode = 200, Body = chatBody({
+					toolCalls = { toolCall("k" .. tostring(childStep),
+						(childStep % 2 == 0) and "players_list" or "game_info", {}) },
+				}) }
+			end
+			parentStep = parentStep + 1
+			if parentStep == 1 then
+				return { StatusCode = 200, Body = chatBody({
+					toolCalls = { toolCall("d1", "dispatch_agent", { task = "dig forever", preset = "read" }) },
+				}) }
+			end
+			return { StatusCode = 200, Body = chatBody({ content = "The subagent ran out of steps." }) }
+		end,
+	})
+	handle.config.set("permissions.mode", "full")
+	handle.config.set("agent.unlimitedTurns", true)
+	handle.config.set("agent.subagentTurns", 3)
+	handle.config.set("agent.subagentUnlimited", false)
+
+	local session = handle.sessions.current()
+	session.send("delegate something endless")
+	harness.settle(60)
+
+	check("the child stopped at its own step budget", childStep, 3)
+
+	local report
+	for _, message in ipairs(session.ctx.messages) do
+		if message.role == "tool" then report = message end
+	end
+	contains("and said so in its report", report and report.content or "", "step limit")
+	check("the parent, which is unlimited, carried on and answered",
+		session.ctx.messages[#session.ctx.messages].content, "The subagent ran out of steps.")
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+-- The other half of that decision.
+--
+-- Holding the line at the watched conversation leaves the delegated half of a long job
+-- stopping mid-way and saying so -- the whole dispatch spent producing "I reached this
+-- session's step limit before finishing", which is the one outcome that answers nothing.
+-- `subagentUnlimited` is the switch that says otherwise, and it has to reach the child
+-- without the parent's switch being involved at all.
+scenario("the subagent switch lifts a child's own limits", function()
+	local parentStep, childStep = 0, 0
+	local harness, handle = bootWith({
+		handler = function(entry)
+			if not tostring(entry.url):find("/chat/completions") then return { StatusCode = 404, Body = "{}" } end
+			if tostring(entry.body):find("You are a subagent", 1, true) then
+				childStep = childStep + 1
+				if childStep <= 8 then
+					return { StatusCode = 200, Body = chatBody({
+						toolCalls = { toolCall("k" .. tostring(childStep),
+							(childStep % 2 == 0) and "players_list" or "game_info", {}) },
+					}) }
+				end
+				return { StatusCode = 200, Body = chatBody({ content = "Nine steps in, here is the answer." }) }
+			end
+			parentStep = parentStep + 1
+			if parentStep == 1 then
+				return { StatusCode = 200, Body = chatBody({
+					toolCalls = { toolCall("d1", "dispatch_agent",
+						{ task = "dig for as long as it takes", preset = "read" }) },
+				}) }
+			end
+			return { StatusCode = 200, Body = chatBody({ content = "The subagent got there." }) }
+		end,
+	})
+	handle.config.set("permissions.mode", "full")
+	handle.config.set("agent.subagentTurns", 3)
+	handle.config.set("agent.subagentUnlimited", true)
+
+	local session = handle.sessions.current()
+	session.send("delegate something long")
+	harness.settle(90)
+
+	check("the child ran past the step limit it was given", childStep, 9)
+
+	local report
+	for _, message in ipairs(session.ctx.messages) do
+		if message.role == "tool" then report = tostring(message.content) end
+	end
+	contains("and answered rather than reporting a limit", report or "", "Nine steps in")
+	truthy("no step limit was reported at all",
+		(report or ""):find("step limit", 1, true) == nil, report)
+
+	local record = handle.env.require("agent/subagent").list()[1]
+	truthy("the register kept the dispatch", record ~= nil)
+	check("marked as having run unlimited", record and record.unlimited, true)
+	check("and it finished rather than being cut off", record and record.status, "done")
+	-- The brief has to agree with the budget, or the model rations turns it does not
+	-- have to ration and stops reading early to save them.
+	local childBody
+	for _, entry in ipairs(chatRequests(harness)) do
+		if tostring(entry.body):find("You are a subagent", 1, true) then childBody = tostring(entry.body) end
+	end
+	contains("the child was told it has no step limit", childBody or "", "no step limit and no clock")
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+-- A dispatch used to be one shot: the child answered, its context went on the floor,
+-- and a parent that wanted one more fact had to describe the whole job again to a fresh
+-- subagent that would go and rediscover it. This is the same subagent, asked a second
+-- question in the conversation it already had.
+scenario("a subagent takes a follow-up instead of being replaced", function()
+	local parentStep, childStep = 0, 0
+	local sawFirstTurn = false
+	-- Declared before the boot, because the handler reaches back for the register to
+	-- read the id the report gave it -- and a `local harness, handle = bootWith(...)`
+	-- leaves both nil inside the closure being passed in.
+	local harness, handle
+	harness, handle = bootWith({
+		handler = function(entry)
+			if not tostring(entry.url):find("/chat/completions") then return { StatusCode = 404, Body = "{}" } end
+			local body = tostring(entry.body)
+			if body:find("You are a subagent", 1, true) then
+				childStep = childStep + 1
+				if childStep == 1 then
+					return { StatusCode = 200, Body = chatBody({ content = "There is one player: TestPlayer." }) }
+				end
+				-- The point of the whole thing: the second turn can see the first. Without
+				-- that a follow-up is a fresh dispatch wearing a different name.
+				sawFirstTurn = body:find("TestPlayer", 1, true) ~= nil
+					and body:find("and their team", 1, true) ~= nil
+				return { StatusCode = 200, Body = chatBody({ content = "TestPlayer is on Neutral." }) }
+			end
+			parentStep = parentStep + 1
+			if parentStep == 1 then
+				return { StatusCode = 200, Body = chatBody({
+					toolCalls = { toolCall("d1", "dispatch_agent",
+						{ task = "count the players", preset = "read" }) },
+				}) }
+			end
+			if parentStep == 2 then
+				-- Addressed by the id the report handed back, which is the only handle the
+				-- model has on a child.
+				local id = handle.env.require("agent/subagent").list()[1].id
+				return { StatusCode = 200, Body = chatBody({
+					toolCalls = { toolCall("f1", "agent_followup",
+						{ agent = id, message = "and their team" }) },
+				}) }
+			end
+			return { StatusCode = 200, Body = chatBody({ content = "One player, on Neutral." }) }
+		end,
+	})
+	handle.config.set("permissions.mode", "full")
+
+	local session = handle.sessions.current()
+	session.send("how many players are here")
+	harness.settle(60)
+
+	local subagents = handle.env.require("agent/subagent")
+	local record = subagents.list()[1]
+	check("the parent took three steps and no more", parentStep, 3)
+	check("one dispatch, not two", #subagents.list(), 1)
+	check("which ran twice", record and record.runs, 2)
+	check("the child kept one context across both", childStep, 2)
+	truthy("and could see its own first turn", sawFirstTurn)
+
+	local reports = {}
+	for _, message in ipairs(session.ctx.messages) do
+		if message.role == "tool" then reports[#reports + 1] = tostring(message.content) end
+	end
+	check("both turns came back as tool results", #reports, 2)
+	contains("the first names the id a follow-up needs", reports[1] or "", record.id)
+	contains("and the tool that takes it", reports[1] or "", "agent_followup")
+	contains("the second carries the answer to the follow-up", reports[2] or "", "Neutral")
+
+	-- Two cards, one subagent. A follow-up has to read as a second turn on the same
+	-- child rather than as a second dispatch doing the job again.
+	local starts = {}
+	for _, event in ipairs(session.log) do
+		if event.kind == "subagent:start" then starts[#starts + 1] = event end
+	end
+	check("two starts were announced", #starts, 2)
+	check("both for the same subagent", starts[2] and starts[2].id, starts[1] and starts[1].id)
+	check("the first is not a follow-up", starts[1] and starts[1].followUp, false)
+	check("the second is", starts[2] and starts[2].followUp, true)
+	check("and is addressed to the call that asked for it", starts[2] and starts[2].call, "f1")
+	contains("the card says which it is", harness.textOf(), "follow-up")
+	check("the parent answered with both halves",
+		session.ctx.messages[#session.ctx.messages].content, "One player, on Neutral.")
+
+	-- A follow-up to something that was never dispatched has to fail with the ids that
+	-- do exist, or the model spends a step guessing.
+	local failed, why = subagents.followUp({ id = "agent_nope", task = "hello" })
+	check("an unknown id is refused", failed, nil)
+	contains("and the open ones are named", why or "", record.id)
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+-- 11. Context --------------------------------------------------------------
+
+scenario("context trimming never orphans a tool result", function()
+	local harness, handle = bootWith({ provider = false })
+	local context = handle.env.require("agent/context").new()
+
+	for turn = 1, 12 do
+		context.pushUser(string.rep("question " .. turn .. " ", 60))
+		context.pushAssistant({
+			content = "",
+			toolCalls = { { id = "c" .. turn, type = "function", ["function"] = { name = "game_info", arguments = "{}" } } },
+		})
+		context.pushToolResult("c" .. turn, "game_info", string.rep("result " .. turn .. " ", 80))
+		context.pushAssistant({ content = "answer " .. turn })
+	end
+
+	local before = context.tokens()
+	truthy("the conversation is over budget", before > 4000, tostring(before))
+	context.trim(2000, 2)
+	truthy("it came down", context.tokens() < before)
+
+	-- The invariant: a tool message must be preceded by the assistant turn that
+	-- asked for it, or every provider rejects the payload.
+	local wire = context.wire("system")
+	local orphans = 0
+	for index, message in ipairs(wire) do
+		if message.role == "tool" then
+			local previous = wire[index - 1]
+			local parentIsAssistant = previous and previous.role == "assistant" and previous.toolCalls ~= nil
+			local previousWasTool = previous and previous.role == "tool"
+			if not (parentIsAssistant or previousWasTool) then orphans = orphans + 1 end
+		end
+	end
+	check("no orphaned tool results", orphans, 0)
+
+	local ids = {}
+	for _, message in ipairs(wire) do
+		for _, call in ipairs(message.toolCalls or {}) do ids[call.id] = true end
+	end
+	local unmatched = 0
+	for _, message in ipairs(wire) do
+		if message.role == "tool" and not ids[message.tool_call_id] then unmatched = unmatched + 1 end
+	end
+	check("every tool result has its call", unmatched, 0)
+end)
+
+-- 12. Payload shape --------------------------------------------------------
+
+scenario("the request payload is shaped the way gateways expect", function()
+	local harness, handle = bootWith({
+		handler = function() return { StatusCode = 200, Body = chatBody({ content = "ok" }) } end,
+	})
+	handle.config.set("permissions.mode", "auto")
+
+	handle.sessions.current().send("hello")
+	harness.settle(6)
+
+	local body = chatRequests(harness)[1].body
+	contains("a model is named", body, '"model":"harness-model"')
+	contains("tools are sent", body, '"tools":[')
+	contains("tool_choice is auto", body, '"tool_choice":"auto"')
+	contains("parallel calls are enabled", body, '"parallel_tool_calls":true')
+	truthy("no empty properties array survives", body:find('"properties":%[%]') == nil,
+		"an empty JSON array was sent where an object is required")
+	contains("zero-argument tools send an object", body, '"properties":{}')
+
+	-- Anthropic-on-Bedrock validates every tool schema against JSON Schema draft
+	-- 2020-12 and answers a bare TOOL_SCHEMA_INVALID, so the shape has to be right
+	-- before it leaves. An empty Luau table encoding as [] is how this breaks, and
+	-- it has to be caught on the wire text: once decoded, {} and [] are the same
+	-- empty Lua table and the bug is invisible.
+	local ARRAY_KEYS = {
+		required = true, enum = true, examples = true, allOf = true, anyOf = true,
+		oneOf = true, prefixItems = true,
+		-- Payload arrays, not schema keywords.
+		tools = true, messages = true, content = true, tool_calls = true, stop = true,
+	}
+	local emptyArrays = {}
+	for key in body:gmatch('"([%w_%$]+)":%[%]') do
+		if not ARRAY_KEYS[key] then emptyArrays[#emptyArrays + 1] = key end
+	end
+	truthy("no schema keyword encodes as an empty array", #emptyArrays == 0,
+		"these came out as []: " .. table.concat(emptyArrays, ", "))
+
+	local TYPES = {
+		object = true, array = true, string = true, number = true,
+		integer = true, boolean = true, ["null"] = true,
+	}
+	local schemaProblems = {}
+	local function auditSchema(node, path)
+		if type(node) ~= "table" then return end
+		if node.type ~= nil and not TYPES[node.type] then
+			schemaProblems[#schemaProblems + 1] = path .. ": type " .. tostring(node.type)
+		end
+		if node.type == "array" and node.items == nil then
+			schemaProblems[#schemaProblems + 1] = path .. ": array without items"
+		end
+		for _, name in ipairs(node.required or {}) do
+			if (node.properties or {})[name] == nil then
+				schemaProblems[#schemaProblems + 1] = path .. ": requires undeclared " .. tostring(name)
+			end
+		end
+		for key, value in pairs(node) do
+			if type(value) == "table" and not ARRAY_KEYS[key] then
+				auditSchema(value, path .. "." .. tostring(key))
+			end
+		end
+	end
+	local decoded = json.decode(body)
+	for _, definition in ipairs(decoded.tools or {}) do
+		auditSchema(definition["function"].parameters, definition["function"].name)
+	end
+	truthy("every tool schema is valid draft 2020-12", #schemaProblems == 0,
+		table.concat(schemaProblems, "\n"))
+
+	check("the system prompt leads", decoded.messages[1].role, "system")
+	contains("it describes the host", decoded.messages[1].content, "Host:")
+	contains("it names the place", decoded.messages[1].content, "PlaceId")
+	check("the user turn follows", decoded.messages[2].role, "user")
+	truthy("every tool has a description", (function()
+		for _, definition in ipairs(decoded.tools) do
+			if type(definition["function"].description) ~= "string" then return false end
+		end
+		return true
+	end)())
+end)
+
+-- 13. Malformed model output ----------------------------------------------
+
+scenario("broken tool arguments are repaired or reported", function()
+	local harness, handle = bootWith({ provider = false })
+	local schema = handle.env.require("agent/schema")
+
+	local fenced, note = schema.repairJson('```json\n{"path":"Workspace"}\n```')
+	check("a fenced object is read", fenced and fenced.path, "Workspace")
+
+	local truncated = schema.repairJson('{"path":"Workspace","depth":')
+	truthy("a truncated object is completed", truncated ~= nil and truncated.path == "Workspace")
+
+	local trailing = schema.repairJson('{"path":"Workspace",}')
+	check("a trailing comma is removed", trailing and trailing.path, "Workspace")
+
+	local pythonic = schema.repairJson('{"path":"Workspace","recursive":True}')
+	check("Python literals are converted", pythonic and pythonic.recursive, true)
+
+	local prose = schema.repairJson('Sure! {"path":"Workspace"} hope that helps')
+	check("surrounding prose is stripped", prose and prose.path, "Workspace")
+
+	local hopeless = schema.repairJson("path = Workspace")
+	check("genuinely broken input is refused", hopeless, nil)
+
+	local coerced, errors = schema.validate({
+		type = "object",
+		properties = { depth = { type = "integer" }, path = { type = "string" } },
+		required = { "path" },
+	}, { depth = "3", path = "Workspace" })
+	check("a numeric string is coerced", coerced.depth, 3)
+	check("with no complaint", #errors, 0)
+
+	local _, missing = schema.validate({
+		type = "object",
+		properties = { path = { type = "string" } },
+		required = { "path" },
+	}, {})
+	check("a missing required field is reported", #missing, 1)
+end)
+
+-- 14. Filesystem tools -----------------------------------------------------
+
+scenario("file tools stay inside the agent folder", function()
+	local harness, handle = bootWith({ provider = false })
+	handle.config.set("permissions.mode", "full")
+	local tools = handle.tools
+	local context = handle.sessions.current().toolContext()
+
+	local write = tools.dispatch({ id = "1", ["function"] = {
+		name = "file_write",
+		arguments = json.encode({ path = "notes/plan.txt", content = "step one" }),
+	} }, context)
+	truthy("a write succeeds", write.ok, write.text)
+	check("it landed in the agent's workspace", harness.files["UAI/files/notes/plan.txt"], "step one")
+	falsy("and not in the client's own root", harness.files["UAI/notes/plan.txt"] ~= nil)
+
+	local read = tools.dispatch({ id = "2", ["function"] = {
+		name = "file_read", arguments = json.encode({ path = "notes/plan.txt" }),
+	} }, context)
+	contains("and reads back", read.text, "step one")
+
+	local escape = tools.dispatch({ id = "3", ["function"] = {
+		name = "file_write", arguments = json.encode({ path = "../../escape.txt", content = "no" }),
+	} }, context)
+	check("a path traversal is refused", escape.ok, false)
+	contains("with a reason", escape.text, "..")
+	check("and nothing was written outside", harness.files["../../escape.txt"], nil)
+
+	-- The client's own files are not in the workspace, which is the point of the
+	-- split: the model's file_list must not offer config.json or a session file.
+	local session = handle.sessions.current()
+	session.send("hello")
+	harness.settle(4)
+	handle.sessions.persist(session)
+	local stale = tools.dispatch({ id = "stale", ["function"] = {
+		name = "file_list", arguments = json.encode({}),
+	} }, context)
+	falsy("a previous turn's tool context cannot run new work", stale.ok)
+	local listed = tools.dispatch({ id = "4", ["function"] = {
+		name = "file_list", arguments = json.encode({}),
+	} }, session.toolContext())
+	falsy("the workspace does not list the client's config", tostring(listed.text):find("config.json", 1, true) ~= nil)
+	falsy("nor its conversations", tostring(listed.text):find("sessions/", 1, true) ~= nil)
+	contains("but does list what was written", tostring(listed.text), "notes/plan.txt")
+end)
+
+-- 15. Responsiveness -------------------------------------------------------
+
+scenario("the interface follows the viewport", function()
+	local harness, handle = bootWith({ provider = false })
+	local responsive = handle.env.require("ui/responsive")
+
+	check("a desktop viewport is a window", responsive.mode, "window")
+
+	harness.setViewport(390, 844)
+	check("a phone viewport becomes a sheet", responsive.mode, "sheet")
+	check("and reports the breakpoint", responsive.breakpoint, "xs")
+	check("and the orientation", responsive.orientation, "portrait")
+	truthy("the window survived the rebuild", harness.screen():FindFirstChild("UAI_Window") ~= nil,
+		harness.dump())
+	local sheet = harness.byName("UAI_Window")
+	truthy("the sheet spans the width", sheet.AbsoluteSize.X > 340,
+		tostring(sheet.AbsoluteSize.X))
+	truthy("and does not exceed the viewport", sheet.AbsoluteSize.X <= 390)
+	truthy("and leaves room above it", sheet.AbsoluteSize.Y < 844)
+
+	harness.setViewport(834, 1112)
+	check("a tablet viewport docks as a panel", responsive.mode, "panel")
+
+	harness.setViewport(1920, 1080)
+	check("back to a window on a large screen", responsive.mode, "window")
+
+	-- Touch changes the minimum hit target, which is the thing a phone actually
+	-- needs from a layout.
+	harness.services.UserInputService.TouchEnabled = true
+	responsive.refresh("test")
+	check("touch raises the minimum target", responsive.minTarget(), 44)
+	harness.services.UserInputService.TouchEnabled = false
+	responsive.refresh("test")
+	check("a pointer lowers it", responsive.minTarget(), 28)
+
+	-- The on-screen keyboard must move the window, not cover the composer.
+	harness.services.UserInputService.OnScreenKeyboardVisible = true
+	harness.services.UserInputService.OnScreenKeyboardSize = harness.dt.Vector2.new(390, 300)
+	harness.services.UserInputService:GetPropertyChangedSignal("OnScreenKeyboardVisible"):Fire()
+	harness.settle(1)
+	check("the keyboard height is reported", responsive.keyboardHeight, 300)
+	truthy("and counted as an obstruction", responsive.bottomObstruction() >= 300)
+
+	check("no thread errors through all of that", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+scenario("theme tokens react to settings", function()
+	local harness, handle = bootWith({ provider = false })
+	local theme = handle.env.require("ui/theme")
+
+	local comfortable = theme.space.md
+	handle.config.set("ui.density", "compact")
+	harness.settle(1)
+	truthy("compact density tightens spacing", theme.space.md < comfortable,
+		tostring(theme.space.md) .. " vs " .. tostring(comfortable))
+
+	local before = theme.text.body.size
+	handle.config.set("ui.fontScale", 1.3)
+	harness.settle(1)
+	truthy("text scale grows the ramp", theme.text.body.size > before)
+
+	-- The size ramp is floored at one, not at eight. It used to be eight, which was
+	-- harmless while every token was larger than that and silently wrong the moment
+	-- the small ones arrived: a 3px slider track, a 4px scrollbar and a 6px status dot
+	-- all came out of the ramp as 8.
+	handle.config.set("ui.fontScale", 1)
+	harness.settle(1)
+	truthy("a small token survives the ramp", theme.size.dotSmall < theme.size.dot,
+		tostring(theme.size.dotSmall) .. " vs " .. tostring(theme.size.dot))
+	truthy("and is not clamped up to eight", theme.size.track < 8, tostring(theme.size.track))
+	truthy("the scrollbar is the width it says it is", theme.size.scrollbar < 8,
+		tostring(theme.size.scrollbar))
+
+	handle.config.set("ui.accent", "rose")
+	harness.settle(1)
+	check("the accent changed", theme.accentName, "rose")
+	truthy("the interface rebuilt without error", harness.screen():FindFirstChild("UAI_Window") ~= nil)
+
+	-- And the converse, which is the expensive half. A theme rebuild fires
+	-- theme.changed, and the app answers that by destroying and reconstructing every
+	-- panel, the window and the launcher. Accepting the whole `ui.` namespace meant
+	-- maximising the window, moving the launcher or switching panel each tore the
+	-- interface down and built it again -- once a second, in the log that prompted
+	-- this test.
+	local rebuilds = 0
+	local unsubscribe = theme.changed:connect(function() rebuilds = rebuilds + 1 end)
+	for _, path in ipairs({ "ui.window.maximised", "ui.window.width", "ui.panel",
+		"ui.showReasoning", "ui.launcher.x" }) do
+		handle.config.set(path, path == "ui.window.width" and 900 or false)
+	end
+	harness.settle(1)
+	check("an unrelated ui key does not rebuild the theme", rebuilds, 0)
+
+	handle.config.set("ui.accent", "aurora")
+	harness.settle(1)
+	truthy("but a token key still does", rebuilds >= 1, tostring(rebuilds))
+	pcall(unsubscribe)
+
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+-- A design system whose text cannot be read on its own surface is a design system
+-- with a bug in it, and it is the one class of visual mistake that no amount of
+-- looking at the code will catch: every token here is a plausible dark grey. So the
+-- contrast is computed, in the same terms the accessibility guidelines use, over the
+-- pairs the interface actually puts together.
+scenario("the palette keeps text legible on the surface it sits on", function()
+	local harness, handle = bootWith({ provider = false })
+	local theme = handle.env.require("ui/theme")
+
+	-- WCAG relative luminance. The mock's Color3 keeps its channels as 0-1 floats,
+	-- same as the real one.
+	local function channel(value)
+		if value <= 0.03928 then return value / 12.92 end
+		return ((value + 0.055) / 1.055) ^ 2.4
+	end
+	local function luminance(colour)
+		return 0.2126 * channel(colour.R) + 0.7152 * channel(colour.G) + 0.0722 * channel(colour.B)
+	end
+	local function ratio(a, b)
+		local first, second = luminance(a), luminance(b)
+		if first < second then first, second = second, first end
+		return (first + 0.05) / (second + 0.05)
+	end
+
+	local colour = theme.color
+	-- 4.5 is the guideline for body text, 3.0 for large text and for a control's own
+	-- outline. Captions are held to 4.5 too: "it is only a caption" is how a caption
+	-- ends up unreadable.
+	local pairsToCheck = {
+		{ "body text on the canvas", colour.text, colour.canvas, 4.5 },
+		{ "body text on a card", colour.text, colour.surfaceRaised, 4.5 },
+		{ "secondary text on the canvas", colour.textSecondary, colour.canvas, 4.5 },
+		{ "tertiary text on the canvas", colour.textTertiary, colour.canvas, 4.5 },
+		{ "tertiary text on a card", colour.textTertiary, colour.surfaceRaised, 4.5 },
+		-- The overlay tone is the lightest surface in the set, so it is where a muted
+		-- caption comes closest to disappearing: a menu's detail line and a toast both
+		-- sit on it. This pair is what set the tertiary tone, not the other way round.
+		{ "tertiary text on an overlay", colour.textTertiary, colour.surfaceOverlay, 4.5 },
+		{ "text on the user's own turn", colour.text, colour.bubbleUser, 4.5 },
+		{ "code on the code surface", colour.codeText, colour.codeSurface, 4.5 },
+		{ "a code block's language on its bar", colour.codeGutter, colour.codeBar, 3 },
+		{ "an added line on its own fill", colour.codeAddText, colour.codeAddSurface, 4.5 },
+		{ "a removed line on its own fill", colour.codeRemoveText, colour.codeRemoveSurface, 4.5 },
+		{ "inline code on the canvas", colour.accentHot, colour.canvas, 4.5 },
+		{ "the accent on the canvas", colour.accent, colour.canvas, 3 },
+		{ "dark text on the solid action", colour.onSolid, colour.solid, 4.5 },
+		{ "dark text on the accent", colour.textOnAccent, colour.accent, 4.5 },
+		{ "danger text on its own surface", colour.danger, colour.dangerSurface, 3 },
+		{ "warn text on its own surface", colour.warn, colour.warnSurface, 3 },
+		{ "success text on its own surface", colour.success, colour.successSurface, 3 },
+		{ "info text on its own surface", colour.info, colour.infoSurface, 3 },
+		{ "a toast's text on a toast", colour.text, colour.surfaceOverlay, 4.5 },
+	}
+	for _, entry in ipairs(pairsToCheck) do
+		local label, fg, bg, want = entry[1], entry[2], entry[3], entry[4]
+		local got = ratio(fg, bg)
+		truthy(label .. " clears " .. tostring(want) .. ":1", got >= want,
+			string.format("%.2f:1", got))
+	end
+
+	-- Hairlines are not text and do not need 3:1, but they do have to be visible at
+	-- all: borderSubtle used to sit one step above the surface it was drawn on, which
+	-- is 1.05:1 and reads as no border.
+	for _, entry in ipairs({
+		{ "the hairline on the canvas", colour.borderSubtle, colour.canvas },
+		{ "the hairline on a card", colour.borderSubtle, colour.surfaceRaised },
+		{ "the window outline on the canvas", colour.border, colour.canvas },
+	}) do
+		local got = ratio(entry[2], entry[3])
+		truthy(entry[1] .. " is actually visible", got >= 1.25, string.format("%.2f:1", got))
+	end
+
+	-- And the surfaces have to be distinguishable from each other, or the hierarchy
+	-- the whole palette is built on is decoration.
+	local steps = {
+		{ "canvas", colour.canvas }, { "surface", colour.surface },
+		{ "raised", colour.surfaceRaised }, { "overlay", colour.surfaceOverlay },
+	}
+	for index = 2, #steps do
+		local previous, current = steps[index - 1], steps[index]
+		truthy(current[1] .. " is a step above " .. previous[1],
+			luminance(current[2]) > luminance(previous[2]))
+	end
+	check("the code surface is below the canvas",
+		luminance(colour.codeSurface) < luminance(colour.canvas), true)
+
+	-- Every accent has to clear the same bar, or switching one turns the interface
+	-- into a different quality of interface.
+	for name in pairs(theme.ACCENTS) do
+		handle.config.set("ui.accent", name)
+		harness.settle(1)
+		truthy(name .. " reads as inline code on the canvas",
+			ratio(theme.color.accentHot, theme.color.canvas) >= 4.5,
+			string.format("%.2f:1", ratio(theme.color.accentHot, theme.color.canvas)))
+		truthy(name .. " takes dark text when it is a fill",
+			ratio(theme.color.textOnAccent, theme.color.accent) >= 4.5,
+			string.format("%.2f:1", ratio(theme.color.textOnAccent, theme.color.accent)))
+	end
+
+	-- And so does every code palette. The light one inverts the whole set, so a pair
+	-- that was only ever checked against the dark tones is exactly where a code block
+	-- would come out as pale grey on cream.
+	for _, name in ipairs(theme.CODE_THEME_ORDER) do
+		handle.config.set("ui.codeTheme", name)
+		harness.settle(1)
+		local set = theme.color
+		for _, entry in ipairs({
+			{ "code", set.codeText, set.codeSurface, 4.5 },
+			{ "the language label", set.codeGutter, set.codeBar, 3 },
+			{ "an added line", set.codeAddText, set.codeAddSurface, 4.5 },
+			{ "a removed line", set.codeRemoveText, set.codeRemoveSurface, 4.5 },
+		}) do
+			local got = ratio(entry[2], entry[3])
+			truthy(name .. ": " .. entry[1] .. " clears " .. tostring(entry[4]) .. ":1",
+				got >= entry[4], string.format("%.2f:1", got))
+		end
+	end
+	handle.config.set("ui.codeTheme", "dark")
+	harness.settle(1)
+
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+-- 16. Markdown -------------------------------------------------------------
+
+scenario("markdown blocks are split correctly", function()
+	local harness, handle = bootWith({ provider = false })
+	local markdown = handle.env.require("ui/markdown")
+
+	local blocks = markdown.blocks(table.concat({
+		"Here is the plan.",
+		"",
+		"- first",
+		"- second",
+		"",
+		"```lua",
+		"local x = 1 < 2",
+		"```",
+		"",
+		"Done.",
+	}, "\n"))
+
+	check("four blocks", #blocks, 4)
+	check("prose first", blocks[1].kind, "text")
+	check("then bullets", blocks[2].kind, "bullets")
+	check("two of them", #blocks[2].items, 2)
+	check("then code", blocks[3].kind, "code")
+	check("with its language", blocks[3].lang, "lua")
+	check("kept verbatim", blocks[3].text, "local x = 1 < 2")
+	check("then prose", blocks[4].kind, "text")
+
+	local inline = markdown.inline("use **bold** and `code < here`")
+	contains("bold becomes a tag", inline, "<b>bold</b>")
+	contains("inline code gets the mono face", inline, 'face="Code"')
+	truthy("a raw angle bracket was escaped", inline:find("&lt;", 1, true) ~= nil, inline)
+
+	local unterminated = markdown.blocks("```lua\nlocal a = 1")
+	check("an unterminated fence still renders", unterminated[1].kind, "code")
+	check("and says so", unterminated[1].unterminated, true)
+
+	-- Ordered lists kept losing their numbers: `1.` and `-` both landed in the same
+	-- array of bare strings and both painted as a dot, so a list of steps read as a
+	-- list of unordered points.
+	local ordered = markdown.blocks("1. first\n2. second\n  - nested")
+	check("one list", #ordered, 1)
+	check("of three items", #ordered[1].items, 3)
+	check("the first keeps its number", ordered[1].items[1].marker, "1.")
+	check("and its text", ordered[1].items[1].text, "first")
+	check("the second too", ordered[1].items[2].marker, "2.")
+	check("a bullet has no marker", ordered[1].items[3].marker, nil)
+	check("but does have a depth", ordered[1].items[3].depth, 1)
+
+	local quoted = markdown.blocks("> an aside\n> over two lines\n\nback to prose")
+	check("a blockquote is its own block", quoted[1].kind, "quote")
+	check("joined", quoted[1].text, "an aside\nover two lines")
+	check("and prose follows it", quoted[2].kind, "text")
+end)
+
+-- 17. Subagent -------------------------------------------------------------
+
+scenario("a subagent reports back without filling the parent context", function()
+	local step = 0
+	local harness, handle = bootWith({
+		handler = function(entry)
+			if not tostring(entry.url):find("/chat/completions") then return { StatusCode = 404, Body = "{}" } end
+			step = step + 1
+			if step == 1 then
+				return { StatusCode = 200, Body = chatBody({
+					toolCalls = { toolCall("s1", "dispatch_agent", { task = "count the players", preset = "read" }) },
+				}) }
+			end
+			if step == 2 then
+				return { StatusCode = 200, Body = chatBody({
+					toolCalls = { toolCall("s2", "players_list", {}) },
+				}) }
+			end
+			if step == 3 then
+				return { StatusCode = 200, Body = chatBody({ content = "There is one player: TestPlayer." }) }
+			end
+			return { StatusCode = 200, Body = chatBody({ content = "The subagent found one player." }) }
+		end,
+	})
+	handle.config.set("permissions.mode", "full")
+
+	local session = handle.sessions.current()
+	session.send("how many players are here")
+	harness.settle(20)
+
+	check("the parent context stayed small", #session.ctx.messages, 4)
+	local report = session.ctx.messages[3]
+	check("the report came back as a tool result", report.role, "tool")
+	contains("carrying the subagent's answer", report.content, "one player")
+	contains("labelled as a subagent report", report.content, "Subagent report")
+	check("the parent answered", session.ctx.messages[4].content, "The subagent found one player.")
+
+	-- The live view. The child's work is forwarded onto the parent's stream, because
+	-- that stream is the only thing the transcript renders -- and it is addressed, so
+	-- three concurrent subagents cannot paint over each other's rows.
+	local kinds = {}
+	local start
+	for _, event in ipairs(session.log) do
+		kinds[event.kind] = (kinds[event.kind] or 0) + 1
+		if event.kind == "subagent:start" then start = event end
+	end
+	check("the dispatch was announced", kinds["subagent:start"], 1)
+	check("the tool the child ran was forwarded", kinds["subagent:tool"], 1)
+	check("with its outcome", kinds["subagent:tool:done"], 1)
+	check("what it said between calls", kinds["subagent:text"], 1)
+	check("and the finish", kinds["subagent:done"], 1)
+	contains("the card is labelled with the task", start and start.label or "", "count the players")
+	check("and addressed to the call that started it", start and start.call, "s1")
+
+	local child = harness.byName("Subagent")
+	truthy("a card was rendered for it", child ~= nil)
+	truthy("nested inside the dispatch row rather than floating beside it",
+		harness.byName("Subagent", harness.byName("Tool")) ~= nil)
+	harness.click(harness.byName("RunHeader"))
+	check("child execution stays folded beside its report", harness.byName("Feed", child).Visible, false)
+	contains("the report is readable before opening child execution", harness.byName("ReportText", child).Text, "one player")
+	harness.click(harness.byName("SubagentHeader", child))
+	local shown = harness.textOf(child)
+	contains("showing which tool the child ran", shown, "players_list")
+	contains("and the task it was given", shown, "count the players")
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+	check("no property type errors", #harness.instanceState.typeErrors, 0,
+		table.concat(harness.instanceState.typeErrors, "\n"))
+end)
+
+-- A subagent runs for minutes by design. The generic tool timeout is twenty-five
+-- seconds, and until this was fixed it was what bounded the dispatching call: every
+-- subagent was reported to the model as abandoned, kept running -- Luau cannot kill a
+-- thread -- and finished into a caller that had stopped listening. The log said
+-- "subagent finished in 26.1s over 9 messages" and the user was told nothing came back.
+scenario("a slow subagent is not cut off by the generic tool timeout", function()
+	local step = 0
+	local harness, handle = bootWith({
+		handler = function(entry)
+			if not tostring(entry.url):find("/chat/completions") then return { StatusCode = 404, Body = "{}" } end
+			step = step + 1
+			if step == 1 then
+				return { StatusCode = 200, Body = chatBody({
+					toolCalls = { toolCall("d1", "dispatch_agent", { task = "take your time", preset = "read" }) },
+				}) }
+			end
+			if step == 2 then
+				-- Longer than the generic timeout set below, shorter than the subagent's
+				-- own budget.
+				return { StatusCode = 200, delay = 8, Body = chatBody({ content = "Took a while: found nothing." }) }
+			end
+			return { StatusCode = 200, Body = chatBody({ content = "The subagent reported back." }) }
+		end,
+	})
+	handle.config.set("permissions.mode", "full")
+	handle.config.set("agent.toolTimeout", 5)
+	handle.config.set("agent.subagentUnlimited", false)
+
+	local subagent = handle.env.require("agent/subagent")
+	local tool = handle.env.require("agent/registry").get("dispatch_agent")
+	check("the tool states a timeout of its own", type(tool.timeout), "function")
+	check("resolved from the subagent budget", tool.timeout(), subagent.toolTimeout())
+	truthy("which is far past the generic one", tool.timeout() > handle.config.get("agent.toolTimeout"))
+	handle.config.set("agent.subagentBudget", 60)
+	check("and follows the setting", tool.timeout(), 120)
+	handle.config.set("agent.subagentBudget", 240)
+
+	local session = handle.sessions.current()
+	session.send("delegate something slow")
+	harness.settle(40)
+
+	local report
+	for _, entry in ipairs(session.ctx.messages) do
+		if entry.role == "tool" then report = entry end
+	end
+	truthy("the call produced a report", report ~= nil)
+	contains("carrying what the subagent found", report and report.content or "", "found nothing")
+	truthy("and nothing was abandoned",
+		not tostring(report and report.content or ""):find("did not finish"),
+		tostring(report and report.content or ""))
+	check("so the parent could answer with it",
+		session.ctx.messages[#session.ctx.messages].content, "The subagent reported back.")
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+scenario("stopping a turn stops the subagents it started", function()
+	local step = 0
+	local harness, handle = bootWith({
+		handler = function(entry)
+			if not tostring(entry.url):find("/chat/completions") then return { StatusCode = 404, Body = "{}" } end
+			step = step + 1
+			if step == 1 then
+				return { StatusCode = 200, Body = chatBody({
+					toolCalls = { toolCall("d1", "dispatch_agent", { task = "keep digging", preset = "read" }) },
+				}) }
+			end
+			return { StatusCode = 200, delay = 8, Body = chatBody({
+				toolCalls = { toolCall("c1", "players_list", {}) },
+			}) }
+		end,
+	})
+	handle.config.set("permissions.mode", "full")
+
+	local session = handle.sessions.current()
+	session.send("delegate then change your mind")
+	harness.settle(3)
+	truthy("the turn is running", session.busy)
+	session.abort()
+	harness.settle(40)
+
+	local done
+	for _, event in ipairs(session.log) do
+		if event.kind == "subagent:done" then done = event end
+	end
+	truthy("the subagent reported back rather than running on", done ~= nil)
+	truthy("and says it was stopped", done and done.aborted == true)
+	truthy("the child made no further requests after the stop", step <= 2,
+		"requests: " .. tostring(step))
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+-- Parallel dispatch is the reason a subagent is worth having for a wide job: three
+-- searches in one step cost one wait instead of three. It comes out of the ordinary
+-- parallel-tool path, so what this pins down is that nothing in the dispatch itself
+-- serialises the batch -- a shared lock, a shared prompt, a shared counter -- and
+-- that two children finishing out of order both still land.
+scenario("two subagents dispatched in one step run at the same time", function()
+	local parentStep = 0
+	local harness, handle = bootWith({
+		handler = function(entry)
+			if not tostring(entry.url):find("/chat/completions") then return { StatusCode = 404, Body = "{}" } end
+			local body = tostring(entry.body)
+			-- Checked before the task text, which also appears in the parent's own
+			-- messages once the calls are on the transcript.
+			if body:find("You are a subagent", 1, true) then
+				if body:find("alpha sweep", 1, true) then
+					return { StatusCode = 200, delay = 6, Body = chatBody({ content = "Alpha found three doors." }) }
+				end
+				return { StatusCode = 200, delay = 1, Body = chatBody({ content = "Bravo found one key." }) }
+			end
+			parentStep = parentStep + 1
+			if parentStep == 1 then
+				return { StatusCode = 200, Body = chatBody({
+					toolCalls = {
+						toolCall("d1", "dispatch_agent", { task = "alpha sweep", preset = "read" }),
+						toolCall("d2", "dispatch_agent", { task = "bravo sweep", preset = "read" }),
+					},
+				}) }
+			end
+			return { StatusCode = 200, Body = chatBody({ content = "Three doors and one key." }) }
+		end,
+	})
+	handle.config.set("permissions.mode", "full")
+
+	local session = handle.sessions.current()
+	session.send("sweep the place two ways")
+	harness.settle(40)
+
+	local reports = {}
+	for _, message in ipairs(session.ctx.messages) do
+		if message.role == "tool" then reports[#reports + 1] = message end
+	end
+	check("both dispatches produced a report", #reports, 2)
+	contains("the first carries its own child's answer", reports[1].content, "three doors")
+	contains("and the second its own", reports[2].content, "one key")
+	check("the parent answered with both",
+		session.ctx.messages[#session.ctx.messages].content, "Three doors and one key.")
+
+	local starts, dones = {}, {}
+	for _, event in ipairs(session.log) do
+		if event.kind == "subagent:start" then starts[#starts + 1] = event end
+		if event.kind == "subagent:done" then dones[#dones + 1] = event end
+	end
+	check("two cards were opened", #starts, 2)
+	truthy("addressed to different calls", starts[1].call ~= starts[2].call)
+	truthy("and keyed to different children", starts[1].id ~= starts[2].id)
+	contains("the first card is labelled with its task", starts[1].label, "alpha sweep")
+	contains("the second with its own", starts[2].label, "bravo sweep")
+
+	check("two cards were closed", #dones, 2)
+	-- The whole point: the one-second child reports before the six-second child, which
+	-- is only possible if the second dispatch was not waiting on the first.
+	contains("the quicker child finished first", dones[1].label, "bravo sweep")
+	truthy("so the slower one was still running when it did",
+		(dones[2].at - dones[2].ms) < dones[1].at,
+		string.format("alpha ran %d-%d, bravo ended %d",
+			dones[2].at - dones[2].ms, dones[2].at, dones[1].at))
+	truthy("and the turn took about one wait, not two",
+		dones[2].at - (dones[2].at - dones[2].ms) < (dones[1].ms + dones[2].ms))
+
+	local shown = harness.textOf()
+	contains("both tasks are on screen", shown, "alpha sweep")
+	contains("both of them", shown, "bravo sweep")
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+-- Depth caps how deep the tree goes; nothing capped how wide. `toolConcurrency`
+-- bounds one batch, so it bounds a dispatch from the main conversation -- but a
+-- subagent's own batch is bounded separately, and two levels of that multiply. A
+-- dispatch over the ceiling waits for a slot rather than failing, because the step
+-- that asked has already been paid for.
+scenario("the subagent ceiling serialises what it cannot fit", function()
+	local parentStep = 0
+	local harness, handle = bootWith({
+		handler = function(entry)
+			if not tostring(entry.url):find("/chat/completions") then return { StatusCode = 404, Body = "{}" } end
+			local body = tostring(entry.body)
+			if body:find("You are a subagent", 1, true) then
+				if body:find("alpha sweep", 1, true) then
+					return { StatusCode = 200, delay = 6, Body = chatBody({ content = "Alpha done." }) }
+				end
+				return { StatusCode = 200, delay = 1, Body = chatBody({ content = "Bravo done." }) }
+			end
+			parentStep = parentStep + 1
+			if parentStep == 1 then
+				return { StatusCode = 200, Body = chatBody({
+					toolCalls = {
+						toolCall("d1", "dispatch_agent", { task = "alpha sweep", preset = "read" }),
+						toolCall("d2", "dispatch_agent", { task = "bravo sweep", preset = "read" }),
+					},
+				}) }
+			end
+			return { StatusCode = 200, Body = chatBody({ content = "Both back." }) }
+		end,
+	})
+	handle.config.set("permissions.mode", "full")
+	handle.config.set("agent.subagentConcurrency", 1)
+
+	local subagent = handle.env.require("agent/subagent")
+	check("the ceiling follows the setting", subagent.concurrencyLimit(), 1)
+
+	local session = handle.sessions.current()
+	session.send("sweep the place two ways")
+	harness.settle(60)
+
+	local dones = {}
+	for _, event in ipairs(session.log) do
+		if event.kind == "subagent:done" then dones[#dones + 1] = event end
+	end
+	check("both children still ran", #dones, 2)
+	contains("the first dispatched went first", dones[1].label, "alpha sweep")
+	truthy("and the second waited for it rather than running beside it",
+		(dones[2].at - dones[2].ms) >= dones[1].at - 500,
+		string.format("alpha ended %d, bravo started %d", dones[1].at, dones[2].at - dones[2].ms))
+	check("nothing was abandoned", dones[2].ok, true)
+	check("the parent got both reports",
+		session.ctx.messages[#session.ctx.messages].content, "Both back.")
+	check("and the ceiling was given back afterwards", subagent.live, 0)
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+-- A subagent used to refuse streaming, on the reading that a child with no interface
+-- has nothing to stream into. No Roblox transport delivers a body incrementally
+-- anyway, so that bought nothing and cost the two things only the streamed shape
+-- carries: reasoning text, and the per-request usage block that is the only place
+-- some gateways report token counts at all.
+scenario("a subagent's own requests stream like the main conversation", function()
+	local parentStep = 0
+	local harness, handle = bootWith({
+		stream = true,
+		handler = function(entry)
+			if not tostring(entry.url):find("/chat/completions") then return { StatusCode = 404, Body = "{}" } end
+			if tostring(entry.body):find("You are a subagent", 1, true) then
+				return { StatusCode = 200, Body = chatBody({ content = "Nothing unusual here." }) }
+			end
+			parentStep = parentStep + 1
+			if parentStep == 1 then
+				return { StatusCode = 200, Body = chatBody({
+					toolCalls = { toolCall("d1", "dispatch_agent", { task = "look around", preset = "read" }) },
+				}) }
+			end
+			return { StatusCode = 200, Body = chatBody({ content = "It looked around." }) }
+		end,
+	})
+	handle.config.set("permissions.mode", "full")
+
+	local session = handle.sessions.current()
+	session.send("send someone to look")
+	harness.settle(30)
+
+	local parent, child
+	for _, entry in ipairs(chatRequests(harness)) do
+		if tostring(entry.body):find("You are a subagent", 1, true) then
+			child = child or entry
+		else
+			parent = parent or entry
+		end
+	end
+	truthy("the parent made a request", parent ~= nil)
+	truthy("and so did the child", child ~= nil)
+	contains("the parent asked for a stream", parent.body, '"stream":true')
+	contains("and the child asked for one too", child.body, '"stream":true')
+	contains("including the usage block it is asked for", child.body, "include_usage")
+	check("the child's report still came back",
+		session.ctx.messages[#session.ctx.messages].content, "It looked around.")
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+-- The two switches this section is about are settings, and a setting nobody can reach
+-- is not one. Nothing else in this suite mounts the Settings panel, so a mistyped
+-- control here would have surfaced first on a real client.
+scenario("the new agent switches are reachable from Settings", function()
+	local harness, handle = bootWith({ provider = false })
+	handle.show("settings")
+	harness.settle(3)
+
+	local shown = harness.textOf()
+	contains("the step limit still has its row", shown, "Step limit")
+	contains("the unlimited switch is there", shown, "Unlimited tool calls")
+	contains("saying what still bounds it", shown, "Stop still apply")
+	contains("and the subagent ceiling has a row", shown, "Parallel subagents")
+	truthy("the ceiling is on a named track",
+		harness.byName("Slider_agent.subagentConcurrency") ~= nil)
+	-- The two that had no control at all: a config key nothing can write is a setting
+	-- only the file has.
+	contains("the per-subagent step limit has one now", shown, "Subagent steps")
+	truthy("on its own track", harness.byName("Slider_agent.subagentTurns") ~= nil)
+	contains("and so does the depth cap", shown, "Delegation depth")
+	truthy("which is the switch that can turn delegation off",
+		harness.byName("Slider_agent.subagentDepth") ~= nil)
+	-- The switch that answers the step-limit message a dispatch comes back with. It only
+	-- existed in config.json, which for a setting whose whole point is a stuck job is the
+	-- same as not existing.
+	contains("lifting a subagent's own limits is a switch too", shown, "Unlimited subagents")
+	contains("and it says what still stops one", shown, "Stop still apply")
+
+	local config = handle.config
+	check("the switch ships on", config.get("agent.unlimitedTurns"), true)
+	config.set("agent.unlimitedTurns", false)
+	check("and persists when turned off", config.get("agent.unlimitedTurns"), false)
+	check("the subagent switch ships on too", config.get("agent.subagentUnlimited"), true)
+	config.set("agent.subagentUnlimited", false)
+	check("the switch persists", config.get("agent.subagentUnlimited"), false)
+	check("the ceiling defaults to its ceiling", config.get("agent.subagentConcurrency"), 12)
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+	check("nothing was warned", #harness.console.warnings, 0,
+		table.concat(harness.console.warnings, "\n"))
+end)
+
+-- 18. Persistence ----------------------------------------------------------
+
+scenario("settings and conversations persist", function()
+	-- Sent through session.send rather than pushed straight into the context, because
+	-- the two halves of a stored conversation come from different places: the context
+	-- from ctx.serialise, and the transcript from the event log that only a real turn
+	-- produces. Writing to ctx alone is what let the transcript go unpersisted unnoticed.
+	local harness, handle = bootWith({
+		handler = function()
+			return { StatusCode = 200, Body = chatBody({ content = "I will." }) }
+		end,
+	})
+	handle.config.set("ui.accent", "amber")
+	handle.config.saveNow()
+	handle.sessions.current().send("remember me")
+	harness.settle(12)
+	handle.sessions.persist(handle.sessions.current())
+	harness.settle(2)
+
+	truthy("a config file was written", harness.files["UAI/config.json"] ~= nil,
+		table.concat((function()
+			local keys = {}
+			for key in pairs(harness.files) do keys[#keys + 1] = key end
+			table.sort(keys)
+			return keys
+		end)(), "\n"))
+	contains("with the setting in it", harness.files["UAI/config.json"], "amber")
+
+	local sessionFiles = 0
+	for key in pairs(harness.files) do
+		if key:find("^UAI/sessions/") then sessionFiles = sessionFiles + 1 end
+	end
+	check("a conversation was written", sessionFiles, 1)
+
+	-- A second client with the same filesystem should come back to the same state.
+	local second = envMock.new({})
+	for key, value in pairs(harness.files) do second.files[key] = value end
+	for key in pairs(harness.folders) do second.folders[key] = true end
+	local secondHandle = select(1, second.boot())
+	second.settle(2)
+	check("the accent came back", secondHandle.config.get("ui.accent"), "amber")
+	truthy("the provider came back", secondHandle.providers.count() >= 1)
+	local restored = false
+	for _, session in ipairs(secondHandle.sessions.list()) do
+		for _, message in ipairs(session.ctx.messages) do
+			if tostring(message.content):find("remember me") then restored = true end
+		end
+	end
+	truthy("the conversation came back", restored)
+
+	-- The context is what the model needs to continue; the log is what the transcript
+	-- is drawn from, and only the first of the two used to be written. So a restored
+	-- conversation was listed in the sidebar, switched to correctly, and then showed the
+	-- greeting card -- which is what "previous conversations will not load" looks like.
+	local target = nil
+	for _, session in ipairs(secondHandle.sessions.list()) do
+		for _, message in ipairs(session.ctx.messages) do
+			if tostring(message.content):find("remember me") then target = session end
+		end
+	end
+	truthy("the restored conversation has a transcript", target and #target.log > 0,
+		target and tostring(#target.log) or "no session")
+	local sawUser = false
+	for _, event in ipairs(target and target.log or {}) do
+		if event.kind == "user" and tostring(event.text):find("remember me") then sawUser = true end
+	end
+	truthy("with the question in it", sawUser)
+
+	-- And it renders, rather than only existing in the table.
+	secondHandle.app.openSession(target.id)
+	second.settle(2)
+	contains("which the transcript draws", second.textOf(), "remember me")
+
+	-- A status line, a token count and a permission prompt are not transcript: the
+	-- first two are meaningless after the fact and the third carries the closure that
+	-- answers it, which would fail the whole write.
+	for _, event in ipairs(target.log) do
+		truthy("no ephemeral event was stored: " .. tostring(event.kind),
+			event.kind ~= "status" and event.kind ~= "usage"
+				and event.kind ~= "permission:ask" and event.kind ~= "tool:progress")
+	end
+end)
+
+-- 19. Error surfaces -------------------------------------------------------
+
+scenario("a provider error is explained, not swallowed", function()
+	local harness, handle = bootWith({
+		handler = function()
+			return { StatusCode = 401, Body = '{"error":{"message":"Incorrect API key provided"}}' }
+		end,
+	})
+
+	local session = handle.sessions.current()
+	session.send("hello")
+	harness.settle(20)
+
+	local errorEvent
+	for _, event in ipairs(session.log) do
+		if event.kind == "error" then errorEvent = event end
+	end
+	truthy("an error was reported", errorEvent ~= nil)
+	contains("naming the cause", errorEvent and errorEvent.message or "", "API key")
+	contains("and the transcript says so", harness.textOf(), "API key")
+	check("the session recovered", session.busy, false)
+
+	-- A 401 must not be retried: the key will not become correct.
+	check("no pointless retries", #chatRequests(harness), 1)
+end)
+
+scenario("an unknown tool and a bad argument are reported to the model", function()
+	local harness, handle = bootWith({ provider = false })
+	local context = handle.sessions.current().toolContext()
+
+	local unknown = handle.tools.dispatch({ id = "u", ["function"] = {
+		name = "definitely_not_a_tool", arguments = "{}",
+	} }, context)
+	check("unknown tools do not raise", unknown.ok, false)
+	contains("and suggest what exists", unknown.text, "Available tools include")
+
+	local bad = handle.tools.dispatch({ id = "b", ["function"] = {
+		name = "instance_get", arguments = json.encode({}),
+	} }, context)
+	check("a missing required argument is caught", bad.ok, false)
+	contains("and named", bad.text, "path")
+
+	local missingPath = handle.tools.dispatch({ id = "c", ["function"] = {
+		name = "instance_get", arguments = json.encode({ path = "Workspace.NotThere" }),
+	} }, context)
+	truthy("a bad path explains itself", tostring(missingPath.text):find("has no child") ~= nil,
+		missingPath.text)
+end)
+
+-- 20. Tool surface ---------------------------------------------------------
+
+scenario("the tool catalog is broad and consistent", function()
+	local harness, handle = bootWith({ provider = false })
+	local tools = handle.tools.list()
+	truthy("there are plenty of tools", #tools >= 45, tostring(#tools))
+
+	local seen, problems = {}, {}
+	for _, tool in ipairs(tools) do
+		if seen[tool.name] then problems[#problems + 1] = "duplicate: " .. tool.name end
+		seen[tool.name] = true
+		if not tool.name:match("^[a-z][a-z0-9_]*$") then
+			problems[#problems + 1] = "not snake_case: " .. tool.name
+		end
+		if type(tool.description) ~= "string" or #tool.description < 20 then
+			problems[#problems + 1] = "thin description: " .. tool.name
+		end
+		if tool.risk ~= "read" and tool.risk ~= "write" and tool.risk ~= "danger" then
+			problems[#problems + 1] = "bad risk: " .. tool.name
+		end
+		if type(tool.parameters) ~= "table" or tool.parameters.type ~= "object" then
+			problems[#problems + 1] = "bad schema: " .. tool.name
+		end
+		for _, name in ipairs(tool.parameters.required or {}) do
+			local properties = tool.parameters.properties or {}
+			if properties[name] == nil then
+				problems[#problems + 1] = tool.name .. " requires an undeclared field: " .. name
+			end
+		end
+	end
+	check("no catalog problems", #problems, 0, table.concat(problems, "\n"))
+
+	local groups = handle.tools.stats().byGroup
+	truthy("tools are spread across groups", (function()
+		local count = 0
+		for _ in pairs(groups) do count = count + 1 end
+		return count >= 10
+	end)())
+
+	local dangerous = {}
+	for _, tool in ipairs(tools) do
+		if tool.risk == "danger" then dangerous[#dangerous + 1] = tool.name end
+	end
+	truthy("the destructive ones are marked", #dangerous >= 4, table.concat(dangerous, ", "))
+	local expected = { run_luau = true, instance_destroy = true, file_delete = true, remote_fire = true }
+	for name in pairs(expected) do
+		truthy(name .. " is marked dangerous", (function()
+			for _, item in ipairs(dangerous) do
+				if item == name then return true end
+			end
+			return false
+		end)())
+	end
+end)
+
+scenario("luau execution is sandboxed and bounded", function()
+	local harness, handle = bootWith({ provider = false })
+	handle.config.set("permissions.mode", "full")
+	local context = handle.sessions.current().toolContext()
+
+	local result = handle.tools.dispatch({ id = "r", ["function"] = {
+		name = "run_luau",
+		arguments = json.encode({ code = "print('from the sandbox') return 6 * 7" }),
+	} }, context)
+	truthy("it ran", result.ok, result.text)
+	contains("output was captured, not printed", result.text, "from the sandbox")
+	contains("the return value came back", result.text, "42")
+	check("nothing reached the real console", #harness.console.out, 0,
+		table.concat(harness.console.out, "\n"))
+
+	local broken = handle.tools.dispatch({ id = "r2", ["function"] = {
+		name = "run_luau", arguments = json.encode({ code = "this is not lua" }),
+	} }, context)
+	contains("a compile error is reported", broken.text, "Compile error")
+
+	local raising = handle.tools.dispatch({ id = "r3", ["function"] = {
+		name = "run_luau", arguments = json.encode({ code = "error('deliberate')" }),
+	} }, context)
+	contains("a runtime error is reported", raising.text, "deliberate")
+end)
+
+scenario("every panel builds cleanly", function()
+	local harness, handle = bootWith({})
+
+	-- Visiting all five panels exercises most of the component set. The mock
+	-- type-checks every property assignment, so this is where a wrong value type --
+	-- a number handed to Size because a prop table overloaded the name -- surfaces.
+	for _, panel in ipairs({ "providers", "tools", "settings", "logs", "cowork", "agents", "chat" }) do
+		handle.app.show(panel)
+		harness.settle(1)
+		truthy(panel .. " panel built", handle.app.panels[panel] ~= nil)
+	end
+
+	local typeErrors = harness.instanceState.typeErrors
+	check("no property was assigned the wrong type", #typeErrors, 0,
+		table.concat((function()
+			local out = {}
+			for index = 1, math.min(#typeErrors, 8) do out[index] = typeErrors[index] end
+			return out
+		end)(), "\n"))
+
+	local unknownReads = {}
+	for key in pairs(harness.instanceState.unknownReads) do unknownReads[#unknownReads + 1] = key end
+	table.sort(unknownReads)
+	check("no unknown property was read", #unknownReads, 0, table.concat(unknownReads, "\n"))
+
+	local unknownEnums = {}
+	for key in pairs(harness.unknownEnums) do unknownEnums[#unknownEnums + 1] = key end
+	table.sort(unknownEnums)
+	check("no unrecognised enum was used", #unknownEnums, 0, table.concat(unknownEnums, "\n"))
+
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+	check("nothing was warned", #harness.console.warnings, 0,
+		table.concat(harness.console.warnings, "\n"))
+end)
+
+scenario("the built interface holds its layout invariants", function()
+	-- Two rules Roblox will not enforce and the mock cannot render, so they are
+	-- asserted on the props instead.
+	--
+	-- One: a TextLabel starts at zero size, and `auto` only covers the axes it names, so
+	-- `auto = "Y"` still leaves the width to the caller. A wrapped label that never
+	-- gets one does not vanish -- which would at least be obvious -- it wraps at
+	-- zero and renders one character per line, straight down the screen. The mock
+	-- has no layout solver and cannot see that happen, but it does not need one:
+	-- the mistake is in the props, so that is where this looks.
+	--
+	-- Two: a UIListLayout owns the Position of every GuiObject child it is given. A
+	-- decoration that anchors itself to an edge does not merely fail to move, it
+	-- becomes a layout item -- and a full-width one in a row takes the whole line
+	-- and puts every sibling past the right edge, which is how a title bar goes
+	-- missing without a single error.
+	local function nameOf(value)
+		if type(value) == "table" and value.Name then return tostring(value.Name) end
+		return tostring(value)
+	end
+
+	local widths, anchors = {}, {}
+	local seenWidth, seenAnchor = {}, {}
+
+	local function sweep(harness)
+		for _, node in ipairs(harness.screen():GetDescendants()) do
+			local path = node:GetFullName()
+
+			if node.ClassName == "TextLabel" or node.ClassName == "TextBox" then
+				local truncates = nameOf(node.TextTruncate) == "AtEnd"
+				local auto = nameOf(node.AutomaticSize)
+				-- An auto width is the one case where the label sizes itself.
+				local ownsWidth = auto == "X" or auto == "XY"
+				-- A flex child inside a list layout is the other: the layout hands it
+				-- whatever is left on the line, which is exactly what a (0,0) width
+				-- plus FlexMode.Fill asks for. Several rows in here fill deliberately
+				-- rather than reserving a guessed number of pixels for their
+				-- neighbours -- that guess is what used to push the timing column of a
+				-- tool row past the card's own clip.
+				local flex = node:FindFirstChildOfClass("UIFlexItem")
+				local flexMode = flex and nameOf(flex.FlexMode) or nil
+				local parentList = node.Parent and node.Parent:FindFirstChildOfClass("UIListLayout")
+				if parentList and (flexMode == "Fill" or flexMode == "Grow") then
+					ownsWidth = true
+				end
+				if (node.TextWrapped == true or truncates) and not ownsWidth then
+					local size = node.Size
+					local width = type(size) == "table" and size.X or nil
+					if (not width or (width.Scale == 0 and width.Offset <= 0)) and not seenWidth[path] then
+						seenWidth[path] = true
+						widths[#widths + 1] = string.format(
+							"%s  wrap=%s truncate=%s auto=%s  text=%q",
+							path, tostring(node.TextWrapped), tostring(truncates), auto,
+							tostring(node.Text):sub(1, 48))
+					end
+				end
+			end
+
+			local parent = node.Parent
+			if node:IsA("GuiObject") and parent and parent:FindFirstChildOfClass("UIListLayout") then
+				local anchor = node.AnchorPoint
+				local position = node.Position
+				local placed = type(position) == "table"
+					and (position.X.Scale ~= 0 or position.X.Offset ~= 0
+						or position.Y.Scale ~= 0 or position.Y.Offset ~= 0)
+				local anchored = type(anchor) == "table" and (anchor.X ~= 0 or anchor.Y ~= 0)
+				if (placed or anchored) and not seenAnchor[path] then
+					seenAnchor[path] = true
+					anchors[#anchors + 1] = string.format(
+						"%s  position=(%g,%g),(%g,%g) anchor=(%g,%g)",
+						path, position.X.Scale, position.X.Offset, position.Y.Scale,
+						position.Y.Offset, anchor.X, anchor.Y)
+				end
+			end
+		end
+	end
+
+	-- Both states matter: a configured client renders the cards and headers, an
+	-- unconfigured one renders the empty states, and they share almost no labels.
+	for _, configured in ipairs({ true, false }) do
+		local harness, handle = bootWith({ provider = configured })
+		for _, panel in ipairs({ "providers", "tools", "settings", "logs", "cowork", "agents", "chat" }) do
+			handle.app.show(panel)
+			harness.settle(1)
+			sweep(harness)
+		end
+
+		-- Modals build their own header rather than going through a panel, and the
+		-- provider editor is the densest form in the app, so both need walking too.
+		handle.env.require("ui/panels/providers").editor(
+			handle.providers.blank("openai"), function() end)
+		harness.settle(1)
+		sweep(harness)
+
+		handle.env.require("ui/overlay").confirm({
+			title = "Remove the thing?",
+			description = "It will not come back.",
+		})
+		harness.settle(1)
+		sweep(harness)
+
+		-- The settings dialog is a surface of its own -- two panes and thirteen
+		-- categories, none of which go through a panel -- and it is where three
+		-- zero-width controls were hiding.
+		local dialog = handle.app.showSettingsDialog("general")
+		for _, entry in ipairs(handle.env.require("ui/settingspanes").PANES) do
+			local row = harness.byName("Category_" .. entry.id)
+			if row then harness.click(row) end
+			harness.settle(1)
+			sweep(harness)
+		end
+		if dialog then dialog.close() end
+		harness.settle(1)
+
+		-- The one remaining surface that builds its own chrome: the search results.
+		handle.app.showSearch()
+		harness.settle(1)
+		sweep(harness)
+		handle.env.require("ui/overlay").closeAll()
+		harness.settle(1)
+
+		handle.app.showSearch()
+		harness.settle(1)
+		sweep(harness)
+		handle.env.require("ui/overlay").closeAll()
+		harness.settle(1)
+
+		handle.app.showAbout()
+		harness.settle(1)
+		sweep(harness)
+		handle.env.require("ui/overlay").closeAll()
+		harness.settle(1)
+	end
+
+	-- `truthy` rather than `check`, because `check` builds its own got/want detail and
+	-- the offending paths are the only part of a failure here worth reading.
+	truthy("every wrapped or truncated label has a width", #widths == 0,
+		table.concat(widths, "\n"))
+	truthy("nothing positions itself inside a list layout", #anchors == 0,
+		table.concat(anchors, "\n"))
+end)
+
+scenario("the window and its controls respond to input", function()
+	local harness, handle = bootWith({
+		handler = function() return { StatusCode = 200, Body = chatBody({ content = "Got it." }) } end,
+	})
+	local window = handle.app.window
+
+	-- The launcher is the only way back in once the window is closed, so the
+	-- toggle has to work in both directions.
+	truthy("the window starts open", window.visible)
+	truthy("closing it works", harness.click(harness.byName("Close")) and not window.visible)
+	harness.click(harness.byName("Launcher"))
+	truthy("the launcher reopens it", window.visible)
+	truthy("minimizing it works", harness.click(harness.byName("Minimize")) and not window.visible)
+	harness.click(harness.byName("Launcher"))
+	truthy("the launcher restores it after minimize", window.visible)
+
+	-- Both menus stay mounted. Exercise the visible sidebar menu on this desktop.
+	local menuButton = harness.byName("Nav_menu", handle.app.sideHolder)
+	harness.click(menuButton)
+	harness.click(harness.byName("Option_tools"))
+	check("a menu option switches panel", handle.app.panel, "tools")
+	harness.click(menuButton)
+	harness.click(harness.byName("Option_chat"))
+	check("and back", handle.app.panel, "chat")
+
+	-- Which is also what the two history arrows walk.
+	truthy("going back is offered", handle.app.canBack())
+	handle.app.back()
+	check("back returns to the previous panel", handle.app.panel, "tools")
+	handle.app.forward()
+	check("and forward returns", handle.app.panel, "chat")
+
+	-- Drag. The header is the handle; the body deliberately is not, so the
+	-- transcript can still be dragged to scroll.
+	local before = window.root.Position.X.Offset
+	harness.drag(harness.byName("Header"), 400, 100, 520, 160)
+	truthy("dragging the header moves the window",
+		window.root.Position.X.Offset ~= before,
+		tostring(before) .. " -> " .. tostring(window.root.Position.X.Offset))
+
+	-- Resize.
+	local sizeBefore = window.root.Size.X.Offset
+	harness.drag(harness.byName("ResizeGrip"), 900, 700, 700, 500)
+	truthy("dragging the grip resizes it",
+		window.root.Size.X.Offset ~= sizeBefore,
+		tostring(sizeBefore) .. " -> " .. tostring(window.root.Size.X.Offset))
+	truthy("but not below the minimum", window.root.Size.X.Offset >= 340)
+
+	-- Maximise changes geometry while keeping the shell mounted.
+	harness.click(harness.byName("Maximise"))
+	truthy("maximise takes effect", handle.app.window.maximised)
+	truthy("and the window is still there", harness.byName("Header") ~= nil)
+
+	-- Sending from the composer: type into the field, press the button.
+	local field = harness.byName("Prompt")
+	truthy("the composer field exists", field ~= nil)
+	local box = field and field:FindFirstChildOfClass("TextBox")
+	truthy("with a text box", box ~= nil)
+	box.Text = "hello from the composer"
+	harness.click(harness.byName("Send"))
+	harness.settle(6)
+
+	check("a request was sent", #chatRequests(harness), 1)
+	contains("the transcript shows what was typed", harness.textOf(), "hello from the composer")
+	contains("and the reply", harness.textOf(), "Got it.")
+	check("the field was cleared", box.Text, "")
+
+	-- The send button is also the stop button, so it has to disarm when the turn
+	-- ends. It did not: the loop emits "Ready" one line after turn:end and from
+	-- inside the turn, so session.busy was still true when the status handler read
+	-- it, and the composer went straight back to Stop a frame after being cleared --
+	-- leaving no way to send a second message.
+	local composer = handle.app.chatPanel and handle.app.chatPanel.composer
+	truthy("the composer is reachable", composer ~= nil)
+	check("the session is idle", handle.sessions.current().busy, false)
+	check("and so is the composer", composer and composer.busy, false)
+	truthy("so the button offers send rather than stop",
+		harness.byName("IconSend", harness.byName("Send")) ~= nil,
+		harness.dump(harness.byName("Send")))
+
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+	check("no property type errors", #harness.instanceState.typeErrors, 0,
+		table.concat(harness.instanceState.typeErrors, "\n"))
+end)
+
+scenario("overlays can be dismissed and answered", function()
+	local harness, handle = bootWith({ provider = false })
+	local overlay = handle.env.require("ui/overlay")
+
+	local confirmed, cancelled = false, false
+	overlay.confirm({
+		title = "Delete the thing?",
+		description = "It will not come back.",
+		confirmText = "Delete",
+		danger = true,
+		onConfirm = function() confirmed = true end,
+		onCancel = function() cancelled = true end,
+	})
+	harness.settle(0.6)
+	contains("the confirmation is on screen", harness.textOf(), "Delete the thing?")
+	contains("with the consequence spelled out", harness.textOf(), "will not come back")
+
+	local deleteButton
+	for _, node in ipairs(harness.screen():GetDescendants()) do
+		if node.__props.Text == "Delete" then deleteButton = node end
+	end
+	truthy("the confirm button is labelled by its action, not 'OK'", deleteButton ~= nil)
+	-- The label is inside the button, so the click goes to its ancestor.
+	harness.click(deleteButton and deleteButton.Parent and deleteButton.Parent.Parent)
+	check("confirming fires the callback", confirmed, true)
+	check("and not the cancel one", cancelled, false)
+	truthy("the modal closed", harness.textOf():find("Delete the thing?", 1, true) == nil)
+
+	-- A menu selects a value and closes itself.
+	local picked = nil
+	local target = harness.byName("Launcher")
+	overlay.menu({
+		target = target,
+		options = {
+			{ label = "First", value = "one" },
+			{ label = "Second", value = "two", selected = true },
+		},
+		onSelect = function(value) picked = value end,
+	})
+	harness.settle(0.4)
+	contains("the menu rendered its options", harness.textOf(), "Second")
+	local firstOption
+	for _, node in ipairs(harness.screen():GetDescendants()) do
+		if node.__props.Text == "First" then firstOption = node end
+	end
+	harness.click(firstOption and firstOption.Parent and firstOption.Parent.Parent
+		and firstOption.Parent.Parent.Parent)
+	check("selecting reports the value", picked, "one")
+
+	-- A toast appears and expires on its own.
+	overlay.toast("saved", "good", 1)
+	harness.settle(0.3)
+	contains("the toast is visible", harness.textOf(), "saved")
+	harness.settle(3)
+
+	-- A dropdown opened from inside a modal has to sit above it. The preset menu in
+	-- the Add provider dialog opened *behind* the dialog, because the dropdown layer
+	-- ranked below the modal one -- and since ZIndexBehavior is Sibling, the
+	-- comparison that decides it is between the two scrims, which are siblings under
+	-- the overlay layer.
+	local dialog = overlay.modal({ title = "Pick a preset", width = 380 })
+	harness.settle(0.4)
+	local inModal = overlay.menu({
+		target = harness.byName("Launcher"),
+		options = { { label = "One", value = "1" }, { label = "Two", value = "2" } },
+	})
+	harness.settle(0.4)
+	local menuLayer = harness.byName("MenuLayer")
+	local modalScrim = harness.byName("Scrim")
+	truthy("a menu opened over a modal exists", menuLayer ~= nil, harness.dump())
+	truthy("and ranks above the modal it was opened from",
+		menuLayer and modalScrim and menuLayer.ZIndex > modalScrim.ZIndex,
+		tostring(menuLayer and menuLayer.ZIndex) .. " vs " .. tostring(modalScrim and modalScrim.ZIndex))
+	if inModal then inModal.close() end
+	if dialog then dialog.close() end
+	harness.settle(0.6)
+
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+-- 22. Anthropic wire ------------------------------------------------------
+
+scenario("the Anthropic Messages API is spoken natively", function()
+	local step = 0
+	local harness = envMock.new({})
+	harness.http.handler = function(entry)
+		if not tostring(entry.url):find("/messages") then return { StatusCode = 404, Body = "{}" } end
+		step = step + 1
+		if step == 1 then
+			return { StatusCode = 200, Body = messagesBody({
+				text = "Let me look.",
+				toolUse = { id = "toolu_1", name = "game_info" },
+			}) }
+		end
+		return { StatusCode = 200, Body = messagesBody({ text = "This place is Mock Place 123456789." }) }
+	end
+	local handle = select(1, harness.boot())
+	harness.settle(1)
+
+	local record = handle.providers.blank("anthropic-messages")
+	record.label = "Claude"
+	record.apiKey = "sk-ant-harness"
+	record.model = "claude-opus-5"
+	record.models = { "claude-opus-5" }
+	record.stream = false
+	local saved, problems = handle.providers.save(record)
+	truthy("the native preset saves", saved, table.concat(problems or {}, ", "))
+	check("and is marked as the messages api", handle.providers.active().api, "anthropic")
+	handle.config.set("permissions.mode", "full")
+	harness.settle(1)
+
+	local session = handle.sessions.current()
+	session.send("what game is this")
+	harness.settle(14)
+
+	local requests = {}
+	for _, entry in ipairs(harness.http.log) do
+		if tostring(entry.url):find("/messages") then requests[#requests + 1] = entry end
+	end
+	check("two requests were made", #requests, 2)
+	contains("to the messages endpoint", requests[1] and requests[1].url or "", "/v1/messages")
+	check("authenticated with x-api-key", requests[1] and requests[1].headers["x-api-key"], "sk-ant-harness")
+	check("and versioned", requests[1] and requests[1].headers["anthropic-version"], "2023-06-01")
+
+	local first = json.decode(requests[1].body)
+	truthy("the system prompt is hoisted to a top-level field",
+		type(first.system) == "string" and #first.system > 0)
+	check("so no message carries the system role", (function()
+		for _, message in ipairs(first.messages or {}) do
+			if message.role == "system" then return "found one" end
+		end
+		return "none"
+	end)(), "none")
+	truthy("max_tokens is sent, as this API requires", (first.max_tokens or 0) > 0)
+	check("temperature is not, because current models reject it", first.temperature, nil)
+	truthy("tools declare input_schema", first.tools and first.tools[1]
+		and first.tools[1].input_schema ~= nil)
+	check("and carry no function wrapper", first.tools[1]["function"], nil)
+
+	-- The fiddly half: a tool result goes back as a tool_result block inside a USER
+	-- turn, preceded by the assistant turn that asked for it. Getting either wrong is
+	-- a 400 from the API rather than a wrong answer.
+	local second = json.decode(requests[2].body)
+	local last = second.messages[#second.messages]
+	check("the tool result came back as a user turn", last.role, "user")
+	check("carrying a tool_result block", last.content[1].type, "tool_result")
+	check("addressed to the call", last.content[1].tool_use_id, "toolu_1")
+	local asked = second.messages[#second.messages - 1]
+	check("preceded by the assistant turn that asked", asked.role, "assistant")
+	truthy("which replays the tool_use block verbatim", (function()
+		for _, block in ipairs(asked.content or {}) do
+			if block.type == "tool_use" and block.id == "toolu_1" then return true end
+		end
+		return false
+	end)(), json.encode(asked.content or {}))
+
+	check("the answer landed", session.ctx.messages[#session.ctx.messages].content,
+		"This place is Mock Place 123456789.")
+
+	-- The streamed form, checked directly: its events are Anthropic's own, and the
+	-- tool input arrives as concatenated JSON fragments.
+	local anthropic = handle.env.require("provider/anthropic")
+	local streamed = anthropic.parseStream(table.concat({
+		'data: {"type":"message_start","message":{"id":"msg_s","model":"claude-opus-5","usage":{"input_tokens":9}}}',
+		'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi "}}',
+		'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"there"}}',
+		'data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_s","name":"game_info"}}',
+		'data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\\"a\\":"}}',
+		'data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"1}"}}',
+		'data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":7}}',
+		'data: {"type":"message_stop"}',
+	}, "\n\n") .. "\n\n")
+	check("streamed text was concatenated", streamed.content, "Hi there")
+	check("one streamed call was assembled", #streamed.toolCalls, 1)
+	check("its id survived", streamed.toolCalls[1].id, "toolu_s")
+	check("its input json was joined", streamed.toolCalls[1]["function"].arguments, '{"a":1}')
+	check("the stop reason was mapped", streamed.finish, "tool_calls")
+	check("and usage normalised", streamed.usage.completion_tokens, 7)
+
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+-- 23. Token limits ---------------------------------------------------------
+
+scenario("what a model accepts is known before a refusal teaches it", function()
+	local _, handle = bootWith({ provider = false })
+	local traits = handle.env.require("provider/traits")
+
+	check("Opus 5 holds a million tokens", traits.contextWindow("claude-opus-5"), 1000000)
+	check("badged for a picker", traits.badge("claude-opus-5"), "1M")
+	check("through a gateway's prefix too", traits.badge("anthropic/claude-opus-5"), "1M")
+	check("and a dated snapshot", traits.contextWindow("claude-opus-5-20260101"), 1000000)
+	check("Haiku 4.5 is smaller", traits.badge("claude-haiku-4-5"), "200K")
+	check("an unfamiliar model claims nothing", traits.contextWindow("harness-model"), nil)
+
+	-- Silence has to mean "send it": withholding a parameter a gateway would have
+	-- honoured breaks every model this table has never heard of.
+	check("sampling is refused by Opus 5", traits.allowsSampling("claude-opus-5"), false)
+	check("allowed on 4.6", traits.allowsSampling("claude-opus-4-6"), true)
+	check("and on anything unknown", traits.allowsSampling("harness-model"), true)
+
+	-- The effort scales differ by generation, and a level a model never had is a
+	-- refusal rather than a rounding, so a setting is clamped down and never up.
+	check("xhigh is honoured where it exists", traits.nearestEffort("claude-opus-5", "xhigh"), "xhigh")
+	check("and lands on high where it does not", traits.nearestEffort("claude-opus-4-6", "xhigh"), "high")
+	check("max survives on both", traits.nearestEffort("claude-opus-4-6", "max"), "max")
+	check("a model with no scale takes no level", traits.nearestEffort("harness-model", "high"), nil)
+
+	-- An Opus has cost a third of the 4.5 rate since 4.6, and reporting the old
+	-- number made every turn in this client look three times dearer than it was.
+	local usage = handle.env.require("agent/usage")
+	local opus5 = usage.priceFor("claude-opus-5")
+	check("Opus 5 input is five dollars", opus5 and opus5[1], 5.00)
+	check("and output twenty-five", opus5 and opus5[2], 25.00)
+	check("Sonnet 5 is cheaper still", (usage.priceFor("claude-sonnet-5") or {})[1], 2.00)
+	check("an older Opus keeps its own price", (usage.priceFor("claude-opus-4-1") or {})[1], 15.00)
+end)
+
+scenario("a Claude request omits what Claude rejects and asks for a depth", function()
+	local sent = {}
+	local harness, handle = bootWith({
+		model = "claude-opus-5",
+		handler = function(entry)
+			if not tostring(entry.url):find("/chat/completions") then
+				return { StatusCode = 404, Body = "{}" }
+			end
+			sent[#sent + 1] = json.decode(entry.body)
+			return { StatusCode = 200, Body = chatBody({ content = "ok" }) }
+		end,
+	})
+	handle.config.set("permissions.mode", "full")
+	handle.config.set("agent.maxTokens", 999999)
+	handle.config.set("agent.executorReplyCeiling", 0)
+	handle.config.set("agent.effort", "high")
+
+	handle.sessions.current().send("hello")
+	harness.settle(10)
+
+	truthy("a request went out", sent[1] ~= nil)
+	check("temperature is withheld from a model that refuses it",
+		sent[1] and sent[1].temperature, nil)
+	check("the reply ceiling is clamped to what the model allows",
+		sent[1] and sent[1].max_tokens, 128000)
+	check("and a reasoning depth is asked for", sent[1] and sent[1].reasoning_effort, "high")
+
+	handle.config.set("agent.effort", "off")
+	handle.sessions.current().send("again")
+	harness.settle(10)
+	check("which can be switched off entirely", sent[2] and sent[2].reasoning_effort, nil)
+
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+scenario("context overflow recovers the same turn on both wire protocols", function()
+	for _, api in ipairs({ "openai", "anthropic" }) do
+		local main, summaries = {}, {}
+		local function response(text)
+			return api == "openai" and chatBody({ content = text }) or messagesBody({ text = text })
+		end
+		local harness, handle = bootWith({ preset = api == "anthropic" and "anthropic-messages" or "custom",
+			model = "Relayed-Unknown", handler = function(entry)
+				if not entry.body then return { StatusCode = 404, Body = "{}" } end
+				local body = json.decode(entry.body)
+				if body.max_tokens == 512 then
+					summaries[#summaries + 1] = body
+					return { StatusCode = 200, Body = response("Keep the lighthouse; the dock is unfinished.") }
+				end
+				main[#main + 1] = body
+				if #main == 1 then
+					local message = api == "openai"
+						and "maximum context length is 12000 tokens; requested 30000 tokens including max_tokens 8192"
+						or "prompt is too long: 30000 tokens > 12000 maximum (max_tokens 8192)"
+					return { StatusCode = 400, Body = json.encode({ error = { message = message } }) }
+				end
+				return { StatusCode = 200, Body = response("Recovered in the same turn.") }
+			end,
+		})
+		local session = handle.sessions.current()
+		for index = 1, 20 do
+			session.ctx.pushUser(("old question "):rep(100))
+			session.ctx.pushAssistant({ content = ("old answer "):rep(100) })
+		end
+		session.send("Finish the dock")
+		harness.settle(20)
+		check(api .. " learns the real context window", handle.config.get("agent.forceContext")["relayed-unknown"], 12000)
+		check(api .. " retries the main request once", #main, 2)
+		check(api .. " makes a separate summary request", #summaries, 1)
+		truthy(api .. " the retry has less history", main[2] and #main[2].messages < #main[1].messages)
+		contains(api .. " the retry includes the rolling summary", main[2] and json.encode(main[2]), "Keep the lighthouse")
+		contains(api .. " the latest question survives", main[2] and json.encode(main[2]), "Finish the dock")
+		check(api .. " context errors do not learn an output cap", handle.providers.active().maxTokensCap, nil)
+		contains(api .. " the turn finishes successfully", harness.textOf(), "Recovered in the same turn.")
+		check(api .. " compaction is counted", session.ctx.compactions, 1)
+		check(api .. " no thread errors", #harness.errors(), 0)
+	end
+end)
+
+	scenario("context recovery is bounded and still permits provider fallback", function()
+	local attempts = {}
+	local harness, handle = bootWith({ handler = function(entry)
+		if not entry.body then return { StatusCode = 404, Body = "{}" } end
+		local body = json.decode(entry.body)
+		if body.max_tokens == 512 then return { StatusCode = 200, Body = chatBody({ content = "Earlier facts" }) } end
+		attempts[body.model] = (attempts[body.model] or 0) + 1
+		if body.model == "fallback" then return { StatusCode = 200, Body = chatBody({ model = "fallback", content = "Fallback answered" }) } end
+		return { StatusCode = 400, Body = json.encode({ error = { message = "maximum context length is 12000 tokens" } }) }
+	end })
+	local primary = handle.providers.active()
+	handle.config.set("agent.fallback", true)
+	local fallback = handle.providers.blank("custom")
+	fallback.label, fallback.baseUrl, fallback.model = "Fallback", "https://fallback.test/v1", "fallback"
+	fallback.apiKey = "test-key"
+	assert(handle.providers.save(fallback))
+	handle.providers.setActive(primary.id)
+	local session = handle.sessions.current()
+	for index = 1, 8 do session.ctx.pushUser("question"); session.ctx.pushAssistant({ content = "answer" }) end
+	session.send("continue")
+	harness.settle(20)
+	check("a repeated refusal gets only one context retry", attempts[primary.model], 2)
+	check("then the next provider is tried", attempts.fallback, 1)
+	contains("fallback completes the turn", harness.textOf(), "Fallback answered")
+	check("no thread errors", #harness.errors(), 0)
+end)
+
+scenario("context recovery learns and retries a smaller fallback model", function()
+	local attempts = {}
+	local harness, handle = bootWith({ handler = function(entry)
+		if not entry.body then return { StatusCode = 404, Body = "{}" } end
+		local body = json.decode(entry.body)
+		if body.max_tokens == 512 then return { StatusCode = 200, Body = chatBody({ content = "Remember the lighthouse" }) } end
+		attempts[body.model] = (attempts[body.model] or 0) + 1
+		if body.model == "harness-model" then return { StatusCode = 401, Body = '{"error":"primary unavailable"}' } end
+		if attempts[body.model] == 1 then
+			return { StatusCode = 400, Body = '{"error":{"message":"maximum context length is 12000 tokens"}}' }
+		end
+		return { StatusCode = 200, Body = chatBody({ model = "small-fallback", content = "The smaller model recovered" }) }
+	end })
+	local primary = handle.providers.active()
+	local fallback = handle.providers.blank("custom")
+	fallback.label, fallback.baseUrl, fallback.model, fallback.apiKey = "Small fallback", "https://small.test/v1", "small-fallback", "test-key"
+	assert(handle.providers.save(fallback))
+	handle.providers.setActive(primary.id)
+	handle.config.set("agent.fallback", true)
+	local session = handle.sessions.current()
+	for index = 1, 8 do session.ctx.pushUser("question"); session.ctx.pushAssistant({ content = "answer" }) end
+	session.send("continue")
+	harness.settle(10)
+	check("the primary is not retried for a fallback overflow", attempts[primary.model], 1)
+	check("the smaller fallback is retried once", attempts["small-fallback"], 2)
+	check("only the refusing model learns a window", handle.config.get("agent.forceContext")["small-fallback"], 12000)
+	check("the primary window is not changed", handle.config.get("agent.forceContext")[primary.model], nil)
+	contains("fallback recovery finishes the same turn", harness.textOf(), "The smaller model recovered")
+	check("no thread errors", #harness.errors(), 0)
+end)
+
+scenario("context recovery stops on cancellation or uncompactable history", function()
+	for _, cancel in ipairs({ false, true }) do
+		local main, summaries, session = 0, 0, nil
+		local harness, handle = bootWith({ handler = function(entry)
+			if not entry.body then return { StatusCode = 404, Body = "{}" } end
+			local body = json.decode(entry.body)
+			if body.max_tokens == 512 then
+				summaries = summaries + 1
+				session.abortFlag = true
+				return { StatusCode = 200, Body = chatBody({ content = "summary" }) }
+			end
+			main = main + 1
+			return { StatusCode = 400, Body = '{"error":{"message":"maximum context length is 12000 tokens"}}' }
+		end })
+		session = handle.sessions.current()
+		if cancel then
+			for index = 1, 8 do session.ctx.pushUser("old question"); session.ctx.pushAssistant({ content = "answer" }) end
+		end
+		session.send("continue")
+		harness.settle(10)
+		check("no extra main request without a usable recovery", main, 1)
+		check("only removable history triggers a summary", summaries, cancel and 1 or 0)
+		check("no thread errors", #harness.errors(), 0)
+	end
+end)
+
+scenario("an over-large reply ceiling is lowered to what the model allows", function()
+	local _, handle = bootWith({ provider = false })
+	local openai = handle.env.require("provider/openai")
+
+	-- The refusal is the only place a model's output limit is published -- /models
+	-- reports ids, not capabilities -- and every vendor words it differently. The last
+	-- rows are the traps: the status code rides along in the text this is handed, and
+	-- a dated model id is full of digits.
+	local cases = {
+		{ "anthropic names the maximum",
+			"the provider rejected the request (400): max_tokens: 200000 > 64000, which is the maximum allowed number of output tokens for claude-sonnet-4-5-20250929",
+			200000, 64000 },
+		{ "openai names what the model supports",
+			"max_tokens is too large: 200000. This model supports at most 16384 completion tokens",
+			200000, 16384 },
+		{ "a gateway states an inequality",
+			"max_tokens must be less than or equal to 8192", 128000, 8192 },
+		{ "a complaint naming no number halves instead of guessing",
+			"the provider rejected the request (400): max_tokens too large", 64000, 32000 },
+		{ "and a ceiling already at the floor gives up rather than crawl",
+			"max_tokens too large", 1000, nil },
+	}
+	for _, case in ipairs(cases) do
+		check(case[1], openai.ceilingFromMessage(case[2], case[3]), case[4])
+	end
+
+	-- End to end on chat completions: the 400 is repaired once, and the number is kept
+	-- on the record so no later turn pays for the lesson again.
+	local sent = {}
+	local live, liveHandle = bootWith({
+		handler = function(entry)
+			if not tostring(entry.url):find("/chat/completions") then
+				return { StatusCode = 404, Body = "{}" }
+			end
+			local body = json.decode(entry.body)
+			sent[#sent + 1] = body.max_tokens
+			if (body.max_tokens or 0) > 8192 then
+				return { StatusCode = 400, Body = json.encode({
+					error = { message = "max_tokens must be less than or equal to 8192" },
+				}) }
+			end
+			return { StatusCode = 200, Body = chatBody({ content = "Fits now." }) }
+		end,
+	})
+	liveHandle.config.set("agent.maxTokens", 64000)
+	liveHandle.config.set("agent.executorReplyCeiling", 0)
+	local session = liveHandle.sessions.current()
+	session.send("hello")
+	live.settle(20)
+
+	check("the ceiling the user chose was tried first", sent[1], 64000)
+	check("then lowered to the one the provider named", sent[2], 8192)
+	check("and the answer landed", session.ctx.messages[#session.ctx.messages].content, "Fits now.")
+	local remembered = liveHandle.providers.active().maxTokensCap
+	check("the limit was remembered", remembered and remembered.tokens, 8192)
+	check("against the model it belongs to", remembered and remembered.model, "harness-model")
+
+	session.send("again")
+	live.settle(20)
+	check("so the next turn opens with it", sent[3], 8192)
+
+	-- The limit is the model's, not the endpoint's. A record pointed at a wider model
+	-- has to ask for the full ceiling again rather than stay clamped to what the last
+	-- one allowed, which nothing on screen would explain.
+	liveHandle.providers.setModel(liveHandle.providers.active().id, "harness-model-wide")
+	live.settle(1)
+	session.send("once more")
+	live.settle(20)
+	check("switching model asks for the full ceiling again", sent[4], 64000)
+	check("and learns this one's limit too", sent[5], 8192)
+	check("no thread errors", #live.errors(), 0,
+		live.errors()[1] and live.errors()[1].traceback or nil)
+
+	-- And on the Messages API, where max_tokens is mandatory and there is no second
+	-- shape to fall back to: without this the whole provider is unusable at that
+	-- setting rather than merely capped.
+	local nativeSent = {}
+	local native = envMock.new({})
+	native.http.handler = function(entry)
+		if not tostring(entry.url):find("/messages") then return { StatusCode = 404, Body = "{}" } end
+		local body = json.decode(entry.body)
+		nativeSent[#nativeSent + 1] = body.max_tokens
+		if (body.max_tokens or 0) > 64000 then
+			return { StatusCode = 400, Body = json.encode({
+				type = "error",
+				error = {
+					type = "invalid_request_error",
+					message = "max_tokens: 96000 > 64000, which is the maximum allowed number of output tokens for claude-opus-5",
+				},
+			}) }
+		end
+		return { StatusCode = 200, Body = messagesBody({ text = "Within the limit." }) }
+	end
+	local nativeHandle = select(1, native.boot())
+	native.settle(1)
+
+	local record = nativeHandle.providers.blank("anthropic-messages")
+	record.label = "Claude"
+	record.apiKey = "sk-ant-harness"
+	record.model = "claude-opus-5"
+	record.models = { "claude-opus-5" }
+	record.stream = false
+	local saved, problems = nativeHandle.providers.save(record)
+	truthy("the native preset saves", saved, table.concat(problems or {}, ", "))
+	nativeHandle.config.set("agent.maxTokens", 96000)
+	nativeHandle.config.set("agent.executorReplyCeiling", 0)
+	native.settle(1)
+
+	local nativeSession = nativeHandle.sessions.current()
+	nativeSession.send("hello")
+	native.settle(20)
+
+	check("the messages api tried the chosen ceiling", nativeSent[1], 96000)
+	check("and retried at the model's own", nativeSent[2], 64000)
+	check("with an answer rather than a dead provider",
+		nativeSession.ctx.messages[#nativeSession.ctx.messages].content, "Within the limit.")
+	check("which is remembered too", (nativeHandle.providers.active().maxTokensCap or {}).tokens, 64000)
+	check("no thread errors on the native path", #native.errors(), 0,
+		native.errors()[1] and native.errors()[1].traceback or nil)
+end)
+
+scenario("native replies use configured model limits without an executor ceiling", function()
+	for _, api in ipairs({ "openai", "anthropic" }) do
+		local sent = {}
+		local response = api == "openai" and chatBody({ content = "ok" }) or messagesBody({ text = "ok" })
+		local harness, handle = bootWith({ preset = api == "anthropic" and "anthropic-messages" or "custom", stream = true,
+			handler = function(entry)
+				if not entry.body then return { StatusCode = 404, Body = "{}" } end
+				sent[#sent + 1] = json.decode(entry.body)
+				return { StatusCode = 200, Body = response }
+			end,
+		})
+		local adapter = handle.env.require("provider/" .. api)
+		local record = handle.providers.active()
+		local caps = handle.env.require("runtime/caps")
+		caps.ws = true
+		handle.config.set("agent.effort", "off")
+		truthy(api .. " default call succeeds", providerCall(harness, adapter, record))
+		check(api .. " buffered SSE retains the configured output budget", sent[#sent].max_tokens, 128000)
+		check(api .. " stored reply ceiling is unchanged", handle.config.get("agent.maxTokens"), 128000)
+		check(api .. " context default is unchanged", handle.config.get("agent.contextTokens"), 1000000)
+		providerCall(harness, adapter, record, { maxTokens = 32768 })
+		check(api .. " explicit request token override is retained", sent[#sent].max_tokens, 32768)
+		record.params = { max_tokens = 49152 }
+		providerCall(harness, adapter, record)
+		check(api .. " explicit provider body override is retained", sent[#sent].max_tokens, 49152)
+		record.params = {}
+		providerCall(harness, adapter, record, { extra = { max_tokens = 24576 } })
+		check(api .. " explicit extra token override is retained", sent[#sent].max_tokens, 24576)
+		handle.config.set("agent.executorReplyCeiling", 6000)
+		providerCall(harness, adapter, record)
+		check(api .. " legacy executor ceiling settings are ignored", sent[#sent].max_tokens, 128000)
+		handle.config.set("agent.maxTokens", 2000)
+		providerCall(harness, adapter, record)
+		check(api .. " lower requested ceilings are not raised", sent[#sent].max_tokens, 2000)
+		handle.config.set("agent.maxTokens", 128000)
+		handle.config.set("agent.executorReplyCeiling", 0)
+		providerCall(harness, adapter, record)
+		check(api .. " the configured output budget remains authoritative", sent[#sent].max_tokens, 128000)
+		handle.config.set("agent.executorReplyCeiling", 8192)
+		record.wsUrl = "wss://harness.test/stream"
+		if api == "openai" then
+			local socketBody
+			handle.env.require("net/ws").stream = function(spec) socketBody = json.decode(json.encode(spec.body)); return response end
+			local result = providerCall(harness, adapter, record)
+			check("configured WebSocket streaming retains the full ceiling", socketBody and socketBody.max_tokens, 128000)
+			check("the socket path was actually used", result and result.via, "websocket")
+			handle.env.require("net/ws").stream = function() return nil, "socket unavailable" end
+			providerCall(harness, adapter, record)
+			check("HTTP fallback preserves the configured output budget", sent[#sent].max_tokens, 128000)
+			record.stream = false
+			providerCall(harness, adapter, record)
+			check("nonstreaming HTTP preserves the configured output budget", sent[#sent].max_tokens, 128000)
+		else
+			providerCall(harness, adapter, record)
+			check("Messages API HTTP preserves its configured output budget", sent[#sent].max_tokens, 128000)
+		end
+		if not nativeOnly then
+		handle.config.set("bridge.enabled", true, { quiet = true })
+		handle.config.set("bridge.runtime", "web", { quiet = true })
+		local relayed
+		handle.env.require("net/http").send = function(spec)
+			relayed = spec
+			return { ok = true, status = 200, body = response }
+		end
+		providerCall(harness, adapter, record)
+		check(api .. " web relay keeps the full ceiling", json.decode(relayed.body).max_tokens, 128000)
+		truthy(api .. " the request uses the web relay", relayed.relay)
+		end
+		check(api .. " no thread errors", #harness.errors(), 0)
+	end
+end)
+
+scenario("transport deadlines never retry or learn a ceiling for either provider API", function()
+	for _, api in ipairs({ "openai", "anthropic" }) do
+		for _, delay in ipairs({ 30, 60 }) do
+			local sent, retries = {}, 0
+			local response = api == "openai" and chatBody({ content = "Recovered" }) or messagesBody({ text = "Recovered" })
+			local harness, handle = bootWith({ preset = api == "anthropic" and "anthropic-messages" or "custom",
+				handler = function(entry)
+					if not entry.body then return { StatusCode = 404, Body = "{}" } end
+					sent[#sent + 1] = json.decode(entry.body)
+					if #sent == 1 then return { StatusCode = 403, Body = "", headerless = true, delay = delay } end
+					return { StatusCode = 200, Body = response }
+				end,
+			})
+			local adapter, record = handle.env.require("provider/" .. api), handle.providers.active()
+			handle.config.set("agent.effort", "off")
+			local tokenField = api == "openai" and delay == 60 and "max_completion_tokens" or "max_tokens"
+			if tokenField == "max_completion_tokens" then record.repairs = { "max_completion_tokens" } end
+			local request = { onRetry = function() retries = retries + 1 end }
+			if api == "anthropic" then request.extra = { output_config = { effort = "max", format = { type = "json_schema" } } } end
+			local result = providerCall(harness, adapter, record, request, delay + 1)
+			local label = api .. " " .. delay .. "s"
+			check(label .. " dispatches once", #sent, 1)
+			check(label .. " starts with the configured output budget", sent[1] and sent[1][tokenField], 128000)
+			check(label .. " no retry is reported", retries, 0)
+			falsy(label .. " unknown outcome remains a failure", result)
+			local cap = handle.providers.active().maxTokensCap
+			falsy(label .. " a deadline cannot teach a working ceiling", cap)
+			handle.config.saveNow()
+			local saved = json.decode(harness.files["UAI/config.json"])
+			falsy(label .. " no guessed cap is saved to disk", saved.providers.list[1].maxTokensCap)
+			providerCall(harness, adapter, handle.providers.active())
+			check(label .. " a separate request retains its configured ceiling", sent[2] and sent[2][tokenField], 128000)
+			if api == "anthropic" then
+				check("failure does not mutate the original override", request.extra.output_config.effort, "max")
+			end
+			handle.providers.setModel(record.id, "harness-model-wide")
+			providerCall(harness, adapter, handle.providers.active())
+			check(label .. " changing model retains its configured ceiling", sent[3] and sent[3].max_tokens, 128000)
+			falsy(label .. " changing model discards the old token-field repair", sent[3] and sent[3].max_completion_tokens)
+			check(label .. " no thread errors", #harness.errors(), 0)
+		end
+	end
+end)
+
+scenario("transport wall retry does not learn from failures or repeat minimal requests", function()
+	for _, api in ipairs({ "openai", "anthropic" }) do
+		for _, case in ipairs({
+			{ label = "deadline before an invalid response", delay = 30, body = "not JSON", requests = 1 },
+			{ label = "deadline before an empty response", delay = 30, body = "{}", requests = 1 },
+			{ label = "repeated transport wall", delay = 30, secondWall = true, requests = 1 },
+			{ label = "minimal request", delay = 30, maxTokens = 2000, requests = 1 },
+			{ label = "quick transport error", delay = 1, requests = 1 },
+			{ label = "outside recovery window", delay = 131, requests = 1 },
+		}) do
+			local sent = 0
+			local harness, handle = bootWith({ preset = api == "anthropic" and "anthropic-messages" or "custom",
+				handler = function(entry)
+					if not entry.body then return { StatusCode = 404, Body = "{}" } end
+					sent = sent + 1
+					if sent == 1 or case.secondWall then return { StatusCode = 403, Body = "", headerless = true, delay = case.delay } end
+					return { StatusCode = 200, Body = case.body or "{}" }
+				end,
+			})
+			handle.config.set("agent.effort", "off")
+			local adapter, record = handle.env.require("provider/" .. api), handle.providers.active()
+			local result = providerCall(harness, adapter, record, { maxTokens = case.maxTokens }, case.delay * 2 + 1)
+			falsy(api .. " " .. case.label .. " is a failure", result)
+			check(api .. " " .. case.label .. " stays bounded", sent, case.requests)
+			falsy(api .. " " .. case.label .. " does not learn a cap", handle.providers.active().maxTokensCap)
+			check(api .. " " .. case.label .. " has no thread errors", #harness.errors(), 0)
+		end
+		local harness, handle = bootWith({ preset = api == "anthropic" and "anthropic-messages" or "custom" })
+		local calls, retries, stopped = 0, 0, false
+		handle.env.require("net/http").send = function()
+			calls = calls + 1
+			harness.sched.wait(30)
+			stopped = true
+			return nil, "executor deadline"
+		end
+		local result = providerCall(harness, handle.env.require("provider/" .. api), handle.providers.active(), {
+			onRetry = function() retries = retries + 1 end, aborted = function() return stopped end,
+		}, 31)
+		falsy(api .. " cancelled transport is not recovered", result)
+		check(api .. " cancellation is never retried", calls, 1)
+		check(api .. " cancellation produces no retry notification", retries, 0)
+	end
+end)
+
+scenario("the token sliders span three orders of magnitude", function()
+	local harness, handle = bootWith({ provider = false })
+	harness.click(harness.byName("Nav_menu", handle.app.sideHolder))
+	harness.click(harness.byName("Option_settings"))
+	harness.settle(1)
+
+	-- Dragging well past either end, which clamps: the assertion is about what the
+	-- ends of the track carry, not about pixels, and the panel is the only place the
+	-- stop lists are wired to a setting.
+	local function dragTo(path, x)
+		local slider = harness.byName("Slider_" .. path)
+		local hit = slider and slider:FindFirstChildOfClass("TextButton")
+		if not hit then return false end
+		harness.drag(hit, 0, 0, x, 0)
+		return true
+	end
+
+	truthy("the context budget has a slider", dragTo("agent.contextTokens", 100000))
+	check("whose far end is a million tokens", handle.config.get("agent.contextTokens"), 1000000)
+	contains("labelled as such", harness.textOf(), "1M")
+
+	truthy("and it still goes back", dragTo("agent.contextTokens", -100000))
+	check("to four thousand", handle.config.get("agent.contextTokens"), 4000)
+
+	truthy("the reply ceiling has one", dragTo("agent.maxTokens", 100000))
+	check("reaching 128k, which the widest models will spend", handle.config.get("agent.maxTokens"), 128000)
+
+	truthy("and the tool result cap is adjustable at all", dragTo("agent.resultCap", 100000))
+	check("up to 128k characters", handle.config.get("agent.resultCap"), 128000)
+
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+	check("no property type errors", #harness.instanceState.typeErrors, 0,
+		table.concat(harness.instanceState.typeErrors, "\n"))
+end)
+
+scenario("effort reads as a scale rather than a number", function()
+	local harness, handle = bootWith({ provider = false })
+	harness.click(harness.byName("Nav_menu", handle.app.sideHolder))
+	harness.click(harness.byName("Option_settings"))
+	harness.settle(1)
+
+	local slider = harness.byName("Slider_agent.effort")
+	truthy("the effort setting has a track of its own", slider ~= nil)
+	local hit = slider and slider:FindFirstChildOfClass("TextButton")
+	truthy("with something to drag", hit ~= nil)
+
+	-- Words, not numbers. What the scale costs and buys is the part a reader needs,
+	-- and "xhigh" is not a quantity anyone can place on a bare track.
+	contains("the near end says what it buys", harness.textOf(), "Faster")
+	contains("and the far end too", harness.textOf(), "Smarter")
+
+	if hit then
+		harness.drag(hit, 0, 0, 100000, 0)
+		check("the far end spends the most", handle.config.get("agent.effort"), "max")
+		contains("and names itself", harness.textOf(), "Max")
+		harness.drag(hit, 0, 0, -100000, 0)
+		check("the near end the least", handle.config.get("agent.effort"), "low")
+	end
+
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+	check("no property type errors", #harness.instanceState.typeErrors, 0,
+		table.concat(harness.instanceState.typeErrors, "\n"))
+end)
+
+scenario("reasoning arrives folded, sized, and answers its switch", function()
+	local harness, handle = bootWith({
+		handler = function()
+			return { StatusCode = 200, Body = chatBody({
+				content = "Forty-two.",
+				reasoning = string.rep("weighing the options ", 40),
+			}) }
+		end,
+	})
+	handle.config.set("permissions.mode", "full")
+	handle.sessions.current().send("what is the answer")
+	harness.settle(10)
+
+	contains("the thinking is on screen", harness.textOf(), "weighing the options")
+	contains("under a header naming it", harness.textOf(), "Thinking")
+	-- Reasoning is billed as output and never appears in the reply, so its size is a
+	-- number the reader cannot get from anywhere else on the row.
+	contains("with its size in tokens", harness.textOf(), "tokens")
+	contains("and the answer as well", harness.textOf(), "Forty-two.")
+
+	local card = harness.byName("Reasoning")
+	truthy("the row exists", card ~= nil)
+	truthy("and its body starts folded", card and harness.byName("Aside", card).Visible == false)
+
+	-- The switch used to be read only while a row was being built, so turning it off
+	-- left the conversation exactly as it was and read as a dead toggle.
+	handle.config.set("ui.showReasoning", false)
+	harness.settle(3)
+	local after = harness.byName("Reasoning")
+	truthy("switching it off takes the row off screen", after == nil or after.Visible == false)
+	contains("and leaves the answer alone", harness.textOf(), "Forty-two.")
+
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+-- 23b. Hand-declared capabilities ----------------------------------------
+
+-- No endpoint publishes what a relayed model id can do, so before this the honest
+-- answer for every unknown id was "no reasoning, no badge, no effort" -- on exactly
+-- the models a user brings from a gateway. The two manual claims are the user's
+-- word against that silence, and they have to reach the wire.
+scenario("reasoning and a context window can be declared by hand", function()
+	local requests = {}
+	local harness, handle = bootWith({
+		model = "relay/unknown-large-model",
+		handler = function(entry)
+			if tostring(entry.url):find("/chat/completions") then
+				requests[#requests + 1] = json.decode(entry.body)
+				return { StatusCode = 200, Body = chatBody({ content = "Fine." }) }
+			end
+			return { StatusCode = 404, Body = "{}" }
+		end,
+	})
+	local traits = handle.env.require("provider/traits")
+
+	falsy("an unknown id documents nothing", traits.thinkingStyle("relay/unknown-large-model"))
+	falsy("and earns no badge", traits.badge("relay/unknown-large-model"))
+	falsy("so no effort is sent to it", requests[1] and requests[1].reasoning_effort)
+
+	-- The claim lives in the model picker, the surface behind the composer's chip.
+	harness.click(harness.byName("ModelChip"))
+	harness.settle(2)
+	truthy("the picker states it is a guess-free list",
+		harness.byName("NoEffort") ~= nil, harness.dump())
+
+	harness.click(harness.byName("ModelOptions"))
+	local claim = harness.byName("Option_reasoning")
+	truthy("a model row offers a reasoning claim", claim ~= nil, harness.dump())
+	harness.click(claim)
+	harness.settle(2)
+	check("which is recorded against this model",
+		handle.config.get("agent.forceReasoning")["relay/unknown-large-model"], true)
+	check("and read back as a thinking style",
+		traits.thinkingStyle("relay/unknown-large-model"), "adaptive")
+	check("so the effort setting now goes out",
+		traits.nearestEffort("relay/unknown-large-model", "high"), "high")
+
+	-- A declared context window is what the badge shows and the slider works against.
+	harness.click(harness.byName("ModelOptions"))
+	local window = harness.byName("Option_context")
+	truthy("and a context claim", window ~= nil, harness.dump())
+	harness.click(window)
+	harness.settle(2)
+	local fieldBox = harness.byName("PromptField")
+	local box = fieldBox and fieldBox:FindFirstChildOfClass("TextBox")
+	truthy("the claim opens a field", box ~= nil)
+	box.Text = "1000000"
+	if box.__signals and box.__signals.FocusLost then
+		box.__signals.FocusLost:Fire(true)
+	end
+	harness.settle(2)
+	check("the window is remembered",
+		handle.config.get("agent.forceContext")["relay/unknown-large-model"], 1000000)
+	check("and read back by the traits module",
+		traits.contextWindow("relay/unknown-large-model"), 1000000)
+	check("with the badge to match", traits.badge("relay/unknown-large-model"), "1M")
+
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+-- 23c. Notifications while minimized --------------------------------------
+
+-- The window can be closed for a whole turn and the only sign anything happened
+-- was a dot already pulsing while it ran. A finished answer, a failure and a stop
+-- are the three outcomes someone minimized is waiting on, from any conversation.
+scenario("a minimized client is told when a turn finishes", function()
+	local harness, handle = bootWith({
+		handler = function()
+			return { StatusCode = 200, Body = chatBody({ content = "All done, here is your answer." }) }
+		end,
+	})
+
+	-- Minimized, a turn runs to completion.
+	handle.app.hide()
+	harness.settle(1)
+	truthy("the window is closed", not handle.app.window.visible)
+	handle.sessions.current().send("a long question")
+	-- Short: the toast lives 4.5s and the mock settles until nothing is pending,
+	-- which includes the toast's own timer -- a long settle would wait for it to
+	-- close and the check below would race exactly the thing it asserts.
+	harness.settle(2)
+
+	-- The toast: the overlay layer lives on the ScreenGui, not the window, so it
+	-- shows over the game with the window closed.
+	contains("a toast announced the answer", harness.textOf(), "All done")
+	contains("naming what happened", harness.textOf(), "Reply ready")
+	harness.settle(10)
+
+	-- The badge: the count on the launcher, which survives however long the user
+	-- takes to look.
+	local badge = harness.byName("LauncherBadge")
+	truthy("the launcher carries a badge", badge ~= nil, harness.dump())
+	check("and it is visible", badge and badge.Visible, true)
+	check("counting one missed notification", harness.byName("LauncherBadgeCount").Text, "1")
+	-- And the durable record of what was missed, which is what a future history of
+	-- these notifications would be built from.
+	local noted = handle.app.notifications and handle.app.notifications[1]
+	contains("recording the reply", noted and noted.text or "", "All done")
+	check("from this conversation", noted and noted.sessionId, handle.sessions.activeId)
+
+	-- Opening the window is reading them, so they clear.
+	handle.app.show()
+	harness.settle(2)
+	truthy("the badge is gone once the window opens",
+		harness.byName("LauncherBadge") == nil or harness.byName("LauncherBadge").Visible == false)
+	check("and the list with it", #(handle.app.notifications or {}), 0)
+
+	-- With the window open there is no toast: the transcript is the notification,
+	-- and a toast on top of it is the same information twice.
+	local before = #chatRequests(harness)
+	handle.sessions.current().send("another question while open")
+	harness.settle(10)
+	truthy("the turn ran", #chatRequests(harness) > before)
+	contains("and answered on screen", harness.textOf(), "All done")
+
+	-- A failure while minimized is its own kind of notification.
+	handle.app.hide()
+	harness.settle(1)
+	handle.sessions.current().send("this one will fail")
+	harness.settle(10)
+	check("the badge counts it", harness.byName("LauncherBadgeCount").Text, "1")
+
+	-- The setting turns the toasts off; the badge still happens, because the
+	-- launcher is where "something happened while you were away" belongs.
+	handle.config.set("ui.notifications", false)
+	handle.app.show()
+	harness.settle(2)
+	handle.app.hide()
+	harness.settle(1)
+	handle.sessions.current().send("a quiet one")
+	harness.settle(10)
+	truthy("the badge still appears", harness.byName("LauncherBadge").Visible == true)
+
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+-- 24. Quick chat ----------------------------------------------------------
+
+scenario("quick chat opens on a keypress and sends to the same conversation", function()
+	local harness, handle = bootWith({
+		handler = function() return { StatusCode = 200, Body = chatBody({ content = "Quick answer." }) } end,
+	})
+	local quick = handle.env.require("ui/quickchat")
+
+	check("the default key is bound", quick.keyName(), "Semicolon")
+	truthy("and it starts hidden", not quick.visible)
+
+	harness.press("Semicolon")
+	truthy("the bound key opens it", quick.visible)
+	truthy("its surface exists", harness.byName("QuickChat") ~= nil, harness.dump())
+
+	harness.press("Escape")
+	truthy("escape closes it", not quick.visible)
+	check("without sending anything", #chatRequests(harness), 0)
+
+	-- A keystroke the interface already consumed must not open it, or typing the
+	-- bound character into the composer would open it on every keypress.
+	harness.press("Semicolon", true)
+	truthy("a processed keystroke is ignored", not quick.visible)
+
+	harness.press("Semicolon")
+	truthy("it opens again", quick.visible)
+	quick.submit("hello from quick chat")
+	truthy("sending closes it", not quick.visible)
+	harness.settle(8)
+
+	check("one request was sent", #chatRequests(harness), 1)
+	contains("the transcript has it, so it is the same session",
+		harness.textOf(), "hello from quick chat")
+	contains("and the reply", harness.textOf(), "Quick answer.")
+
+	-- Rebinding captures the next key rather than parsing a typed character.
+	quick.captureNext(function() end)
+	harness.press("Q")
+	check("the captured key was stored", quick.keyName(), "Q")
+	check("and persisted", handle.config.get("ui.quickKey"), "Q")
+	harness.press("Semicolon")
+	truthy("the old key no longer opens it", not quick.visible)
+	harness.press("Q")
+	truthy("the new one does", quick.visible)
+	quick.hide()
+
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+-- 25. Unload --------------------------------------------------------------
+
+scenario("unloading stops everything it started", function()
+	local harness, handle = bootWith({
+		handler = function() return { StatusCode = 200, Body = chatBody({ content = "Hi." }) } end,
+	})
+	local dispose = handle.env.require("runtime/dispose")
+
+	truthy("the interface is up", harness.screen() ~= nil)
+	truthy("and cleanups are registered", dispose.count() > 0, tostring(dispose.count()))
+
+	-- A turn leaves a working row behind with a timer driving it, so the drain has
+	-- real work rather than an empty registry.
+	handle.sessions.current().send("hello")
+	harness.settle(1)
+
+	local ran = handle.destroy()
+	truthy("the drain ran cleanups", (ran or 0) > 0, tostring(ran))
+	check("the registry is empty afterwards", dispose.count(), 0)
+	check("the handle is no longer alive", handle.alive, false)
+	truthy("the interface is gone", harness.screen() == nil, harness.dump(harness.coreGui))
+
+	-- The whole point: nothing keeps running. Advancing the clock a long way must not
+	-- raise from a timer writing to a label that no longer exists.
+	harness.settle(25)
+	check("no thread errors after unloading", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+
+	-- And a config write must not rebuild an interface that has gone.
+	handle.config.set("ui.accent", "amber")
+	handle.config.set("ui.density", "compact")
+	harness.settle(3)
+	truthy("a config change does not resurrect it", harness.screen() == nil)
+	check("still no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+
+	check("a second unload is a no-op", handle.destroy(), 0)
+end)
+
+-- 44. The web bridge -------------------------------------------------------
+--
+-- A Roblox client cannot be connected to, so the browser half of this feature is a
+-- local process that the client polls. Three things have to hold: a command coming
+-- back off that poll reaches the session, the reply is pushed back out, and none of
+-- the polling lands in the request history the Logs panel reads.
+
+scenario("the web bridge relays a browser message into the session", function()
+	local uploads, inboxCalls = {}, 0
+	local harness, handle = bootWith({
+		handler = function(entry)
+			local url = tostring(entry.url)
+			if url:find("/api/agent/inbox") then
+				inboxCalls = inboxCalls + 1
+				if inboxCalls == 1 then
+					return { StatusCode = 200, Body = json.encode({
+						commands = { { type = "send", text = "what game is this" } },
+					}) }
+				end
+				return { StatusCode = 200, Body = json.encode({ commands = {} }) }
+			end
+			if url:find("/api/agent/events") then
+				uploads[#uploads + 1] = json.decode(entry.body or "{}")
+				return { StatusCode = 204, Body = "" }
+			end
+			if url:find("/chat/completions") then
+				return { StatusCode = 200, Body = chatBody({
+					content = "This place is Mock Place 123456789.",
+				}) }
+			end
+			return { StatusCode = 404, Body = "{}" }
+		end,
+	})
+
+	handle.config.set("bridge.token", ("a"):rep(64))
+	handle.config.set("bridge.enabled", true)
+	harness.settle(10)
+
+	local bridge = handle.env.require("net/bridge")
+	truthy("the bridge is running", bridge.running)
+	truthy("and finds the local process reachable", bridge.online)
+
+	local session = handle.sessions.current()
+	local kinds = {}
+	for _, event in ipairs(session.log) do kinds[event.kind] = (kinds[event.kind] or 0) + 1 end
+	check("the browser's message became a user turn", kinds["user"], 1)
+	truthy("and the agent answered it", (kinds["assistant:text"] or 0) >= 1)
+
+	-- The answer has to travel back out, or the browser shows a question and then
+	-- nothing at all.
+	local relayed = {}
+	for _, upload in ipairs(uploads) do
+		for _, event in ipairs(upload.events or {}) do relayed[#relayed + 1] = event end
+		for _, event in ipairs(upload.snapshot or {}) do relayed[#relayed + 1] = event end
+	end
+	local sawUser, sawReply = false, false
+	for _, event in ipairs(relayed) do
+		if event.kind == "user" and tostring(event.text):find("what game") then sawUser = true end
+		if event.kind == "assistant:text" and tostring(event.text):find("Mock Place") then
+			sawReply = true
+		end
+	end
+	truthy("the user turn was pushed to the bridge", sawUser)
+	truthy("so was the answer", sawReply)
+
+	local http = handle.env.require("net/http")
+	local leaked = 0
+	for _, item in ipairs(http.history) do
+		if tostring(item.url):find("/api/agent/") then leaked = leaked + 1 end
+	end
+	check("bridge traffic stays out of the request history", leaked, 0)
+	truthy("while the inference call is still in it", #http.history > 0)
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+scenario("unloading stops the bridge", function()
+	local inboxCalls = 0
+	local harness, handle = bootWith({
+		handler = function(entry)
+			local url = tostring(entry.url)
+			if url:find("/api/agent/inbox") then
+				inboxCalls = inboxCalls + 1
+				return { StatusCode = 200, Body = json.encode({ commands = {} }) }
+			end
+			if url:find("/api/agent/events") then return { StatusCode = 204, Body = "" } end
+			return { StatusCode = 404, Body = "{}" }
+		end,
+	})
+
+	handle.config.set("bridge.token", ("b"):rep(64))
+	handle.config.set("bridge.enabled", true)
+	harness.settle(6)
+
+	local bridge = handle.env.require("net/bridge")
+	truthy("the bridge started", bridge.running)
+	truthy("and polled at least once", inboxCalls > 0, tostring(inboxCalls))
+
+	handle.destroy()
+	local before = inboxCalls
+	harness.settle(30)
+
+	check("it stopped with everything else", bridge.running, false)
+	check("and its poller made no further requests", inboxCalls, before)
+
+	-- Re-enabling the setting afterwards must not bring the threads back: the
+	-- subscription watching that setting is drained along with them.
+	handle.config.set("bridge.enabled", false)
+	handle.config.set("bridge.enabled", true)
+	harness.settle(6)
+	check("a config write does not restart it", bridge.running, false)
+	check("still nothing polling", inboxCalls, before)
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+-- 45. Activity history ------------------------------------------------------
+
+-- Every figure the home card shows has to come from something the client saw. These
+-- scenarios are the contract: a number appears only after the event that produces it,
+-- it survives a restart, and nothing is counted twice.
+scenario("activity is counted from what actually happened", function()
+	local harness, handle = bootWith({
+		handler = function(entry)
+			if not tostring(entry.url):find("/chat/completions") then
+				return { StatusCode = 404, Body = "{}" }
+			end
+			return { StatusCode = 200, Body = chatBody({ content = "Counted." }) }
+		end,
+	})
+	local stats = handle.env.require("agent/stats")
+
+	local before = stats.window("all")
+	check("nothing is counted before anything happens", before.messages, 0)
+	check("and no tokens", before.tokens, 0)
+	truthy("so there is no comparison to make", stats.comparison(before.tokens) == nil)
+
+	handle.sessions.current().send("count this")
+	harness.settle(8)
+
+	local after = stats.window("all")
+	check("the question was counted", after.userMessages, 1)
+	check("and the answer", after.replies, 1)
+	check("as two messages", after.messages, 2)
+	check("the conversation was counted once", after.sessions, 1)
+	check("one request", after.requests, 1)
+	-- 120 in and 40 out is what the fixture's usage block reports.
+	check("the tokens the provider reported went in", after.tokensIn, 120)
+	check("and the ones it sent back", after.tokensOut, 40)
+	check("totalled", after.tokens, 160)
+	check("today is the only active day", after.activeDays, 1)
+	check("which is a one day streak", after.currentStreak, 1)
+
+	-- The virtual clock starts at midnight on the first of January 2026, so the day
+	-- key is a fixed, readable date rather than whatever the test machine thinks.
+	local todayKey = handle.env.require("runtime/clock").dayKey()
+	check("bucketed under the local day", todayKey, "2026-01-01")
+	truthy("which has a record", stats.data.days[todayKey] ~= nil)
+
+	local model = after.topModel
+	truthy("the model that did the work is named", model ~= nil)
+	check("and it is the one that answered", model and model.id, "harness-model")
+	check("with all of the tokens", model and model.tokens, 160)
+
+	-- A second turn in the same conversation is more messages, not a second
+	-- conversation: the id has already been counted.
+	handle.sessions.current().send("and this")
+	harness.settle(8)
+	local second = stats.window("all")
+	check("a second turn adds messages", second.messages, 4)
+	check("but not a second conversation", second.sessions, 1)
+
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+scenario("the activity history survives a restart", function()
+	local harness, handle = bootWith({
+		handler = function(entry)
+			if not tostring(entry.url):find("/chat/completions") then
+				return { StatusCode = 404, Body = "{}" }
+			end
+			return { StatusCode = 200, Body = chatBody({ content = "Stored." }) }
+		end,
+	})
+	handle.sessions.current().send("remember this")
+	harness.settle(8)
+	handle.destroy()
+	harness.settle(2)
+
+	truthy("the history was written", harness.files["UAI/stats.json"] ~= nil)
+	contains("with the model in it", harness.files["UAI/stats.json"], "harness-model")
+
+	-- A fresh client on the same filesystem, which is what a second run is.
+	local revived = envMock.new({})
+	for path, body in pairs(harness.files) do revived.files[path] = body end
+	for path in pairs(harness.folders) do revived.folders[path] = true end
+	revived.http.handler = function() return { StatusCode = 404, Body = "{}" } end
+	local second = revived.boot()
+	truthy("the client came back", second ~= nil)
+	revived.settle(2)
+
+	local stats = second.env.require("agent/stats")
+	local window = stats.window("all")
+	check("the messages are still counted", window.messages, 2)
+	check("so is the conversation", window.sessions, 1)
+	check("and the tokens", window.tokens, 160)
+	check("no thread errors", #revived.errors(), 0,
+		revived.errors()[1] and revived.errors()[1].traceback or nil)
+end)
+
+scenario("a history that predates the counters is recovered from the transcripts", function()
+	-- The client kept conversations on disk long before it counted anything, so the
+	-- first run with a counter file reads the real timestamps out of those
+	-- transcripts. Tokens are deliberately not recovered: nothing on disk records
+	-- them, and an estimate would be a figure with no measurement behind it.
+	local harness, handle = bootWith({
+		handler = function(entry)
+			if not tostring(entry.url):find("/chat/completions") then
+				return { StatusCode = 404, Body = "{}" }
+			end
+			return { StatusCode = 200, Body = chatBody({ content = "Answered." }) }
+		end,
+	})
+	handle.sessions.current().send("an older conversation")
+	harness.settle(8)
+	handle.destroy()
+	harness.settle(2)
+
+	local revived = envMock.new({})
+	for path, body in pairs(harness.files) do
+		-- Everything except the counters, which is exactly the state an install from
+		-- before this feature is in.
+		if path ~= "UAI/stats.json" then revived.files[path] = body end
+	end
+	for path in pairs(harness.folders) do revived.folders[path] = true end
+	revived.http.handler = function() return { StatusCode = 404, Body = "{}" } end
+	local second = revived.boot()
+	revived.settle(2)
+
+	local stats = second.env.require("agent/stats")
+	local window = stats.window("all")
+	check("the messages came back", window.messages, 2)
+	check("and the conversation", window.sessions, 1)
+	check("without inventing tokens", window.tokens, 0)
+	truthy("and nothing claims to know when they were spent", window.tokensFrom == nil)
+
+	-- Seeding runs once. A third boot must not count the same transcripts again.
+	local third = envMock.new({})
+	for path, body in pairs(revived.files) do third.files[path] = body end
+	for path in pairs(revived.folders) do third.folders[path] = true end
+	third.http.handler = function() return { StatusCode = 404, Body = "{}" } end
+	local handle3 = third.boot()
+	third.settle(2)
+	check("a later boot does not count them again",
+		handle3.env.require("agent/stats").window("all").messages, 2)
+	check("no thread errors", #third.errors(), 0,
+		third.errors()[1] and third.errors()[1].traceback or nil)
+end)
+
+scenario("the activity windows and the heatmap agree with the record", function()
+	local harness, handle = bootWith({ provider = false })
+	local stats = handle.env.require("agent/stats")
+	local clock = handle.env.require("runtime/clock")
+
+	-- Written straight into the store rather than through a conversation, because
+	-- what is under test is the arithmetic over several days and the virtual clock
+	-- only ever advances by seconds.
+	local today = clock.dayNumber()
+	local function put(offset, tokens, messages)
+		local key = clock.keyFromDayNumber(today - offset)
+		stats.data.days[key] = {
+			sessions = 1, messages = messages, userMessages = messages, replies = 0,
+			tokensIn = tokens, tokensOut = 0, cost = 0, requests = 1,
+			toolCalls = 0, toolErrors = 0, errors = 0,
+			hours = { ["11"] = messages }, models = {},
+		}
+		return key
+	end
+	put(0, 1000, 2)
+	put(1, 500, 1)
+	put(2, 250, 1)
+	-- A gap at three days, then an older cluster, which is what makes the streaks
+	-- and the windows different from each other.
+	put(9, 100, 1)
+	put(40, 50, 1)
+
+	local all = stats.window("all")
+	check("every day counts in all", all.activeDays, 5)
+	check("with every token", all.tokens, 1900)
+	check("the streak ends at the gap", all.currentStreak, 3)
+	check("and the longest run is the same one", all.longestStreak, 3)
+	check("the busiest hour is the one with the messages", all.peakHour, 11)
+	check("read back as a time", clock.describeHour(all.peakHour), "11 AM")
+
+	local week = stats.window("7d")
+	check("a week excludes the older days", week.activeDays, 3)
+	check("and their tokens", week.tokens, 1750)
+
+	local month = stats.window("30d")
+	check("a month reaches the cluster", month.activeDays, 4)
+	check("but not the one before it", month.tokens, 1850)
+
+	local map = stats.heatmap(26)
+	check("the heatmap is the weeks it was asked for", #map.columns, 26)
+	check("each column is a week", #map.columns[1], 7)
+	check("and its peak is the busiest day", map.peak, 1000)
+
+	local todayKey = clock.keyFromDayNumber(today)
+	local found = nil
+	for _, column in ipairs(map.columns) do
+		for _, cell in ipairs(column) do
+			if cell.key == todayKey then found = cell end
+		end
+	end
+	truthy("today has a cell", found ~= nil)
+	check("at the top level", found and found.level, 4)
+	check("holding the day's real total", found and found.tokens, 1000)
+
+	-- One book is the floor, because "0.4 books" is not a sentence.
+	truthy("no comparison under a whole book", stats.comparison(90000) == nil)
+	contains("and the book is named above it", tostring(stats.comparison(1000000)),
+		"Harry Potter")
+	contains("with a multiple", tostring(stats.comparison(1000000)), "10")
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+-- 46. The reworked interface ------------------------------------------------
+
+-- The sidebar, the composer's chips and the settings dialog were the three surfaces
+-- that looked finished and were not: a hardcoded list of project names, a permission
+-- chip that announced the opposite of the mode in force, and a dialog whose panes
+-- were mostly placeholder text. These scenarios pin the replacements to real state.
+scenario("the conversation list is the real one", function()
+	local harness, handle = bootWith({
+		handler = function(entry)
+			if not tostring(entry.url):find("/chat/completions") then
+				return { StatusCode = 404, Body = "{}" }
+			end
+			return { StatusCode = 200, Body = chatBody({ content = "Noted." }) }
+		end,
+	})
+
+	handle.sessions.current().send("the raft spawns in the wrong place")
+	harness.settle(8)
+	local first = handle.sessions.activeId
+	handle.app.openSession(handle.sessions.newThread().id)
+	handle.sessions.current().send("the camera clips through the wall")
+	harness.settle(8)
+	local second = handle.sessions.activeId
+
+	local sidebar = harness.byName("Sidebar")
+	truthy("the sidebar exists", sidebar ~= nil)
+	local text = harness.textOf(sidebar)
+	contains("the first conversation is listed", text, "the raft spawns")
+	contains("so is the second", text, "the camera clips")
+	contains("grouped under the place they happened in", text, "Mock Place")
+	-- The list used to be three invented project names with eleven invented titles
+	-- under them, copied out of a screenshot.
+	truthy("and nothing invented is listed",
+		not text:find("Project%-Gravity") and not text:find("rbxmptest"), text)
+
+	local rows = harness.allByName("SessionRow", sidebar)
+	check("one row per conversation", #rows, 2)
+
+	-- The most recent conversation sorts first, so the second row is the older one.
+	harness.click(rows[2])
+	check("clicking a row switches to it", handle.sessions.activeId, first)
+	contains("and the transcript follows", harness.textOf(harness.byName("Transcript")),
+		"the raft spawns")
+
+	local session = handle.sessions.threads[first]
+	session.rename("Raft spawn point")
+	harness.settle(1)
+	contains("a rename shows up in the list", harness.textOf(harness.byName("Sidebar")),
+		"Raft spawn point")
+
+	handle.sessions.remove(second)
+	harness.settle(1)
+	truthy("a deleted conversation leaves the list",
+		not harness.textOf(harness.byName("Sidebar")):find("the camera clips"))
+	truthy("and its file goes with it",
+		harness.files["UAI/sessions/" .. tostring(second) .. ".json"] == nil)
+
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+scenario("the composer states what is actually in force", function()
+	local harness, handle = bootWith({
+		model = "claude-opus-5",
+		handler = function(entry)
+			if not tostring(entry.url):find("/chat/completions") then
+				return { StatusCode = 404, Body = "{}" }
+			end
+			return { StatusCode = 200, Body = chatBody({ content = "Fine." }) }
+		end,
+	})
+
+	local runtime = harness.byName("Chip_runtime")
+	truthy("the runtime chip exists", runtime ~= nil)
+	contains("and names the host it is on", harness.textOf(runtime), "OfflineHarness")
+
+	-- The permission chip said "Bypass permissions" on a client whose mode was "ask",
+	-- which is the one place a fake label was also a safety problem.
+	local permissionLabel = harness.byName("PermissionLabel")
+	truthy("the permission chip exists", permissionLabel ~= nil)
+	check("and reads the mode in force", permissionLabel.Text, "Ask first")
+	handle.env.require("agent/permissions").setMode("full")
+	harness.settle(1)
+	check("changing the mode changes the label", permissionLabel.Text, "Full access")
+
+	local modelLabel = harness.byName("ModelLabel")
+	contains("the model is the one the provider is pointed at", modelLabel.Text, "claude-opus-5")
+	contains("with the window this client knows it has", modelLabel.Text, "1M")
+
+	-- Isolation is the worktree chip: a conversation marked that way is never written.
+	local session = handle.sessions.current()
+	session.send("write this down")
+	harness.settle(8)
+	local path = "UAI/sessions/" .. tostring(session.id) .. ".json"
+	truthy("an ordinary conversation is on disk", harness.files[path] ~= nil)
+	harness.click(harness.byName("Chip_isolate"))
+	truthy("isolating it takes it off disk", harness.files[path] == nil)
+	session.send("and this")
+	harness.settle(8)
+	truthy("and it stays off", harness.files[path] == nil)
+	harness.click(harness.byName("Chip_isolate"))
+	truthy("turning it back on saves it again", harness.files[path] ~= nil)
+
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+scenario("an attached file travels with the message", function()
+	local sent = nil
+	local harness, handle = bootWith({
+		handler = function(entry)
+			if not tostring(entry.url):find("/chat/completions") then
+				return { StatusCode = 404, Body = "{}" }
+			end
+			sent = entry.body
+			return { StatusCode = 200, Body = chatBody({ content = "Read it." }) }
+		end,
+	})
+
+	local fsx = handle.env.require("runtime/fsx")
+	fsx.write("notes/plan.txt", "step one: fix the raft")
+
+	local composer = handle.app.chatPanel.composer
+	composer.attachments = { { label = "notes/plan.txt", text = "step one: fix the raft" } }
+	local box = harness.byName("Prompt"):FindFirstChildOfClass("TextBox")
+	box.Text = "what does the plan say"
+	harness.click(harness.byName("Send"))
+	harness.settle(8)
+
+	truthy("a request went out", sent ~= nil)
+	contains("with the file's contents in it", tostring(sent), "step one: fix the raft")
+	contains("named", tostring(sent), "notes/plan.txt")
+	contains("alongside the question", tostring(sent), "what does the plan say")
+	check("and the attachment is not resent", #composer.attachments, 0)
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+scenario("every settings pane builds and is reachable", function()
+	local harness, handle = bootWith({})
+	local panes = handle.env.require("ui/settingspanes")
+
+	local dialog = handle.app.showSettingsDialog("usage")
+	harness.settle(1)
+	truthy("the dialog opened", dialog ~= nil)
+	truthy("with a category list", harness.byName("Category_usage") ~= nil)
+
+	-- Every pane, one at a time. The mock type-checks every property assignment, so
+	-- this is where a pane that only looked finished stops looking finished.
+	for _, entry in ipairs(panes.PANES) do
+		local row = harness.byName("Category_" .. entry.id)
+		truthy(entry.id .. " has a category row", row ~= nil)
+		if row then
+			harness.click(row)
+			harness.settle(1)
+			truthy(entry.id .. " renders", harness.byName("Pane_" .. entry.id) ~= nil)
+		end
+	end
+
+	-- The old dialog built its own scrim and registered with nothing, so Escape did
+	-- not close it and neither did clicking beside it.
+	harness.press("Escape")
+	harness.settle(1)
+	truthy("Escape closes it", harness.byName("SettingsDialog") == nil)
+
+	local typeErrors = handle.env and harness.instanceState.typeErrors or {}
+	check("no property was assigned the wrong type", #typeErrors, 0,
+		typeErrors[1] and tostring(typeErrors[1]) or nil)
+	local unknownReads = {}
+	for key in pairs(harness.instanceState.unknownReads) do unknownReads[#unknownReads + 1] = key end
+	table.sort(unknownReads)
+	check("no unknown property was read", #unknownReads, 0, table.concat(unknownReads, "\n"))
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+	check("nothing was warned", #harness.console.warnings, 0,
+		table.concat(harness.console.warnings, "\n"))
+end)
+
+scenario("a tool group can be withheld from the model", function()
+	local sent = nil
+	local harness, handle = bootWith({
+		handler = function(entry)
+			if not tostring(entry.url):find("/chat/completions") then
+				return { StatusCode = 404, Body = "{}" }
+			end
+			sent = entry.body
+			return { StatusCode = 200, Body = chatBody({ content = "Nothing to do." }) }
+		end,
+	})
+	local registry = handle.env.require("agent/registry")
+
+	local before = #registry.definitions({})
+	local groups = registry.groups()
+	truthy("the registry reports its groups", #groups > 0)
+
+	local target = nil
+	for _, group in ipairs(groups) do
+		if group.id == "remotes" then target = group end
+	end
+	truthy("including the remotes family", target ~= nil)
+
+	registry.setGroupEnabled("remotes", false)
+	local after = #registry.definitions({})
+	truthy("switching it off shortens the tool list", after < before,
+		tostring(before) .. " -> " .. tostring(after))
+	check("by exactly that family", before - after, target.total)
+
+	handle.sessions.current().send("look around")
+	harness.settle(8)
+	truthy("and the wire carries the shorter list", sent ~= nil)
+	truthy("with none of the withheld tools in it",
+		not tostring(sent):find("remote_fire", 1, true), tostring(sent):sub(1, 400))
+
+	registry.setGroupEnabled("remotes", true)
+	check("turning it back on restores them", #registry.definitions({}), before)
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+scenario("search finds a conversation by what was said in it", function()
+	local harness, handle = bootWith({
+		handler = function(entry)
+			if not tostring(entry.url):find("/chat/completions") then
+				return { StatusCode = 404, Body = "{}" }
+			end
+			return { StatusCode = 200, Body = chatBody({ content = "Understood." }) }
+		end,
+	})
+
+	handle.sessions.current().send("the lighting is too dark near the docks")
+	harness.settle(8)
+	local older = handle.sessions.activeId
+	handle.app.openSession(handle.sessions.newThread().id)
+	handle.sessions.current().send("something else entirely")
+	harness.settle(8)
+
+	handle.app.showSearch()
+	harness.settle(1)
+	local field = harness.byName("SearchField")
+	truthy("the search field is there", field ~= nil)
+	local box = field:FindFirstChildOfClass("TextBox")
+	box.Text = "docks"
+	harness.settle(1)
+
+	local result = harness.byName("Result_1")
+	truthy("a result appeared", result ~= nil, harness.dump(harness.byName("SearchResults")))
+	contains("naming the conversation it was found in", harness.textOf(result), "lighting is too dark")
+	harness.click(result)
+	harness.settle(1)
+	check("and opening it switches to that conversation", handle.sessions.activeId, older)
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+scenario("cowork is the web bridge rather than a slogan", function()
+	local harness, handle = bootWith({
+		handler = function(entry)
+			local url = tostring(entry.url)
+			if url:find("/api/agent/inbox") then
+				return { StatusCode = 200, Body = json.encode({ commands = {} }) }
+			end
+			if url:find("/api/agent/events") then return { StatusCode = 204, Body = "" } end
+			return { StatusCode = 404, Body = "{}" }
+		end,
+	})
+
+	handle.app.show("cowork")
+	harness.settle(1)
+	local panel = harness.byName("Cowork")
+	truthy("the cowork panel builds", panel ~= nil)
+	contains("and explains how to connect", harness.textOf(panel), "Not connected.")
+
+	handle.config.set("bridge.token", ("c"):rep(64))
+	handle.config.set("bridge.enabled", true)
+	harness.settle(6)
+	local text = harness.textOf(harness.byName("Cowork"))
+	contains("turning it on reports the connection", text, "Connected")
+	contains("and which conversation is shared", text, "sharing:")
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+scenario("the home card reports the record and nothing else", function()
+	local harness, handle = bootWith({ provider = false })
+	local stats = handle.env.require("agent/stats")
+	local clock = handle.env.require("runtime/clock")
+
+	local card = harness.byName("Home")
+	truthy("the card is on an empty conversation", card ~= nil)
+	local blank = harness.textOf(card)
+	contains("greeting the player by name", blank, "TestPlayer")
+	-- The card used to open with 11 sessions, 5,387 messages and 1.5B tokens on a
+	-- client that had never sent a request.
+	truthy("with no invented figures on it",
+		not blank:find("5,387") and not blank:find("1.5B"), blank)
+	contains("and says why it is empty", blank, "Your activity will appear here as you work")
+
+	local today = clock.dayNumber()
+	stats.data.days[clock.keyFromDayNumber(today)] = {
+		sessions = 2, messages = 40, userMessages = 20, replies = 20,
+		tokensIn = 900000, tokensOut = 100000, cost = 1.5, requests = 20,
+		toolCalls = 6, toolErrors = 0, errors = 0,
+		hours = { ["9"] = 40 },
+		models = { ["claude-opus-5"] = { requests = 20, tokensIn = 900000, tokensOut = 100000, cost = 1.5 } },
+	}
+	stats.changed:fire(stats.data)
+	harness.settle(2)
+
+	local filled = harness.textOf(harness.byName("Home"))
+	contains("the message count is the recorded one", filled, "40")
+	contains("the tokens are the recorded ones", filled, "1M")
+	contains("the peak hour is the recorded one", filled, "9 AM")
+	contains("and the model is the one that answered", filled, "claude-opus-5")
+	contains("with the comparison the record supports", filled, "Harry Potter")
+
+	-- The range pills are a real window over the same record.
+	harness.click(harness.byName("Pill_7d"))
+	harness.settle(1)
+	contains("a week still contains today", harness.textOf(harness.byName("Home")), "40")
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+scenario("the appearance settings change what is drawn", function()
+	local harness, handle = bootWith({
+		handler = function(entry)
+			if not tostring(entry.url):find("/chat/completions") then
+				return { StatusCode = 404, Body = "{}" }
+			end
+			return { StatusCode = 200, Body = chatBody({
+				content = "Try this:\n\n```lua\nlocal x = 1\n```\n",
+			}) }
+		end,
+	})
+	local theme = handle.env.require("ui/theme")
+
+	-- Ctrl-comma, which the profile menu advertises. A menu that names a key it has
+	-- not bound is decoration.
+	harness.hold("LeftControl", true)
+	harness.press("Comma")
+	harness.settle(1)
+	harness.hold("LeftControl", false)
+	truthy("the shortcut opens the settings", harness.byName("SettingsDialog") ~= nil)
+
+	harness.click(harness.byName("Category_claude_code"))
+	harness.settle(1)
+
+	local darkSurface = theme.color.codeSurface
+	truthy("both code palettes are previewed",
+		harness.byName("CodePreview_dark") ~= nil and harness.byName("CodePreview_light") ~= nil)
+	harness.click(harness.byName("CodePreview_light"))
+	harness.settle(2)
+	check("pressing one selects it", handle.config.get("ui.codeTheme"), "light")
+	truthy("and the code surface actually changes",
+		theme.color.codeSurface ~= darkSurface)
+
+	-- And it reaches the transcript, which is the only reason the setting exists.
+	handle.sessions.current().send("show me")
+	harness.settle(8)
+	local block = harness.byName("Code")
+	truthy("a code block was rendered", block ~= nil)
+	check("in the palette that was chosen", block.BackgroundColor3, theme.color.codeSurface)
+
+	local bodyFont = theme.text.body.font
+	handle.config.set("ui.interfaceFont", "gotham")
+	harness.settle(2)
+	truthy("the interface font is a real change", theme.text.body.font ~= bodyFont)
+
+	local wide = theme.size.reading
+	handle.config.set("ui.transcriptWidth", "narrow")
+	harness.settle(2)
+	truthy("so is the transcript width", theme.size.reading < wide,
+		tostring(wide) .. " -> " .. tostring(theme.size.reading))
+
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+scenario("a phone can still reach every panel and conversation", function()
+	local harness, handle = bootWith({
+		handler = function(entry)
+			if not tostring(entry.url):find("/chat/completions") then
+				return { StatusCode = 404, Body = "{}" }
+			end
+			return { StatusCode = 200, Body = chatBody({ content = "Fine." }) }
+		end,
+	})
+	handle.sessions.current().send("the first one")
+	harness.settle(8)
+	local first = handle.sessions.activeId
+	handle.app.openSession(handle.sessions.newThread().id)
+	handle.sessions.current().send("the second one")
+	harness.settle(8)
+
+	-- A phone has no sidebar, so the app menu carries the whole of navigation. It used
+	-- to carry only the panels, and on a tablet in portrait or a console it carried
+	-- nothing at all -- the hamburger was gated on "sheet or narrower than 500".
+	harness.setViewport(390, 844)
+	harness.settle(2)
+	check("the layout is a sheet", handle.env.require("ui/responsive").mode, "sheet")
+	check("with no sidebar", handle.app.sidebarVisible(), false)
+
+	harness.click(harness.byName("Nav_menu", handle.app.window.header))
+	harness.settle(1)
+	local menu = harness.byName("MenuLayer")
+	truthy("the app menu opens", menu ~= nil)
+	local text = harness.textOf(menu)
+	contains("listing the panels", text, "Providers")
+	contains("a new conversation", text, "New conversation")
+	contains("and the conversations themselves", text, "the first one")
+	contains("with the exit a phone has no other road to", text, "Unload UAI")
+
+	-- A conversation row is a folder of actions on a phone, because a phone has no
+	-- sidebar and therefore no ellipsis: the same open / rename / delete the desktop
+	-- row offers, one level deep.
+	harness.click(harness.byName("Option_session:" .. tostring(first)))
+	harness.settle(1)
+	local actions = harness.byName("MenuLayer")
+	truthy("the row opens its own actions", actions ~= nil)
+	contains("offering a rename", harness.textOf(actions), "Rename")
+	contains("and a delete", harness.textOf(actions), "Delete")
+	harness.click(harness.byName("Option_open"))
+	harness.settle(1)
+	check("one of which can be opened", handle.sessions.activeId, first)
+
+	-- A tablet in portrait is the other mode with no sidebar.
+	harness.setViewport(834, 1112)
+	harness.settle(2)
+	check("a portrait tablet is a panel", handle.env.require("ui/responsive").mode, "panel")
+	local menuButton = harness.byName("Nav_menu", handle.app.window.header)
+	truthy("and still has the app menu", menuButton ~= nil and menuButton.Visible)
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+-- 34. The sidebar toggle ---------------------------------------------------
+
+-- Untested until now, which is how a toggle that was a mathematical no-op shipped:
+-- `collapsed = not sidebarVisible()` is a fixed point in both directions, so pressing
+-- it rebuilt the whole tree and produced a byte-identical sidebar.
+scenario("the sidebar collapses and comes back", function()
+	local harness, handle = bootWith({})
+	local app = handle.app
+
+	truthy("the sidebar starts open", app.sidebarVisible())
+	truthy("and is on screen", harness.byName("Sidebar") ~= nil)
+
+	harness.click(harness.byName("Nav_sidebar"))
+	harness.settle(2)
+	check("pressing the toggle collapses it", app.sidebarVisible(), false)
+	truthy("and takes it off screen without destroying it", harness.byName("Sidebar") ~= nil and not app.sideHolder.Visible)
+	check("which is remembered", handle.config.get("ui.sidebarCollapsed"), true)
+
+	-- The only control that could bring it back used to live inside the sidebar, so
+	-- collapsing it was a one-way trip.
+	local expand = harness.byName("Nav_collapse")
+	truthy("the header offers a way back", expand ~= nil)
+	harness.click(expand)
+	harness.settle(2)
+	truthy("which restores it", app.sidebarVisible())
+	truthy("and the sidebar with it", harness.byName("Sidebar") ~= nil)
+
+	-- The switch in the appearance pane writes the same path without the quiet flag,
+	-- and nothing was listening for it.
+	handle.config.set("ui.sidebarCollapsed", true)
+	harness.settle(2)
+	check("the setting collapses it too", app.sidebarVisible(), false)
+
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+-- 35. Outbound encoding ----------------------------------------------------
+
+-- The crash this covers: HttpService:JSONEncode raises "Can't convert to JSON" on a
+-- string that is not valid UTF-8, and a web search's scraped snippet is full of
+-- candidates. Because the tool result is appended to the message history, the error
+-- then repeated on every following turn with no position and no clue.
+scenario("invalid UTF-8 never reaches the encoder", function()
+	local harness, handle = bootWith({ provider = false })
+	local util = handle.env.require("runtime/util")
+
+	local bare = "caf\233 latte"
+	check("a lone Latin-1 byte is not valid UTF-8", util.validUtf8(bare), false)
+	local fixed, changed = util.sanitise(bare)
+	check("sanitising reports the repair", changed, true)
+	truthy("and the result validates", util.validUtf8(fixed))
+	contains("keeping the text either side", fixed, "latte")
+
+	local clean = "caf\195\169 latte"
+	truthy("valid text validates", util.validUtf8(clean))
+	local same, untouched = util.sanitise(clean)
+	check("and is returned unchanged", same, clean)
+	check("with nothing reported", untouched, false)
+
+	-- The three producers that were making such bytes.
+	check("an entity above 127 becomes real UTF-8", util.htmlEntities("a&#233;b"), "a\195\169b")
+	check("and one above 255 is no longer dropped", util.htmlEntities("it&#8217;s"), "it\226\128\153s")
+	truthy("a percent-escaped Latin-1 byte is repaired",
+		util.validUtf8(util.urlDecode("caf%E9")))
+
+	-- Byte-indexed cuts through a multi-byte character. The em dash is three bytes.
+	local dashes = string.rep("a\226\128\148", 40)
+	truthy("ellipsis cuts on a character boundary", util.validUtf8(util.ellipsis(dashes, 30)))
+	truthy("so does truncate", util.validUtf8((util.truncate(dashes, 60, "note"))))
+
+	-- The chokepoint itself: every outbound value goes through this.
+	local encoded = util.encode({ snippet = bare, count = 0 / 0, note = "ok" })
+	truthy("encode does not raise on poisoned input", type(encoded) == "string")
+	contains("and still carries the good fields", encoded, "ok")
+	truthy("with no NaN token in the body", encoded:lower():find("nan") == nil, encoded)
+
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+-- 36. Code in the transcript ------------------------------------------------
+
+-- Exact source stays available without making every hidden activity row construct
+-- and measure a code listing during replay.
+scenario("a tool call builds its exact code only when inspected", function()
+	local step = 0
+	local source = "local part = Instance.new(\"Part\")\npart.Anchored = true\nreturn part.Name"
+	local harness, handle = bootWith({
+		handler = function()
+			step = step + 1
+			if step == 1 then
+				return { StatusCode = 200, Body = chatBody({
+					toolCalls = { toolCall("call_1", "run_luau", { code = source }) },
+				}) }
+			end
+			return { StatusCode = 200, Body = chatBody({ content = "Made a part." }) }
+		end,
+	})
+	handle.config.set("permissions.mode", "full")
+	handle.sessions.current().send("make me a part")
+	harness.settle(12)
+
+	local row = harness.byName("Tool")
+	truthy("the tool row is there", row ~= nil)
+	check("the unopened row has no source renderer", harness.byName("Source", row), nil)
+	harness.click(harness.byName("RunHeader"))
+	harness.click(harness.byName("ToolHeader", row))
+	local shown = harness.textOf(row)
+	local code = harness.byName("Source", row)
+	local rendered = renderedText(code and code.Text)
+	contains("opening details renders exact code", rendered, "part.Anchored = true")
+	contains("and the last line too", rendered, "return part.Name")
+	check("highlighting keeps every source character", rendered, source)
+	contains("under its language", shown, "lua")
+	contains("with a line count", shown, "3 lines")
+
+	-- The header says what the call is doing rather than showing the envelope.
+	truthy("no JSON envelope in the row", shown:find('{"code"', 1, true) == nil, shown)
+
+	-- Turning it off leaves the code behind the row's own caret rather than removing it.
+	handle.config.set("ui.showToolCode", false)
+	harness.settle(3)
+	local without = harness.byName("Tool")
+	truthy("the row survives the setting", without ~= nil)
+	truthy("and the listing is gone from view",
+		harness.textOf(without):find("part.Anchored", 1, true) == nil)
+
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+-- 37. The providers panel ---------------------------------------------------
+
+-- What this locks in: the key is never rendered, the facts the registry keeps are on
+-- screen, and a health event does not tear the panel down. The old panel printed the
+-- whole API key into a field, showed none of the endpoint/protocol/latency facts, and
+-- rebuilt itself from scratch on every completion.
+-- Adding a provider has to be finishable in the editor it is done in.
+--
+-- `registry.validate` refuses a record with no model, and the picker lived only on the
+-- detail pane -- which is reached by selecting a provider that has already been saved.
+-- So the add path ended on an instruction, "fetch the model list or add a model id",
+-- that nothing on screen could carry out, and Test asked for a completion with no model
+-- named and reported back whatever the endpoint says to that.
+scenario("a provider can be added without leaving the editor", function()
+	local harness, handle = bootWith({
+		provider = false,
+		handler = function(entry)
+			if tostring(entry.url):find("/models") then
+				return { StatusCode = 200, Body = json.encode({
+					data = { { id = "beta-mini" }, { id = "alpha-large" } },
+				}) }
+			end
+			return { StatusCode = 404, Body = "{}" }
+		end,
+	})
+
+	local record = handle.providers.blank("openai")
+	record.label = "Editor test"
+	record.apiKey = "sk-editor-key-1234"
+	check("a new record starts with no model at all", record.model, "")
+
+	local savedId
+	handle.env.require("ui/panels/providers").editor(record, function(id) savedId = id end)
+	harness.settle(2)
+
+	local form = harness.byName("Form")
+	local picker = harness.byName("ActiveModel", form)
+	truthy("the editor has a model control", picker ~= nil, harness.dump())
+	contains("saying one is still needed", harness.textOf(picker), "Choose a model")
+
+	-- The preset's docs address is rendered in full with a copy control beside it,
+	-- so a person can get from here to a key without leaving the client.
+	local keyUrl = harness.byName("KeyLinkUrl", form)
+	check("the key address is shown",
+		keyUrl and keyUrl.Text, "https://platform.openai.com/api-keys")
+	truthy("with a copy control", harness.byName("CopyKeyLink", form) ~= nil)
+
+	harness.click(picker)
+	truthy("which offers a fetch", harness.byName("Option_fetch") ~= nil, harness.dump())
+	harness.click(harness.byName("Option_fetch"))
+	harness.settle(4)
+
+	local asked
+	for _, entry in ipairs(harness.http.log) do
+		if tostring(entry.url):find("/models") then asked = entry end
+	end
+	truthy("the endpoint was asked for its list", asked ~= nil)
+	check("with a GET", asked and asked.method, "GET")
+	local note = harness.byName("ModelNote", form)
+	contains("and the row reports what came back", note and note.Text or "", "2 models")
+	-- Picking one is the reason to fetch, so the list comes back by itself rather than
+	-- leaving the same control to be pressed twice for one decision.
+	truthy("the list is on screen without pressing anything else",
+		harness.byName("Option_model:alpha-large") ~= nil, harness.dump())
+
+	harness.click(harness.byName("Option_model:alpha-large"))
+	harness.settle(1)
+	contains("the control names the chosen model", harness.textOf(picker), "alpha-large")
+
+	harness.click(harness.byName("SaveProvider"))
+	harness.settle(2)
+	truthy("the provider saved", savedId ~= nil,
+		harness.textOf(harness.byName("Problem")))
+	local stored = savedId and handle.providers.get(savedId)
+	check("with the model that was chosen", stored and stored.model, "alpha-large")
+	-- Only the chosen one is written to the record. The rest came off the wire and are
+	-- the endpoint's to answer for again next time; a record is not a cache.
+	check("and only that one on the record", #(stored and stored.models or {}), 1)
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+scenario("the providers panel shows the record without showing the key", function()
+	local harness, handle = bootWith({})
+	handle.config.set("agent.fallback", true)
+	local record = handle.providers.active()
+	record.apiKey = "sk-secret-tail-9999"
+	record.wsUrl = ""
+	-- Streaming on so the transport line is the buffered-SSE case named below.
+	record.stream = true
+	handle.providers.save(record, { force = true })
+	handle.app.show("providers")
+	harness.settle(2)
+
+	local text = harness.textOf()
+	truthy("the key is not on screen", text:find("sk-secret-tail", 1, true) == nil, text)
+	contains("only its last four characters are", text, "9999")
+	contains("the completions endpoint is named", text, "/chat/completions")
+	contains("so is the model list route", text, "/models")
+	contains("and the wire protocol", text, "Chat completions")
+	-- Buffered HTTP receives SSE only after the complete response has arrived.
+	contains("and how streamed replies arrive", text, "Buffered SSE over HTTP")
+	contains("with the fallback rule as configured", text, "active provider first")
+
+	truthy("the provider is listed in the rail",
+		harness.byName("Provider_" .. tostring(record.id)) ~= nil)
+
+	-- A health tick used to rebuild the panel, its header and its scroll position.
+	local rail = harness.byName("Provider_" .. tostring(record.id))
+	handle.providers.markFail(record, "a transient 500")
+	harness.settle(1)
+	check("a health event leaves the rail row in place",
+		harness.byName("Provider_" .. tostring(record.id)), rail)
+	contains("while the failure count updates", harness.textOf(), "1 failed")
+
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+-- 38. Tool pairing ----------------------------------------------------------
+
+-- The 400 this prevents is not survivable on its own: it is not retried, three of them
+-- bench the provider, the chain walks the same broken history to the next one, and
+-- ctx.serialise keeps both halves -- so one orphan kills every following turn and
+-- survives a restart.
+scenario("orphaned tool calls and results are repaired before they go out", function()
+	local harness, handle = bootWith({ provider = false })
+	local ctx = handle.sessions.current().ctx
+
+	-- A result whose call is not in the assistant turn before it. A gateway that drops
+	-- an assistant message with empty content manufactures exactly this.
+	ctx.pushUser("do the thing")
+	ctx.pushAssistant({ content = "", toolCalls = {
+		{ id = "call_real", type = "function", ["function"] = { name = "run_luau", arguments = "{}" } },
+	} })
+	ctx.pushToolResult("call_real", "run_luau", "fine")
+	ctx.pushToolResult("call_ghost", "run_luau", "orphan")
+
+	local dropped, filled = ctx.repair()
+	check("the orphan was dropped", dropped, 1)
+	check("and nothing was invented", filled, 0)
+	local ids = {}
+	for _, message in ipairs(ctx.messages) do
+		if message.role == "tool" then ids[#ids + 1] = message.tool_call_id end
+	end
+	check("one result survives", #ids, 1)
+	check("the matched one", ids[1], "call_real")
+
+	-- The mirror: a call the turn never answered, which is what a crash between
+	-- dispatch and result recording leaves behind.
+	ctx.pushUser("and again")
+	ctx.pushAssistant({ content = "", toolCalls = {
+		{ id = "call_hanging", type = "function", ["function"] = { name = "file_write", arguments = "{}" } },
+	} })
+	local dropped2, filled2 = ctx.repair()
+	check("nothing was dropped this time", dropped2, 0)
+	check("the hanging call was answered", filled2, 1)
+	local last = ctx.messages[#ctx.messages]
+	check("with a tool message", last.role, "tool")
+	check("naming the call", last.tool_call_id, "call_hanging")
+	contains("and saying what happened", last.content, "did not complete")
+
+	-- Idempotent: a repaired history repairs to itself, so the warning does not repeat
+	-- on every request for the rest of the conversation.
+	local dropped3, filled3 = ctx.repair()
+	check("a second pass drops nothing", dropped3, 0)
+	check("and fills nothing", filled3, 0)
+
+	-- And it happens on the way out, not only when asked.
+	ctx.pushToolResult("call_ghost_again", "run_luau", "orphan")
+	local wire = ctx.wire("system")
+	local seen = {}
+	for _, message in ipairs(wire) do
+		for _, call in ipairs(message.toolCalls or {}) do seen[tostring(call.id)] = true end
+	end
+	local unmatched = 0
+	for _, message in ipairs(wire) do
+		if message.role == "tool" and not seen[tostring(message.tool_call_id)] then
+			unmatched = unmatched + 1
+		end
+	end
+	check("the wire payload has no orphans", unmatched, 0)
+end)
+
+-- 41. Two conversations at once --------------------------------------------
+
+-- What this locks in: opening a second conversation does not break the first one.
+-- Three things were client-wide that are not: the task list the model keeps, the
+-- pending permission prompts, and which conversation the prompt dialog listens to.
+-- The consequences were, in order: a running turn resumed against somebody else's
+-- plan; a turn finishing anywhere refused whatever another was waiting on; and a
+-- prompt raised by a conversation that was not on screen was never shown at all, so
+-- after three minutes every call it had planned came back as a refusal.
+scenario("two conversations work at the same time", function()
+	-- Counted per conversation rather than matched on tool names: every tool the
+	-- client has is listed in the definitions on every request, so a body always
+	-- contains "todo_write".
+	local steps = { alpha = 0, bravo = 0 }
+	local harness, handle = bootWith({
+		handler = function(entry)
+			if not tostring(entry.url):find("/chat/completions") then return { StatusCode = 404, Body = "{}" } end
+			local body = tostring(entry.body)
+			local who = body:find("the alpha job", 1, true) and "alpha" or "bravo"
+			steps[who] = steps[who] + 1
+			local step = steps[who]
+			if step == 1 then
+				return { StatusCode = 200, Body = chatBody({
+					toolCalls = { toolCall(who .. "1", "todo_write", {
+						items = { { text = who .. " step one", status = "active" } },
+					}) },
+				}) }
+			end
+			if who == "alpha" and step == 2 then
+				return { StatusCode = 200, Body = chatBody({
+					toolCalls = { toolCall("a2", "instance_create", {
+						class = "Folder", name = "AlphaMade", parent = "Workspace",
+					}) },
+				}) }
+			end
+			return { StatusCode = 200, Body = chatBody({
+				content = who == "alpha" and "Alpha is done." or "Bravo is done.",
+			}) }
+		end,
+	})
+	handle.config.set("permissions.mode", "ask")
+
+	local state = handle.env.require("agent/state")
+	local permissions = handle.env.require("agent/permissions")
+
+	local alpha = handle.sessions.current()
+	alpha.rename("Alpha")
+	alpha.send("the alpha job")
+	harness.settle(8)
+
+	truthy("the first conversation is parked on a prompt", permissions.pendingCount(alpha) == 1)
+	truthy("and is still busy while it waits", alpha.busy == true)
+
+	-- The second conversation, opened and run while the first waits.
+	local bravo = handle.sessions.newThread()
+	bravo.rename("Bravo")
+	handle.app.openSession(bravo.id)
+	harness.settle(1)
+	bravo.send("the bravo job")
+	harness.settle(10)
+
+	check("the second conversation answered", bravo.busy, false)
+	contains("with its own reply", bravo.ctx.messages[#bravo.ctx.messages].content, "Bravo is done")
+
+	-- One: the plans did not overwrite each other.
+	local alphaTodos = state.todoList(alpha)
+	local bravoTodos = state.todoList(bravo)
+	check("each conversation kept one task", #alphaTodos, 1)
+	check("its own", #bravoTodos, 1)
+	contains("the first one's plan survived the second", alphaTodos[1].text, "alpha step one")
+	contains("and the second has its own", bravoTodos[1].text, "bravo step one")
+
+	-- Two: finishing a turn did not sweep the other conversation's prompt.
+	check("the first conversation is still waiting to be asked", permissions.pendingCount(alpha), 1)
+	truthy("and still running", alpha.busy == true)
+
+	-- Three: the prompt is on screen even though the other conversation is open.
+	local shown = harness.textOf()
+	contains("the prompt names the tool", shown, "Allow instance_create?")
+	contains("and says which conversation is asking", shown, "in Alpha")
+
+	local allow = harness.byName("PermissionAllow")
+	truthy("with an allow control", allow ~= nil)
+	harness.click(allow)
+	harness.settle(10)
+
+	truthy("answering it lets the first conversation finish",
+		harness.workspace:FindFirstChild("AlphaMade") ~= nil, harness.dump(harness.workspace))
+	check("and it is no longer busy", alpha.busy, false)
+	contains("with its own reply", alpha.ctx.messages[#alpha.ctx.messages].content, "Alpha is done")
+	check("nothing is left pending", permissions.pendingCount(), 0)
+
+	-- The strip shows the conversation on screen, not the last plan written anywhere.
+	handle.app.openSession(alpha.id)
+	harness.settle(2)
+	contains("the task strip follows the conversation", harness.textOf(harness.byName("Todos")),
+		"alpha step one")
+	handle.app.openSession(bravo.id)
+	harness.settle(2)
+	contains("both ways", harness.textOf(harness.byName("Todos")), "bravo step one")
+
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+-- 42. Managing subagents ---------------------------------------------------
+
+-- A dispatch is the longest-lived and least visible thing this client does: minutes of
+-- work on its own context, its own tool calls, and -- until this -- one card in one
+-- conversation's transcript. There was no register, so nothing could answer "what is
+-- running", and no way to stop one child short of stopping the whole turn.
+scenario("a dispatch is registered, watched and stopped", function()
+	local parentStep = 0
+	local harness, handle = bootWith({
+		handler = function(entry)
+			if not tostring(entry.url):find("/chat/completions") then return { StatusCode = 404, Body = "{}" } end
+			local body = tostring(entry.body)
+			if body:find("You are a subagent", 1, true) then
+				-- Keeps working until something stops it, which is what makes it
+				-- observable in the register and worth having a stop for.
+				return { StatusCode = 200, delay = 1, Body = chatBody({
+					toolCalls = { toolCall("c" .. tostring(math.random(1, 1000000)), "players_list", {}) },
+				}) }
+			end
+			parentStep = parentStep + 1
+			if parentStep == 1 then
+				return { StatusCode = 200, Body = chatBody({
+					toolCalls = { toolCall("d1", "dispatch_agent", {
+						task = "sweep the place for doors", preset = "read",
+					}) },
+				}) }
+			end
+			return { StatusCode = 200, Body = chatBody({ content = "It was stopped before it answered." }) }
+		end,
+	})
+	handle.config.set("permissions.mode", "full")
+
+	local subagent = handle.env.require("agent/subagent")
+	local session = handle.sessions.current()
+	session.send("find every door")
+	harness.settle(6)
+
+	local running = subagent.running()
+	check("the dispatch is in the register", #running, 1)
+	local record = running[1]
+	contains("labelled with its task", record.label, "sweep the place")
+	check("marked as running", record.status, "running")
+	check("attributed to the conversation that asked", record.parentTitle, session.title)
+	truthy("with the tools it has called", #record.tools > 0, tostring(#record.tools))
+
+	-- The panel is the register, drawn.
+	handle.app.show("agents")
+	harness.settle(2)
+	local panel = harness.byName("Agents")
+	truthy("the panel is built", panel ~= nil)
+	local shown = harness.textOf(panel)
+	contains("the task is on screen", shown, "sweep the place")
+	contains("with the capacity in use", shown, "1 of ")
+	contains("and what it is allowed to touch", shown, "read tools")
+	-- The ceilings are stated where the dispatches are, and changed in one place: two
+	-- sets of sliders for one key can disagree, and one of them is always stale.
+	contains("the limits in force are stated", shown, "of delegation")
+	truthy("with a way to change them", harness.byName("OpenAgentSettings", panel) ~= nil)
+
+	local stop = harness.byName("Stop", panel)
+	truthy("a stop control is offered", stop ~= nil)
+	harness.click(stop)
+	harness.settle(1)
+	-- The flag is the mechanism: Luau cannot kill a thread, so the child notices
+	-- between steps and this is what it notices.
+	truthy("the stop reached the child", record.session ~= nil and record.session.abortFlag == true)
+	harness.settle(20)
+
+	check("nothing is left running", #subagent.running(), 0)
+	check("the record says it was stopped", record.status, "stopped")
+	truthy("and how long it ran for", (record.ms or 0) > 0)
+
+	-- The turn that dispatched it was not stopped with it: that is the whole point of
+	-- a per-dispatch control.
+	check("the conversation finished on its own", session.busy, false)
+	local reports = {}
+	for _, message in ipairs(session.ctx.messages) do
+		if message.role == "tool" then reports[#reports + 1] = message end
+	end
+	check("the parent was handed a report", #reports, 1)
+	contains("saying it stopped early", reports[1].content, "stopped early")
+	contains("and the conversation answered", session.ctx.messages[#session.ctx.messages].content,
+		"stopped before it answered")
+
+	handle.app.show("agents")
+	harness.settle(2)
+	contains("the panel keeps it afterwards", harness.textOf(harness.byName("Agents")), "stopped")
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+-- 43. Transcript density ---------------------------------------------------
+
+-- Every tool call used to be a top-level row, and the transcript puts a paragraph of
+-- air between top-level rows because that gap is what separates a question from its
+-- answer. A turn that called eight tools therefore arrived as eight paragraph-spaced
+-- lines with eight listings hanging off them: the machinery was louder than anything
+-- the agent said, which is what "too bloated with a lot of tool calls" looks like.
+scenario("a turn's tool calls arrive as one foldable block", function()
+	local step = 0
+	-- Five different lookups rather than the same one five times: identical calls are
+	-- what the repeat breaker exists to stop, and it would end the run at three.
+	local paths = { "Workspace", "Workspace.Terrain", "Lighting", "ReplicatedStorage", "CoreGui" }
+	local harness, handle = bootWith({
+		handler = function(entry)
+			if not tostring(entry.url):find("/chat/completions") then return { StatusCode = 404, Body = "{}" } end
+			step = step + 1
+			if step <= #paths then
+				return { StatusCode = 200, Body = chatBody({
+					reasoning = "Checking " .. paths[step] .. ".",
+					toolCalls = { toolCall("t" .. tostring(step), "instance_get",
+						{ path = paths[step] }) },
+				}) }
+			end
+			return { StatusCode = 200, Body = chatBody({ content = "Five looks at the tree." }) }
+		end,
+	})
+	handle.config.set("permissions.mode", "full")
+	handle.sessions.current().send("look at the tree five times")
+	harness.settle(20)
+
+	local failedTools = 0
+	for _, event in ipairs(handle.sessions.current().log) do
+		if event.kind == "tool:error" then failedTools = failedTools + 1 end
+	end
+	check("the successful-run fixture has no failed tools", failedTools, 0)
+	local runs = harness.allByName("ToolRun")
+	check("the whole run is one block", #runs, 1)
+	local rows = harness.allByName("Tool", runs[1])
+	check("holding every call", #rows, 5)
+	check("and nothing is left at the top level", #harness.allByName("Tool", harness.byName("Transcript"))
+		- #rows, 0)
+
+	-- The thinking between calls goes in with them, in order: a row that sorted after
+	-- the block would read as though it happened after the work it came before.
+	truthy("the thinking between calls is inside it too",
+		#harness.allByName("Reasoning", runs[1]) > 0)
+
+	local header = harness.byName("RunHeader", runs[1])
+	truthy("the block has a header", header ~= nil)
+	contains("counting the run", harness.textOf(header), "5 tools")
+
+	local calls = harness.byName("Calls", runs[1])
+	check("activity stays compact until explicitly opened", calls.Visible, false)
+	harness.click(header)
+	check("and the header opens it again", calls.Visible, true)
+
+	local failed = handle.env.require("ui/chat/message").toolRun(harness.screen(), 99)
+	failed.opened()
+	failed.opened()
+	failed.closed(true)
+	failed.closed(false)
+	check("failure does not move an unopened transcript", failed.rows.Visible, false)
+	contains("the collapsed header exposes failure", harness.textOf(failed.root), "1 failed")
+	harness.click(harness.byName("RunHeader", failed.root))
+	check("failed details can be opened deliberately", failed.rows.Visible, true)
+	failed.opened()
+	failed.closed(true)
+	check("completion never folds details being inspected", failed.rows.Visible, true)
+
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+-- 44. The mascot -----------------------------------------------------------
+
+-- The one piece of decoration in this interface, and the only place something is
+-- alive. It was a static sprite; a static sprite perched on the composer is a
+-- sticker. What it does is tied to the turn rather than invented, which is the only
+-- honest thing a mascot can do here -- and reduced motion gets the sprite and
+-- nothing else, like every other animation in the client.
+scenario("the mascot is alive and answers reduced motion", function()
+	local harness, handle = bootWith({
+		handler = function(entry)
+			if not tostring(entry.url):find("/chat/completions") then return { StatusCode = 404, Body = "{}" } end
+			return { StatusCode = 200, delay = 4, Body = chatBody({ content = "Done." }) }
+		end,
+	})
+	harness.settle(2)
+
+	local sprite = harness.byName("IconMascot")
+	truthy("the mascot is on the composer", sprite ~= nil)
+	-- The mock applies a tween's goal immediately, so a sprite that is marching sits at
+	-- the top of its hop, rocked over, with its feet apart and its arms pulled in.
+	truthy("it is off the ground", sprite.Position.Y.Offset < 0, tostring(sprite.Position.Y.Offset))
+	truthy("and rocking", sprite.Rotation ~= 0, tostring(sprite.Rotation))
+
+	local mascot = handle.app.chatPanel.composer.mascot
+	truthy("the composer holds its handle", mascot ~= nil)
+	check("resting while nothing is happening", mascot.busy, false)
+
+	handle.sessions.current().send("take your time")
+	harness.settle(1)
+	check("working while the turn is", mascot.busy, true)
+	harness.settle(12)
+	check("and resting again afterwards", mascot.busy, false)
+
+	-- Reduced motion: the sprite stays, the motion goes -- and it goes back to the
+	-- frame it was drawn in rather than wherever a cancelled tween left it.
+	handle.config.set("ui.reduceMotion", "on")
+	harness.setViewport(1280, 820)
+	harness.settle(2)
+	handle.app.rebuild("test")
+	harness.settle(2)
+	check("reduced motion is in force", handle.env.require("ui/responsive").reduceMotion, true)
+	local still = harness.byName("IconMascot")
+	truthy("the mascot is still drawn", still ~= nil)
+	check("and does not move", still.Position.Y.Offset, 0)
+	check("or rock", still.Rotation, 0)
+
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+-- 45. The window draws directly at whole-pixel coordinates -----------------
+
+-- Keep native text independent of offscreen texture limits and interrupted fades.
+scenario("the window never draws itself between pixels", function()
+	local harness, handle = bootWith({})
+	handle.app.show("chat")
+	harness.settle(2)
+
+	local window = harness.byName("UAI_Window")
+	truthy("the window is there", window ~= nil)
+	check("and it draws directly as a Frame", window.ClassName, "Frame")
+	check("with nothing scaling it", window:FindFirstChildOfClass("UIScale"), nil)
+
+	-- An odd viewport is the case that used to soften it.
+	local responsive = handle.env.require("ui/responsive")
+	for _, size in ipairs({ { 1281, 805 }, { 1280, 800 }, { 1440, 901 } }) do
+		harness.setViewport(size[1], size[2])
+		harness.settle(2)
+		local root = harness.byName("UAI_Window")
+		local spareX = size[1] - root.Size.X.Offset
+		local spareY = (size[2] - responsive.inset.Y) - root.Size.Y.Offset
+		-- Only the offset-sized modes centre on their own measurements; a scale-sized
+		-- one is inset by a fixed amount on both sides and is even by construction.
+		if root.Size.X.Scale == 0 then
+			check(string.format("%dx%d leaves whole pixels across", size[1], size[2]),
+				spareX % 2, 0)
+		end
+		if root.Size.Y.Scale == 0 then
+			check(string.format("%dx%d leaves whole pixels down", size[1], size[2]),
+				spareY % 2, 0)
+		end
+	end
+
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+-- 46. Transcript typography ------------------------------------------------
+
+-- Two things the mock cannot see, because it has no layout solver: whether a bullet
+-- lines up with its text, and whether a block of output has room between its lines.
+-- Both are decided by props, so that is where this looks -- the same reasoning as the
+-- layout-invariant sweep.
+--
+-- The bullet was a 4px frame centred inside a 23px slot, next to a label centred inside
+-- its own measured bounds. Two heights computed separately agree only by luck, and they
+-- did not: every bullet in every reply sat low, down by the descender of its line. Now
+-- the marker is text in the same role, on the same line height, top-aligned in a box of
+-- that height -- one baseline by construction.
+scenario("a bullet sits on the line it belongs to, and output has room", function()
+	local harness, handle = bootWith({
+		handler = function(entry)
+			if not tostring(entry.url):find("/chat/completions") then return { StatusCode = 404, Body = "{}" } end
+			return { StatusCode = 200, Body = chatBody({
+				content = "Here is what I can do:\n- read the tree\n- write a file\n\n"
+					.. "```\nPath: Workspace\nHealth: 100 / 100\nParts: 21\n```",
+			}) }
+		end,
+	})
+	handle.sessions.current().send("what can you do")
+	harness.settle(12)
+
+	local function nameOf(value)
+		if type(value) == "table" and value.Name then return tostring(value.Name) end
+		return tostring(value)
+	end
+
+	local theme = handle.env.require("ui/theme")
+	local list = harness.byName("List")
+	truthy("the bullets rendered as a list", list ~= nil)
+	local markers = harness.allByName("Marker", list)
+	check("one marker per item", #markers, 2)
+
+	local marker = markers[1]
+	check("the marker is text, not a dot in a box", marker.ClassName, "TextLabel")
+	check("in the same line height as the item", marker.LineHeight, theme.text.body.line)
+	check("top-aligned", nameOf(marker.TextYAlignment), "Top")
+	check("inside a box one line tall", marker.Size.Y.Offset, theme.text.body.height)
+	check("and it is the middle dot, which every family has", marker.Text, "\194\183")
+
+	-- The item's own label has to match on all three or the construction means nothing.
+	local item = nil
+	for _, node in ipairs(list:GetDescendants()) do
+		if node.ClassName == "TextLabel" and node.__props.Name ~= "Marker"
+			and tostring(node.Text):find("read the tree", 1, true) then
+			item = node
+		end
+	end
+	truthy("the item text is there", item ~= nil)
+	check("on the marker's line height", item and item.LineHeight, theme.text.body.line)
+	check("and top-aligned with it", nameOf(item and item.TextYAlignment), "Top")
+
+	-- Output. The gutter and the code are separate labels, so a line height they do not
+	-- share puts number 11 beside line 9.
+	local source = harness.byName("Source")
+	truthy("the block rendered", source ~= nil)
+	check("the code is on the code line height", source.LineHeight, theme.line.code)
+	truthy("which is looser than the rest of the mono text",
+		theme.line.code > theme.text.mono.line)
+	local numbers = harness.byName("Numbers")
+	truthy("with a gutter", numbers ~= nil)
+	check("on exactly the same one", numbers.LineHeight, source.LineHeight)
+
+	-- Air on the sides, and one number for both of them. The horizontal inset used to be
+	-- two other measurements in disguise -- part of the gutter's own width on the left,
+	-- padding on the scroll viewport on the right -- so the two edges of a block never
+	-- agreed with each other and the language bar above them agreed with neither.
+	local card = harness.byName("Code")
+	truthy("the block is a card of its own", card ~= nil)
+	local body = harness.byName("Body", card)
+	local bodyPad = body and body:FindFirstChildOfClass("UIPadding")
+	truthy("whose body is padded", bodyPad ~= nil)
+	check("on the left", bodyPad and bodyPad.PaddingLeft.Offset, theme.space.lg)
+	check("by the same amount on the right", bodyPad and bodyPad.PaddingRight.Offset, theme.space.lg)
+	local bar = harness.byName("Bar", card)
+	local barPad = bar and bar:FindFirstChildOfClass("UIPadding")
+	truthy("and the language bar shares its left edge",
+		barPad and barPad.PaddingLeft.Offset == theme.space.lg,
+		barPad and tostring(barPad.PaddingLeft.Offset) or "no padding")
+	local viewport = harness.byName("Viewport", card)
+	truthy("with nothing left on the scroll to disagree with it",
+		viewport and viewport:FindFirstChildOfClass("UIPadding") == nil)
+
+	-- And air around it. A fenced block sat exactly as far from the sentence introducing
+	-- it as from the next paragraph, which is what makes a reply read as one column with
+	-- a slab dropped into it.
+	truthy("the block is held off the prose either side of it",
+		harness.byName("CodeSlot") ~= nil)
+
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+
+scenario("syntax highlighting escapes markup and preserves source", function()
+	local harness, handle = bootWith({ provider = false })
+	local markdown = handle.env.require("ui/markdown")
+	local samples = {
+		{ lang = "luau", text = 'local label = "<font color=\\"red\\"> & </font>"\n-- <comment>\nreturn 12' },
+		{ lang = "lua", text = 'local text = [=[<b> & "quoted"</b>]=]\n--[=[ a < b ]=]\nreturn text' },
+		{ lang = "javascript", text = 'const label = "<b>&</b>"; /* <comment> */\nconsole.log(label);' },
+		{ lang = "json", text = '{"label":"<&>","count":12,"ready":true}' },
+		{ lang = "python", text = 'value = "<&>" # <comment>\nprint(value)' },
+		{ lang = "lua", text = 'local value = "unfinished <&' },
+	}
+	for _, sample in ipairs(samples) do
+		local highlighted = markdown.highlight(sample.text, sample.lang)
+		contains(sample.lang .. " has syntax styling", highlighted, '<font color="#')
+		check(sample.lang .. " preserves all source characters", renderedText(highlighted), sample.text)
+		falsy(sample.lang .. " does not interpret source markup", highlighted:find("<b>", 1, true))
+	end
+	local unknown = '<font color="red">literal &amp; text</font>'
+	check("unknown languages still escape literal markup", markdown.highlight(unknown, "unknown"), markdown.escape(unknown))
+	local large = ("local <&> "):rep(4000)
+	check("large listings retain safe plain rendering", markdown.highlight(large, "lua"), markdown.escape(large))
+	check("no thread errors", #harness.errors(), 0)
+end)
+
+scenario("long code blocks stay bounded and copy complete source", function()
+	local harness, handle = bootWith({ provider = false })
+	local theme = handle.env.require("ui/theme")
+	local message = handle.env.require("ui/chat/message")
+	local lines = { 'local label = "<b>&</b>"', 'local wide = "' .. ("long "):rep(200) .. '"' }
+	for index = 3, 80 do lines[index] = string.format("\tprint(%d, label)", index) end
+	local original = table.concat(lines, "\n")
+	local holder = harness.Instance.new("Frame", harness.screen())
+	holder.Name = "CodeRegression"
+	holder.Size = harness.dt.UDim2.fromOffset(480, 500)
+	local card = message.codeBlock(holder, { text = original, lang = "luau", maxLines = 6 })
+	local source = harness.byName("Source", card)
+	local viewport = harness.byName("Viewport", card)
+	local numbers = harness.byName("Numbers", card)
+	local gutter = harness.byName("Gutter", card)
+	local body = harness.byName("CodeScroll", card)
+	local bodyRow = harness.byName("Body", card)
+	local function viewportHeight()
+		return bodyRow.Size.Y.Offset * viewport.Size.Y.Scale + viewport.Size.Y.Offset
+	end
+	local fold = harness.byName("Fold", card)
+	local copy = harness.byName("Copy", card)
+	check("code is rich text", source.RichText, true)
+	check("long lines do not wrap", source.TextWrapped, false)
+	check("both scroll axes remain available", tostring(viewport.ScrollingDirection), "Enum.ScrollingDirection.XY")
+	check("both content dimensions can grow", tostring(viewport.AutomaticCanvasSize), "Enum.AutomaticSize.XY")
+	check("the scroll region has a fixed-height parent", bodyRow.Size.Y.Scale, 0)
+	truthy("the viewport stays within its bounded parent", viewportHeight() <= bodyRow.Size.Y.Offset)
+	truthy("with positive reading space", viewportHeight() > 0)
+	check("the preview preserves its first six lines", renderedText(source.Text), table.concat(lines, "\n", 1, 6))
+	harness.click(copy)
+	check("copy includes every hidden line and original character", harness.sandbox.__clipboard, original)
+	contains("copy gives inline confirmation", harness.textOf(copy), "Copied")
+
+	harness.click(fold)
+	check("expansion reveals the whole source", renderedText(source.Text), original)
+	contains("the gutter includes the final line", numbers.Text, "\n80")
+	truthy("expanded code remains bounded", body.Size.Y.Offset <= theme.size.codeViewport)
+	truthy("long content can scroll inside that bound", source.Size.Y.Offset > viewportHeight())
+	check("the gutter clips offscreen numbers", gutter.ClipsDescendants, true)
+	viewport.CanvasPosition = harness.dt.Vector2.new(96, 120)
+	harness.settle(0.1)
+	check("line numbers track vertical code scrolling", numbers.Position.Y.Offset, -120)
+	check("horizontal code scrolling leaves the gutter fixed", numbers.Position.X.Offset, 0)
+	harness.click(copy)
+	check("copy stays exact after expansion and scrolling", harness.sandbox.__clipboard, original)
+
+	harness.click(fold)
+	check("folding resets horizontal scrolling", viewport.CanvasPosition.X, 0)
+	check("folding resets vertical scrolling", viewport.CanvasPosition.Y, 0)
+	check("and resets the gutter", numbers.Position.Y.Offset, 0)
+	check("folding restores the bounded preview", renderedText(source.Text), table.concat(lines, "\n", 1, 6))
+	card:Destroy()
+	check("no thread errors", #harness.errors(), 0)
+end)
+
+scenario("icons use getcustomasset when the capability is present", function()
+	local harness, handle = bootWith({ provider = false })
+	local icons = handle.env.require("ui/icons")
+	local caps = handle.env.require("runtime/caps")
+	local fsx = handle.env.require("runtime/fsx")
+
+	-- Mock executor customasset and filesystem
+	local writtenFiles = {}
+	caps.fn.customasset = function(path)
+		return "rbxasset://" .. tostring(path)
+	end
+	caps.fn.writefile = function(path, content)
+		writtenFiles[path] = content
+		return true
+	end
+	caps.fn.readfile = function(path)
+		return writtenFiles[path]
+	end
+	caps.fn.isfile = function(path)
+		return writtenFiles[path] ~= nil
+	end
+	caps.fn.makefolder = function() end
+	caps.fn.isfolder = function() return true end
+	caps.fs = true
+
+	local Instance = harness.sandbox.Instance
+	local Color3 = harness.sandbox.Color3
+
+	local testParent = Instance.new("Frame")
+	local frame = icons.draw("gear", testParent, 24, Color3.fromRGB(255, 255, 255))
+	truthy("an icon was created", frame ~= nil)
+	check("named IconGear", frame.Name, "IconGear")
+	local img = frame and frame:FindFirstChild("Image")
+	truthy("an Image child was created", img ~= nil)
+	check("its image is from getcustomasset", img and img.Image, "rbxasset://UAI/icons/settings.png")
+	truthy("the asset was written to disk automatically", writtenFiles["UAI/icons/settings.png"] ~= nil)
+
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+-- 46. The sidebar's groups ------------------------------------------------
+
+-- The list is grouped by place and the groups now fold. Two things are asserted here
+-- that nothing else would catch: the fold survives the rebuild the list does on every
+-- session change, and the header still says how much it is hiding -- a fold that loses
+-- the count is a fold that loses the only sign those conversations exist.
+scenario("a place group folds and says what it is hiding", function()
+	local harness, handle = bootWith({
+		handler = function(entry)
+			if not tostring(entry.url):find("/chat/completions") then
+				return { StatusCode = 404, Body = "{}" }
+			end
+			return { StatusCode = 200, Body = chatBody({ content = "Noted." }) }
+		end,
+	})
+
+	handle.sessions.current().send("the first thing")
+	harness.settle(8)
+	handle.app.openSession(handle.sessions.newThread().id)
+	handle.sessions.current().send("the second thing")
+	harness.settle(8)
+
+	local sidebar = harness.byName("Sidebar")
+	local head = harness.byName("PlaceHead", sidebar)
+	truthy("the group has a header", head ~= nil, harness.dump(sidebar))
+	local count = harness.byName("PlaceCount", head)
+	check("counting what is in it", count and count.Text, "2")
+	truthy("with a caret saying it folds", harness.byName("PlaceCaret", head) ~= nil)
+
+	local body = harness.byName("PlaceSessions", sidebar)
+	truthy("the rows are in a holder of their own", body ~= nil)
+	check("open to start with", body.Visible, true)
+	check("holding both conversations", #harness.allByName("SessionRow", body), 2)
+
+	harness.click(head)
+	harness.settle(1)
+	local folded = harness.byName("PlaceSessions", harness.byName("Sidebar"))
+	check("clicking the header folds it", folded.Visible, false)
+	-- The count is what a folded group has instead of its rows.
+	contains("and the header still reports the count",
+		harness.textOf(harness.byName("PlaceHead", harness.byName("Sidebar"))), "2")
+
+	-- The list rebuilds from scratch on any session change, so the fold has to be
+	-- stored rather than held in a local -- otherwise it springs open several times a
+	-- minute on its own.
+	handle.sessions.current().rename("Second thing")
+	harness.settle(2)
+	check("a rename does not unfold it",
+		harness.byName("PlaceSessions", harness.byName("Sidebar")).Visible, false)
+	harness.click(harness.byName("PlaceHead", harness.byName("Sidebar")))
+	harness.settle(1)
+	check("and the header opens it again",
+		harness.byName("PlaceSessions", harness.byName("Sidebar")).Visible, true)
+
+	-- A row's leading glyph is gone: the circle-and-dot pair said which row was
+	-- selected, which the row's own highlight says better. The slot stays so every
+	-- title shares one left edge with the group name above it, and so a spinner can
+	-- appear without moving the text.
+	local row = harness.allByName("SessionRow", harness.byName("Sidebar"))[1]
+	truthy("a session row still has its leading slot", harness.byName("IconSlot", row) ~= nil)
+	check("and nothing is drawn in it",
+		#harness.byName("IconSlot", row):GetChildren(), 0)
+
+	-- The trailing menu button is three dots, not a move-horizontal arrow. The
+	-- Lucide name for the glyph was once mapped to the wrong icon -- "ellipsis"
+	-- pointed at move-horizontal's left-right arrow, so every conversation row
+	-- carried a <> on its right edge.
+	local menu = harness.byName("SessionMenu", row)
+	truthy("the row has its menu button", menu ~= nil, harness.dump(row))
+	local menuIcon = harness.byName("IconEllipsis", menu)
+	truthy("drawn as an ellipsis", menuIcon ~= nil, harness.dump(menu))
+	truthy("and not as an arrow",
+		harness.byName("IconArrowLeft", menu) == nil and harness.byName("IconArrowRight", menu) == nil)
+
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+-- 47. The boot indicator --------------------------------------------------
+
+-- Running the loader was silent: a megabyte fetched, parsed, then sixty modules loaded
+-- and a window mounted, which on a slow client is seconds of nothing and looks exactly
+-- like a script that failed. The count is the one honest thing there is to report
+-- before the interface exists, and it comes from the loader itself.
+scenario("the boot indicator reports real module progress", function()
+	local harness = envMock.new({})
+	harness.http.handler = function() return { StatusCode = 404, Body = "{}" } end
+	-- Read before settling: the notice is on screen during the boot and removes itself
+	-- shortly after, so this is the only moment it exists.
+	local handle, err = harness.boot()
+	truthy("the client booted", handle ~= nil, tostring(err))
+
+	local pill = nil
+	for _, child in ipairs(harness.coreGui:GetChildren()) do
+		if child.Name == "UAI_Boot" then pill = child end
+	end
+	truthy("a boot notice was mounted", pill ~= nil, harness.dump(harness.coreGui))
+	-- Above the interface's own DisplayOrder, or a slow mount draws over the thing
+	-- reporting it. Against `app.screen` rather than `harness.screen()`: that helper
+	-- returns the first ScreenGui under CoreGui, which during a boot is this pill.
+	local appScreen = handle.app.screen
+	truthy("above the interface it is reporting on",
+		pill.DisplayOrder > appScreen.DisplayOrder,
+		tostring(pill.DisplayOrder) .. " vs " .. tostring(appScreen.DisplayOrder))
+
+	local text = harness.textOf(pill)
+	contains("naming the client", text, "UAI")
+	-- A real fraction of a real total. The denominator is every module in the artifact
+	-- and the numerator is how many actually loaded, so the two must differ: a boot
+	-- deliberately does not reach the panels nobody has opened.
+	truthy("with a count of modules against the artifact's total",
+		text:find("%d+ / %d+") ~= nil, text)
+	truthy("the loader counted them", handle.env.moduleCount > 0)
+	truthy("out of the artifact's own total", handle.env.moduleTotal >= handle.env.moduleCount)
+	truthy("and the total is not a guess -- it is every module in the bundle",
+		handle.env.moduleTotal > 60, tostring(handle.env.moduleTotal))
+	truthy("a boot does not load all of them, and the notice says so",
+		handle.env.moduleCount < handle.env.moduleTotal,
+		tostring(handle.env.moduleCount) .. " of " .. tostring(handle.env.moduleTotal))
+	contains("explaining what the rest are waiting for", text, "load with the panel")
+
+	local fill = harness.byName("BootFill", pill)
+	truthy("the bar is filled to the fraction that loaded", fill ~= nil)
+	truthy("which is a real share, not full",
+		fill.Size.X.Scale > 0.5 and fill.Size.X.Scale < 1, tostring(fill.Size.X.Scale))
+
+	-- And it leaves nothing behind.
+	harness.settle(4)
+	local remaining = nil
+	for _, child in ipairs(harness.coreGui:GetChildren()) do
+		if child.Name == "UAI_Boot" then remaining = child end
+	end
+	truthy("the notice removes itself once the interface is up", remaining == nil)
+	truthy("and the loader hook is released", handle.env.onModuleLoaded == nil)
+
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+	check("nothing was warned", #harness.console.warnings, 0,
+		table.concat(harness.console.warnings, "\n"))
+end)
+
+-- 48. The model picker ----------------------------------------------------
+
+-- It was an anchored menu with four unrelated kinds of row stacked in it: every
+-- provider, then every model on the active one, then a fetch, then five effort levels.
+-- Twenty-odd rows of one visual weight with no headings, which on a gateway serving
+-- eighty ids meant scrolling a 320px menu past the thing you came for.
+scenario("the model picker separates endpoint, model and effort", function()
+	local harness, handle = bootWith({
+		model = "claude-opus-5",
+		handler = function(entry)
+			if tostring(entry.url):find("/models") then
+				local data = {}
+				for index = 1, 14 do data[index] = { id = "vendor/model-" .. tostring(index) } end
+				return { StatusCode = 200, Body = json.encode({ data = data }) }
+			end
+			return { StatusCode = 404, Body = "{}" }
+		end,
+	})
+
+	-- The composer's chip is the way in, and it is the same decision from the user's
+	-- point of view: what answers, and how hard it is asked to think.
+	harness.click(harness.byName("ModelChip"))
+	harness.settle(2)
+	truthy("the chip opens the picker", harness.byName("Section_Endpoint") ~= nil, harness.dump())
+
+	-- Every row is a real record. The provider row states the health the registry has
+	-- actually recorded rather than claiming to be well.
+	harness.click(harness.byName("Section_Endpoint"))
+	local providerRow = harness.byName("Option_harness")
+	truthy("the endpoint this client has is listed", providerRow ~= nil)
+	contains("with its real URL", harness.textOf(providerRow), "harness.test")
+	harness.click(providerRow)
+
+	local modelRow = harness.byName("Model_claude-opus-5")
+	truthy("the model it is pointed at is listed", modelRow ~= nil)
+	contains("with the window this client documents", harness.textOf(modelRow), "1M")
+	truthy("model rows are compact", modelRow.Size.Y.Offset <= 44)
+
+	-- Effort is the model's own scale, and Opus 5 documents five levels.
+	truthy("the effort scale is the model's own", harness.byName("Effort_xhigh") ~= nil)
+	harness.click(harness.byName("Effort_low"))
+	harness.settle(1)
+	check("picking one writes the real setting", handle.config.get("agent.effort"), "low")
+
+	-- A filter appears only once the list is long enough to need one.
+	truthy("search is always available", harness.byName("ModelFilter") ~= nil)
+	harness.click(harness.byName("FetchModels"))
+	harness.settle(6)
+	local asked = nil
+	for _, entry in ipairs(harness.http.log) do
+		if tostring(entry.url):find("/models") then asked = entry end
+	end
+	truthy("the endpoint was asked for its list", asked ~= nil)
+	truthy("the list comes back without pressing anything else",
+		harness.byName("Model_vendor/model-3") ~= nil, harness.dump())
+	truthy("and a long list gets a filter", harness.byName("ModelFilter") ~= nil)
+
+	harness.click(harness.byName("Model_vendor/model-3"))
+	harness.settle(1)
+	check("picking a model points the provider at it",
+		handle.providers.active().model, "vendor/model-3")
+	contains("which the composer's chip then states",
+		harness.byName("ModelLabel").Text, "vendor/model-3")
+
+	-- A model with no documented effort scale gets no effort control, because sending an
+	-- effort a model has no parameter for is a setting that changes nothing. The old
+	-- menu offered five rows of it on every id.
+	truthy("a model with no documented scale is told so", harness.byName("NoEffort") ~= nil)
+	truthy("rather than being offered levels that do nothing",
+		harness.byName("Effort_xhigh") == nil)
+
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+-- 49. Modals fit the screen ----------------------------------------------
+
+-- An auto-height modal has no ceiling, and it is centred -- so a form taller than the
+-- viewport goes off both edges at once. The provider editor is six labelled rows, two
+-- segmented pickers and a footer: on a phone its title went off the top and its Save
+-- button off the bottom, with nothing scrollable and no way to reach either.
+scenario("a form modal stays on screen and keeps its footer reachable", function()
+	local harness, handle = bootWith({ provider = false })
+
+	local function inside(node, root)
+		local walk = node
+		while walk do
+			if walk == root then return true end
+			walk = walk.Parent
+		end
+		return false
+	end
+
+	-- Every layout mode, including the two where the viewport is shorter than the form.
+	for _, spec in ipairs({
+		{ 1280, 720, "window" },
+		{ 390, 844, "sheet" },
+		{ 844, 390, "panel" },
+	}) do
+		harness.setViewport(spec[1], spec[2])
+		harness.settle(2)
+		check("the layout is " .. spec[3], handle.env.require("ui/responsive").mode, spec[3])
+
+		handle.env.require("ui/panels/providers").editor(
+			handle.providers.blank("custom"), function() end)
+		harness.settle(2)
+
+		local card = harness.byName("Modal")
+		truthy("the editor opened at " .. tostring(spec[2]) .. "px tall", card ~= nil)
+		-- Bounded rather than auto: a card with both a height and AutomaticSize.Y grows
+		-- past the height, which is the same bug wearing a different hat. Compared by
+		-- name because an unassigned AutomaticSize is the mock's default rather than an
+		-- EnumItem, and the two do not tostring the same way.
+		truthy("with a bounded height",
+			tostring(card.AutomaticSize):find("None") ~= nil, tostring(card.AutomaticSize))
+		truthy("and a real one", card.Size.Y.Offset > 0, tostring(card.Size.Y.Offset))
+		local top = card.AbsolutePosition.Y
+		local bottom = top + card.AbsoluteSize.Y
+		truthy("its top edge is on screen", top >= -1, tostring(top))
+		truthy("and so is its bottom edge", bottom <= spec[2] + 1,
+			tostring(bottom) .. " vs viewport " .. tostring(spec[2]))
+
+		-- The form scrolls; the footer does not. Save has to be reachable without
+		-- scrolling to it, because a form you cannot submit is worse than one you cannot
+		-- read.
+		local scroll = harness.byName("BodyScroll", card)
+		truthy("the body is a scroll region", scroll ~= nil)
+		for _, name in ipairs({ "Preset", "ProviderName", "BaseUrl", "Protocol", "AuthStyle" }) do
+			local node = harness.byName(name, card)
+			truthy(name .. " is reachable inside it", node ~= nil and inside(node, scroll),
+				name .. " missing or outside the scroll")
+		end
+		local save = harness.byName("SaveProvider", card)
+		truthy("Save exists", save ~= nil)
+		truthy("and is pinned outside the scroll", not inside(save, scroll))
+
+		handle.env.require("ui/overlay").closeAll()
+		harness.settle(1)
+	end
+
+	-- Small confirmations measure their content but keep a scrollable body when the
+	-- keyboard leaves too little room. They should not reserve a full-height dialog.
+	handle.env.require("ui/overlay").confirm({ title = "Remove it?", description = "It will not come back." })
+	harness.settle(1)
+	local confirmation = harness.byName("Modal")
+	truthy("a plain modal stays content-sized and bounded",
+		confirmation.Size.Y.Offset > 0 and confirmation.Size.Y.Offset < 300)
+	truthy("a plain modal retains a scrollable body", harness.byName("BodyScroll", confirmation) ~= nil)
+	handle.env.require("ui/overlay").closeAll()
+	harness.settle(1)
+
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+-- 50. The transcript names its speakers -----------------------------------
+
+-- A turn was a tinted box, then unmarked prose, then another tinted box: scrolling back
+-- through a long conversation meant inferring the speaker from the fill, and the reply's
+-- attribution existed nowhere at all -- a client that can switch model mid-conversation
+-- was rendering four different models' answers identically.
+scenario("each turn says who said it, and the reply says with what", function()
+	local answeredModel
+	local harness, handle = bootWith({
+		model = "claude-opus-5",
+		handler = function(entry)
+			if not tostring(entry.url):find("/chat/completions") then
+				return { StatusCode = 404, Body = "{}" }
+			end
+			return { StatusCode = 200, Body = chatBody({ content = "Two things, then.", model = answeredModel or json.decode(entry.body).model }) }
+		end,
+	})
+
+	handle.sessions.current().send("what is in the workspace")
+	harness.settle(10)
+
+	local user = harness.byName("User")
+	truthy("the question rendered", user ~= nil)
+	local userByline = harness.byName("Byline", user)
+	truthy("with a byline", userByline ~= nil, harness.dump(user))
+	-- The display name, because that is what the person sees everywhere else in the game.
+	contains("naming the person at this client", harness.textOf(userByline), "TestPlayer")
+
+	local agent = harness.byName("Agent")
+	truthy("the reply rendered", agent ~= nil)
+	local agentByline = harness.byName("Byline", agent)
+	truthy("with a byline of its own", agentByline ~= nil, harness.dump(agent))
+	-- The role distinguishes a reply from a user or a tool, while the model remains
+	-- explicit because providers can change between turns.
+	local speaker = harness.byName("Speaker", agentByline)
+	check("naming the role that answered", speaker and speaker.Text, "Assistant")
+	check("separate model attribution", harness.byName("ModelAttribution", agentByline).Text, "claude-opus-5")
+
+	answeredModel = "some/resolved-model"
+	handle.providers.setModel(handle.providers.active().id, "some/other-model")
+	harness.settle(1)
+	handle.sessions.current().send("and now")
+	harness.settle(10)
+	local bylines = harness.allByName("ModelAttribution", harness.byName("Transcript"))
+	check("a second reply names the model reported by the provider",
+		bylines[#bylines].Text, answeredModel)
+
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+-- 51. In-game chat and virtual input tools ---------------------------------
+
+scenario("chat and virtual input tools are registered and callable", function()
+	local harness, handle = bootWith({ provider = false })
+	local registry = handle.tools
+
+	local chatSend = registry.get("chat_send")
+	truthy("chat_send is registered", chatSend ~= nil)
+	check("chat_send group", chatSend and chatSend.group, "chat")
+	check("chat_send risk", chatSend and chatSend.risk, "write")
+
+	local chatHist = registry.get("chat_history")
+	truthy("chat_history is registered", chatHist ~= nil)
+	check("chat_history group", chatHist and chatHist.group, "chat")
+	check("chat_history risk", chatHist and chatHist.risk, "read")
+
+	local keyPress = registry.get("key_press")
+	truthy("key_press is registered", keyPress ~= nil)
+	check("key_press group", keyPress and keyPress.group, "input")
+	check("key_press risk", keyPress and keyPress.risk, "write")
+
+	local mouseClick = registry.get("mouse_click")
+	truthy("mouse_click is registered", mouseClick ~= nil)
+	check("mouse_click group", mouseClick and mouseClick.group, "input")
+	check("mouse_click risk", mouseClick and mouseClick.risk, "write")
+
+	check("chat group label", registry.groupLabel("chat"), "In-game chat")
+	check("input group label", registry.groupLabel("input"), "Virtual input")
+
+	local histResult = chatHist.run({})
+	contains("chat_history handles empty history", histResult, "No recent in-game chat messages")
+
+	local chatFixture = require("gamechat")(harness)
+	handle.env.services.TextChatService = harness.services.TextChatService
+	local sendResult = chatSend.run({ message = "Hello from AI" })
+	contains("chat_send reports sent message", sendResult, "Hello from AI")
+
+	local histAfter = chatHist.run({})
+	contains("chat_history records sent message", histAfter, "Hello from AI")
+
+	local badKey = keyPress.run({ key = "InvalidKey123NonExistent" })
+	contains("key_press rejects invalid keys", type(badKey) == "table" and badKey.text or tostring(badKey), "unrecognised KeyCode")
+
+	local okKey = keyPress.run({ key = "E", action = "press" })
+	truthy("key_press executes valid key", okKey:find("Key E: press") ~= nil or okKey:find("no virtual input") ~= nil)
+
+	local clickRes = mouseClick.run({ button = "left", action = "click", x = 100, y = 200 })
+	truthy("mouse_click executes", clickRes:find("Mouse left click") ~= nil or clickRes:find("no mouse input") ~= nil)
+end)
+
+-- Infinite Yield tools -------------------------------------------------------
+
+-- What this locks in: the three iy tools exist with the right group and risk,
+-- the group carries a label, and the runtime module reports the honest states
+-- without IY present -- off says off, an unauthorised mode says so, and a
+-- command against a mode that is off fails with the reason rather than raising.
+scenario("infinite yield tools register and report without IY", function()
+	local harness, handle = bootWith({ provider = false })
+	local registry = handle.tools
+
+	local status = registry.get("iy_status")
+	truthy("iy_status is registered", status ~= nil)
+	check("iy_status group", status and status.group, "iy")
+	check("iy_status risk", status and status.risk, "read")
+
+	local cmd = registry.get("iy_cmd")
+	truthy("iy_cmd is registered", cmd ~= nil)
+	check("iy_cmd group", cmd and cmd.group, "iy")
+	check("iy_cmd risk", cmd and cmd.risk, "write")
+
+	local list = registry.get("iy_cmds")
+	truthy("iy_cmds is registered", list ~= nil)
+	check("iy_cmds risk", list and list.risk, "read")
+
+	check("iy group label", registry.groupLabel("iy"), "Infinite Yield")
+
+	local iy = handle.env.require("runtime/iy")
+	check("mode starts nil", iy.mode, nil)
+	check("status names the default setting", iy.status()[1][2], "hidden")
+	check("not loaded", iy.isLoaded(), false)
+
+	local empty = cmd.run({ command = "" })
+	contains("an empty command fails cleanly", type(empty) == "table" and empty.text or tostring(empty), "Failed")
+
+	iy.setMode("off")
+	local off = cmd.run({ command = "speed 100" })
+	contains("a command while off names the setting", type(off) == "table" and off.text or tostring(off), "Settings")
+
+	iy.setMode("hidden")
+	check("mode switches", iy.mode, "hidden")
+	check("an unknown mode is refused", iy.setMode("sideways"), false)
+
+	local denied = cmd.run({ command = "speed 100" })
+	contains("a load without http or exec still reports a reason",
+		type(denied) == "table" and denied.text or tostring(denied), "Failed")
+
+	iy.setMode("off")
+end)
+
+scenario("mobile panel can be moved and resized, and burger menu stays within screen bounds", function()
+	local harness, handle = bootWith({})
+	local responsive = handle.env.require("ui/responsive")
+	local config = handle.env.require("runtime/config")
+
+	-- Set mobile landscape viewport (e.g. 844x390, touch enabled)
+	harness.services.UserInputService.TouchEnabled = true
+	responsive.refresh("test")
+	harness.setViewport(844, 390)
+	harness.settle(2)
+	check("layout mode is panel on mobile", responsive.mode, "panel")
+
+	local window = handle.app.window
+	truthy("window exists", window ~= nil and window.root ~= nil)
+
+	local grip = harness.byName("ResizeGrip")
+	truthy("resize grip exists in panel mode", grip ~= nil)
+	check("grip meets the configured target", grip.AbsoluteSize.X >= responsive.minTarget(), true)
+
+	-- Panel dragging
+	local startPosX = window.root.Position.X.Offset
+	local startPosY = window.root.Position.Y.Offset
+	harness.drag(harness.byName("Header"), 600, 30, 450, 60)
+	harness.settle(4)
+	truthy("dragging header moves the mobile panel horizontally", window.root.Position.X.Offset ~= startPosX)
+	local safe = responsive.usableRect(window.root.Parent, handle.env.require("ui/theme").space.sm, false)
+	truthy("mobile panel stays inside device-safe vertical bounds", window.root.Position.Y.Offset >= safe.y
+		and window.root.Position.Y.Offset + window.root.Size.Y.Offset <= safe.y + safe.height)
+	truthy("panel geometry saved to mobilePanel", config.get("ui.mobilePanel.placed", false))
+	check("desktop window geometry was not touched", config.get("ui.window.placed", false), false)
+
+	-- Panel resizing
+	local widthBefore = window.root.Size.X.Offset
+	local heightBefore = window.root.Size.Y.Offset
+	local gripPos = grip.AbsolutePosition
+	harness.drag(grip, gripPos.X, gripPos.Y, gripPos.X - 60, gripPos.Y - 40)
+	harness.settle(4)
+	truthy("panel width resized", window.root.Size.X.Offset ~= widthBefore)
+	truthy("panel height resized", window.root.Size.Y.Offset ~= heightBefore)
+	truthy("panel stays on screen", window.root.Position.Y.Offset >= 0)
+	local beforeY = window.root.Position.Y.Offset
+	local headerPos = window.header.AbsolutePosition
+	harness.drag(window.header, headerPos.X + 96, headerPos.Y + 20, headerPos.X + 76, headerPos.Y + 45)
+	harness.settle(1)
+	truthy("shorter panel can move vertically", window.root.Position.Y.Offset ~= beforeY)
+
+	-- Hamburger menu positioning on mobile
+	if handle.app.sidebarVisible() then handle.app.toggleSidebar() end
+	local burger = harness.byName("Nav_menu", window.header)
+	truthy("collapsed sidebar exposes the shared app menu", burger ~= nil and burger.Visible)
+	harness.click(burger)
+	harness.settle(2)
+
+	local menuCard = harness.byName("Menu")
+	truthy("menu card rendered", menuCard ~= nil)
+	truthy("menu card top edge is on screen (no negative Y)", menuCard.AbsolutePosition.Y >= 0,
+		"AbsolutePosition.Y = " .. tostring(menuCard.AbsolutePosition.Y))
+	truthy("menu card bottom edge does not exceed viewport",
+		menuCard.AbsolutePosition.Y + menuCard.AbsoluteSize.Y <= 390,
+		"bottom = " .. tostring(menuCard.AbsolutePosition.Y + menuCard.AbsoluteSize.Y))
+
+	-- Options can be selected
+	local optionTools = harness.byName("Option_tools", menuCard)
+	truthy("option row exists and is reachable", optionTools ~= nil)
+	harness.click(optionTools)
+	harness.settle(2)
+	check("menu option switched panel", handle.app.panel, "tools")
+
+	-- Clean up touch setting
+	harness.services.UserInputService.TouchEnabled = false
+	responsive.refresh("test")
+end)
+
+scenario("OpenRouter requests carry Project UAI app attribution and disable Claude Code headers", function()
+	local harness, handle = bootWith({
+		baseUrl = "https://openrouter.ai/api/v1",
+		handler = function(entry)
+			return { StatusCode = 200, Body = chatBody({ content = "From OpenRouter." }) }
+		end,
+	})
+
+	handle.sessions.current().send("test openrouter stats")
+	harness.settle(6)
+
+	local requests = chatRequests(harness)
+	check("one request sent to openrouter", #requests, 1)
+	local headers = requests[1] and requests[1].headers or {}
+
+	check("openrouter user agent is ProjectUAI", headers["User-Agent"], "ProjectUAI/1.0.0")
+	check("openrouter referer is ProjectUAI website", headers["HTTP-Referer"], "https://carldv.github.io/ProjectUAI/")
+	check("openrouter title is Project UAI", headers["X-Title"], "Project UAI")
+	check("openrouter modern title is Project UAI", headers["X-OpenRouter-Title"], "Project UAI")
+	check("openrouter categories are set", headers["X-OpenRouter-Categories"], "game,cli-agent")
+	check("claude cli x-app header is suppressed", headers["x-app"], nil)
+	check("stainless lang header is suppressed", headers["X-Stainless-Lang"], nil)
+	check("stainless runtime header is suppressed", headers["X-Stainless-Runtime"], nil)
+	check("stainless package header is suppressed", headers["X-Stainless-Package-Version"], nil)
+end)
+
+-- OpenCode Zen retains its existing request compatibility headers.
+-- Exact-host matching and suppression of competing Claude headers apply to
+-- preset and manually entered records alike.
+scenario("AgentRouter is featured and its required identity survives every switch", function()
+	local sent = {}
+	local harness, handle = bootWith({ preset = "agentrouter", baseUrl = "https://agentrouter.org", model = "deepseek-v4-flash",
+		handler = function(entry)
+			if not entry.url:find("https://agentrouter.org/", 1, true) then return { StatusCode = 404, Body = "{}" } end
+			sent[#sent + 1] = entry
+			if entry.method == "GET" then
+				return { StatusCode = 200, Body = json.encode({ data = { { id = "deepseek-v4-flash" } } }) }
+			end
+			return { StatusCode = 200, Body = messagesBody({ text = "Connected to AgentRouter" }) }
+		end,
+	})
+	local registry, record = handle.providers, handle.providers.active()
+	local preset = handle.env.require("provider/catalog").get("agentrouter")
+	truthy("the preset is featured", preset.featured)
+	check("registration keeps the requested address", preset.docs, "https://agentrouter.org/register?aff=4pqF")
+	check("the Messages protocol is selected", record.api, "anthropic")
+	check("the endpoint is normalized once", handle.env.require("provider/chat").endpointOf(record), "https://agentrouter.org/v1/messages")
+	for _, base in ipairs({ "https://agentrouter.org", "HTTPS://AGENTROUTER.ORG/v1", "https://api.agentrouter.org:443/v1" }) do
+		check("required identity applies to " .. base, registry.identityFor({ baseUrl = base, claudeUa = false }), "claude")
+	end
+	for _, base in ipairs({ "https://agentrouter.org.evil.test", "https://evil.test/agentrouter.org", "https://evil.test?host=agentrouter.org", "https://notagentrouter.org" }) do
+		check("unrelated hosts retain their own preference", registry.identityFor({ baseUrl = base, claudeUa = false }), "none")
+	end
+	handle.config.set("identity.claudeUa", false)
+	handle.config.set("identity.extraHeaders", { ["user-agent"] = "global override", ["x-app"] = "other", ["X-Project"] = "kept" })
+	record.claudeUa = false
+	record.headers["user-agent"], record.headers["X-App"] = "override", "override"
+	truthy("a completion succeeds with the global and record switches off", providerCall(harness, handle.env.require("provider/anthropic"), record))
+	local discovered
+	harness.sched.spawn(function() discovered = handle.env.require("provider/models").discover(record, { force = true }) end)
+	harness.sched.advance(0.5)
+	check("model discovery uses the same required identity", discovered and discovered[1], "deepseek-v4-flash")
+	check("both requests reached the endpoint", #sent, 2)
+	for _, entry in ipairs(sent) do
+		contains("the required User-Agent reaches the wire", entry.headers["User-Agent"], "claude-cli/")
+		check("the client identity reaches the wire", entry.headers["x-app"], "cli")
+		truthy("Stainless metadata reaches the wire", entry.headers["X-Stainless-Lang"] ~= nil)
+		check("custom case variants cannot replace the required identity", entry.headers["user-agent"], nil)
+		check("unrelated extra headers are preserved", entry.headers["X-Project"], "kept")
+		check("the Anthropic version is present", entry.headers["anthropic-version"], "2023-06-01")
+		truthy("the API key is sent", entry.headers["x-api-key"] ~= nil)
+	end
+	assert(registry.save(record))
+	check("saved AgentRouter records retain the required preference", record.claudeUa, true)
+	handle.app.show("providers")
+	harness.settle(0.5)
+	truthy("the provider detail explains the identity requirement", harness.byName("ClaudeUaRequired") ~= nil)
+	falsy("the provider does not offer an identity toggle", harness.byName("ClaudeUa"))
+	local featured = handle.env.require("ui/primitives").column(handle.app.screen, {})
+	handle.env.require("ui/panels/providers").featuredCard(featured, function() end)
+	local highlighted = false
+	for _, note in ipairs(harness.allByName("FeaturedNote", featured)) do
+		if note.Text:find("a GitHub account at least 1 year old", 1, true) then
+			highlighted = note.RichText and note.Text:find("<b><font", 1, true) ~= nil
+		end
+	end
+	truthy("the signup restriction is highlighted", highlighted)
+	featured:Destroy()
+	local socketHeaders
+	handle.env.require("runtime/caps").ws = true
+	record.api, record.stream, record.wsUrl = "openai", true, "wss://agentrouter.org/stream"
+	handle.env.require("net/ws").stream = function(spec)
+		socketHeaders = spec.headers
+		return chatBody({ content = "Socket response" })
+	end
+	truthy("the optional socket completion succeeds", providerCall(harness, handle.env.require("provider/openai"), record))
+	contains("the socket envelope retains the required identity", socketHeaders and socketHeaders["User-Agent"], "claude-cli/")
+	check("socket custom headers cannot turn it off", socketHeaders and socketHeaders["user-agent"], nil)
+	check("no thread errors", #harness.errors(), 0)
+end)
+
+scenario("an OpenCode Zen record preserves its request compatibility headers", function()
+	local requests = {}
+	local harness, handle = bootWith({
+		preset = "zen",
+		baseUrl = "https://opencode.ai/zen/v1",
+		handler = function(entry)
+			if tostring(entry.url):find("/chat/completions") then
+				requests[#requests + 1] = { headers = entry.headers, body = json.decode(entry.body) }
+			end
+			return { StatusCode = 200, Body = chatBody({ content = "From Zen." }) }
+		end,
+	})
+	local record = handle.providers.active()
+
+	handle.sessions.current().send("test zen")
+	harness.settle(6)
+
+	check("one request was sent", #requests, 1)
+	local headers = requests[1] and requests[1].headers or {}
+	contains("carrying a session id the relay accepts",
+		tostring(headers["x-opencode-session"] or ""), "ses_")
+	truthy("a per-request id",
+		tostring(headers["x-opencode-request"] or ""):find("^req_") ~= nil)
+	check("uses the upstream default client header", headers["x-opencode-client"], "cli")
+	check("uses the current upstream compatibility version",
+		headers["User-Agent"], "opencode/1.18.31")
+	-- The preset turns the Claude Code identity off for this record.
+	check("the record carries no claude identity flag", record.claudeUa, false)
+	check("the claude cli marker header is absent", headers["x-app"], nil)
+	check("the stainless language header is absent", headers["X-Stainless-Lang"], nil)
+
+	-- The session id is sticky: the relay hashes it to pick an upstream, so a new
+	-- one per request would scatter one conversation across every provider it has.
+	local first = headers["x-opencode-session"]
+	handle.sessions.current().send("a second turn")
+	harness.settle(6)
+	local second = requests[2] and requests[2].headers["x-opencode-session"]
+	check("the second turn keeps the same session", second, first)
+
+	-- Hand-entered official URLs get the same routing and compatibility identity, even
+	-- when an older record still has the default Claude identity flag.
+	local hand = handle.providers.blank("custom")
+	hand.label = "Hand-typed Zen"
+	hand.baseUrl = "https://opencode.ai/zen/v1"
+	hand.apiKey = "sk-hand"
+	hand.model = "m"
+	hand.models = { "m" }
+	hand.opencode = { version = "1.0.118-test", client = "opencode" }
+	handle.providers.save(hand)
+	harness.settle(2)
+	handle.providers.setActive(hand.id)
+	handle.sessions.current().send("typed by hand")
+	harness.settle(6)
+	local third = requests[3] and requests[3].headers or {}
+	contains("a hand-typed record carries the session header too",
+		tostring(third["x-opencode-session"] or ""), "ses_")
+	check("honours a configured compatibility client", third["x-opencode-client"], "opencode")
+	check("honours a configured compatibility version", third["User-Agent"], "opencode/1.0.118-test")
+	check("preserves ordinary bearer authentication", third["Authorization"], "Bearer sk-hand")
+	check("manual Zen also omits Claude identity", third["x-app"], nil)
+	check("manual Zen also omits Stainless identity", third["X-Stainless-Lang"], nil)
+
+	-- And nowhere else: the same client talking to an unrelated host sends none
+	-- of these, because a header a relay never asked for is one more thing to
+	-- explain in a rejection.
+	local other = handle.providers.blank("custom")
+	other.label = "Somewhere else"
+	other.baseUrl = "https://harness.test/v1"
+	other.apiKey = "sk-other"
+	other.model = "m"
+	other.models = { "m" }
+	handle.providers.save(other)
+	harness.settle(2)
+	handle.providers.setActive(other.id)
+	handle.sessions.current().send("not zen")
+	harness.settle(6)
+	local fourth = requests[4] and requests[4].headers or {}
+	check("an unrelated host gets no session header", fourth["x-opencode-session"], nil)
+	check("and no opencode client header", fourth["x-opencode-client"], nil)
+
+	-- A separate conversation gets its own distinct session id.
+	local otherSession = handle.sessions.newThread()
+	handle.providers.setActive(record.id)
+	otherSession.send("separate conversation")
+	harness.settle(6)
+	local fifth = requests[5] and requests[5].headers or {}
+	local otherHeader = fifth["x-opencode-session"]
+	truthy("a separate conversation gets its own session id", otherHeader ~= first)
+	contains("separate conversation session id has canonical prefix", tostring(otherHeader or ""), "ses_")
+	truthy("separate conversation session id has canonical length", #(otherHeader or "") >= 25)
+	handle.sessions.persist(otherSession)
+	handle.sessions.restore()
+	local restored = handle.sessions.threads[otherSession.id]
+	check("restores preserved opencodeSession", restored and restored.opencodeSession, otherHeader)
+end)
+
+scenario("Zen detection and free labels do not imply account access", function()
+	local harness, handle = bootWith({ provider = false })
+	local registry = handle.env.require("provider/registry")
+	local models = handle.env.require("provider/models")
+	local openai = handle.env.require("provider/openai")
+	for _, base in ipairs({ "https://opencode.ai/zen/v1", "https://OPENCODE.AI:443/zen/v1" }) do
+		truthy("recognises the official authority", registry.isOpencode({ baseUrl = base }))
+	end
+	for _, base in ipairs({
+		"https://opencode.ai.evil.test/v1", "https://opencode.ai@evil.test/v1",
+		"https://evil.test/opencode.ai", "https://evil.test/v1?host=opencode.ai",
+	}) do
+		falsy("does not match unrelated URL components", registry.isOpencode({ baseUrl = base }))
+		check("does not add routing IDs to an unrelated host",
+			registry.opencodeHeaders({ baseUrl = base })["x-opencode-session"], nil)
+	end
+	local zen = { baseUrl = "https://opencode.ai/zen/v1" }
+	truthy("Big Pickle is labelled free on Zen", models.isFree(zen, "big-pickle"))
+	falsy("the alias is scoped to Zen", models.isFree({ baseUrl = "https://example.test/v1" }, "big-pickle"))
+	truthy("recognises a free model suffix", models.isFree(zen, "mimo-v2.5-free"))
+	falsy("does not label freedom as free", models.isFree(zen, "freedom-model"))
+	local errorText = openai.errorText({ status = 403, body = json.encode({ error = {
+		type = "FreeTierError",
+		message = "Error from provider (Console): OpenCode's free tier can only be used from within OpenCode",
+	} }) })
+	contains("preserves the relay error message", errorText, "free tier can only be used from within OpenCode")
+	contains("preserves the HTTP status", errorText, "403")
+end)
+
+-- Azure AI Foundry: the v1 endpoint of a Foundry resource, which speaks plain
+-- chat completions with the api-key header the classic Azure preset already used.
+scenario("an Azure AI Foundry preset exists and authenticates the Azure way", function()
+	local catalog = nil
+	local harness, handle = bootWith({
+		preset = "azure-foundry",
+		baseUrl = "https://my-resource.openai.azure.com/openai/v1",
+		handler = function(entry)
+			return { StatusCode = 200, Body = chatBody({ content = "From Foundry." }) }
+		end,
+	})
+	catalog = handle.env.require("provider/catalog")
+
+	local preset = catalog.get("azure-foundry")
+	truthy("the preset exists", preset ~= nil)
+	contains("pointing at the v1 surface", preset.baseUrl, "/openai/v1")
+	check("authenticating with the api-key header", preset.authStyle, "api-key")
+
+	local record = handle.providers.active()
+	handle.sessions.current().send("test foundry")
+	harness.settle(6)
+	local requests = chatRequests(harness)
+	check("one request was sent", #requests, 1)
+	local headers = requests[1] and requests[1].headers or {}
+	check("with the Azure key header", headers["api-key"], "sk-harness-key-1234")
+	-- The v1 surface takes the model from the body like every OpenAI-compatible
+	-- endpoint, unlike the per-deployment preview path.
+	local body = requests[1] and json.decode(requests[1].body) or {}
+	check("and the model in the body", body.model, "harness-model")
+end)
+
+--[[ Archived with the code editor panel (src/archive). Restore the module and
+-- these scenarios together.
+
+-- The code tab: a shared editor whose tabs the agent can operate through tools,
+-- persisted so a draft survives an unload. The state lives in a module because a
+-- tool cannot reach a closure -- which is the whole reason the store exists.
+scenario("the code tab is a shared, tooled editor", function()
+	local harness, handle = bootWith({ provider = false })
+	handle.config.set("permissions.mode", "full")
+	local store = handle.env.require("ui/panels/code_store")
+	local context = handle.sessions.current().toolContext()
+
+	local function call(name, args)
+		return handle.tools.dispatch({ id = "c", ["function"] = {
+			name = name, arguments = json.encode(args or {}),
+		} }, context)
+	end
+
+	-- The panel builds like every other panel.
+	handle.app.show("code")
+	harness.settle(1)
+	truthy("the code panel built", handle.app.panels.code ~= nil)
+	truthy("with a real text box", harness.byName("Editor") ~= nil)
+
+	-- A fresh install has one tab.
+	local listing = call("code_tabs")
+	contains("the default tab is listed", listing.text, "Tab 1")
+
+	-- The agent writes without switching the user's view.
+	local written = call("code_write", { code = "return 1 + 1" })
+	contains("the write is confirmed", written.text, "Wrote 1 line")
+	check("and marked as failed when it was not", written.ok, true)
+
+	-- A named tab is created on demand and targeted by name.
+	local created = call("code_write", {
+		code = "local x = 2\nreturn x * 3", new = true, name = "Helper",
+	})
+	contains("the new tab is named as asked", created.text, "Helper")
+	local read = call("code_read", { tab = "Helper" })
+	contains("and read back by that name", read.text, "local x = 2")
+
+	-- Line-ranged edits and search, the reference client's two cheap operations.
+	local edited = call("code_edit", {
+		tab = "Helper", start = 1, finish = 1, code = "local x = 3",
+	})
+	contains("the edit lands", edited.text, "Replaced lines 1-1")
+	local found = call("code_search", { pattern = "local x" })
+	contains("search finds it", found.text, "Helper:1")
+
+	-- Running reports through the same contract as run_luau.
+	local run = call("code_run", { tab = "Helper" })
+	contains("the run happened", run.text, "Ran Helper")
+	contains("with the return value", run.text, "9")
+
+	-- A bad tab reference is a failure, not a crash.
+	local missing = call("code_read", { tab = "Nope" })
+	check("an unknown tab fails cleanly", missing.ok, false)
+
+	-- Tabs persist: a second read straight from the store sees the same code.
+	local stored = store.list()
+	check("two tabs are stored", #stored, 2)
+	check("the named one kept its name", stored[2].name, "Helper")
+	contains("and its code", stored[2].code, "local x = 3")
+
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+-- The whole point of the code tab: a turn asks the agent to change code, the agent
+-- writes through the tool, and the editor the user has open shows it -- without the
+-- agent having to switch the user's view.
+scenario("an agent turn edits the code the user is looking at", function()
+	local harness, handle = bootWith({
+		handler = function(entry)
+			if not tostring(entry.url):find("/chat/completions") then
+				return { StatusCode = 404, Body = "{}" }
+			end
+			return { StatusCode = 200, Body = chatBody({
+				toolCalls = { toolCall("w1", "code_write", {
+					code = "print('hello from the agent')",
+					tab = "Tab 1",
+				}) },
+			}) }
+		end,
+	})
+	handle.config.set("permissions.mode", "full")
+
+	-- The user is on the code panel with the editor open.
+	handle.app.show("code")
+	harness.settle(1)
+	local editor = harness.byName("CodeBox")
+	truthy("the editor is open", editor ~= nil, harness.dump(harness.byName("Code")))
+	check("and empty to start", editor.Text, "")
+
+	-- One turn: the model writes into Tab 1 by name.
+	handle.sessions.current().send("put hello world in tab one")
+	harness.settle(8)
+
+	-- The write landed in the store, and in the box the user is looking at -- the
+	-- panel was open, so the store's change signal reached it.
+	check("the editor shows the agent's code", editor.Text, "print('hello from the agent')")
+	local active = handle.env.require("ui/panels/code_store").active()
+	check("still on the tab the user had open", active.name, "Tab 1")
+
+	-- The transcript records the call like any other tool.
+	contains("the turn rendered its tool call",
+		harness.textOf(harness.byName("Transcript")), "code_write")
+
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+]]
+
+-- A record born from a preset should carry that preset's name -- the "Custom
+-- endpoint" default belongs to the one preset that is genuinely custom.
+scenario("a preset-named provider starts with the preset's name", function()
+	local harness, handle = bootWith({ provider = false })
+	local blank = handle.providers.blank("openai")
+	check("a preset record carries the preset's label", blank.label, "OpenAI")
+	check("and the preset's base url", blank.baseUrl, "https://api.openai.com/v1")
+
+	local custom = handle.providers.blank("custom")
+	check("only the custom preset says custom", custom.label, "Custom endpoint")
+end)
+
+-- Adding a provider is one modal, not two. The preset is chosen inside the editor
+-- -- the Preset row there seeds the name, URL and auth style without discarding
+-- anything already typed -- so there is no picker in front of the form.
+scenario("adding a provider opens the editor directly", function()
+	local harness, handle = bootWith({ provider = false })
+	handle.app.show("providers")
+	harness.settle(1)
+
+	local add = harness.byName("AddProvider")
+	truthy("the add control is on screen", add ~= nil, harness.dump())
+	harness.click(add)
+	harness.settle(1)
+
+	-- The editor, not a preset menu: the form is up and there is no menu layer.
+	truthy("the editor form is open", harness.byName("Form") ~= nil, harness.dump())
+	falsy("no preset menu was interposed", harness.byName("MenuLayer") ~= nil)
+	truthy("with a preset row inside it", harness.byName("Preset") ~= nil)
+	contains("starting on the custom preset",
+		harness.textOf(harness.byName("Preset")), "Custom endpoint")
+
+	-- Picking a preset from that row fills the fields in place -- the flow the
+	-- pre-picker used to own, without the extra modal.
+	harness.click(harness.byName("Preset"))
+	harness.settle(1)
+	truthy("the preset menu opens from the row", harness.byName("MenuLayer") ~= nil)
+	harness.click(harness.byName("Option_openai"))
+	harness.settle(1)
+	contains("the button now names the preset",
+		harness.textOf(harness.byName("Preset")), "OpenAI")
+	local url = harness.byName("BaseUrl", harness.byName("Form"))
+	local box = url and url:FindFirstChildOfClass("TextBox")
+	check("and the url was filled in", box and box.Text, "https://api.openai.com/v1")
+
+	-- The name follows when it was never hand-edited, and every row derived from
+	-- the preset repaints: a form where half the rows still describe the previous
+	-- vendor reads as broken rather than as partially updated.
+	local nameRow = harness.byName("ProviderName", harness.byName("Form"))
+	local nameBox = nameRow and nameRow:FindFirstChildOfClass("TextBox")
+	check("the name field follows the preset", nameBox and nameBox.Text, "OpenAI")
+	local hint = harness.byName("KeyHint", harness.byName("Form"))
+	contains("the key hint follows", hint and hint.Text or "", "sk-")
+	local keyLink = harness.byName("KeyLinkUrl", harness.byName("Form"))
+	check("the docs link follows", keyLink and keyLink.Text, "https://platform.openai.com/api-keys")
+
+	-- Switching to a preset with a different auth style moves the segmented control
+	-- too: Anthropic authenticates with x-api-key, not bearer.
+	harness.click(harness.byName("Preset"))
+	harness.settle(1)
+	harness.click(harness.byName("Option_anthropic-messages"))
+	harness.settle(1)
+	check("the name followed the switch", nameBox and nameBox.Text, "Anthropic (Messages API)")
+	local linkAfter = harness.byName("KeyLinkUrl", harness.byName("Form"))
+	check("the docs link followed the switch",
+		linkAfter and linkAfter.Text, "https://console.anthropic.com/settings/keys")
+	local authRow = harness.byName("AuthStyle", harness.byName("Form"))
+	local selected = authRow and harness.byName("Segment_x-api-key", authRow)
+	truthy("the auth segment control follows", selected ~= nil, harness.dump(authRow))
+
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+-- The featured provider and the key links: a first-run client has one recommended
+-- road to a working key, and every preset's docs address is visible and copyable
+-- rather than hidden behind a "click here".
+scenario("a first-run client is pointed at the featured provider", function()
+	local harness, handle = bootWith({ provider = false })
+	handle.app.show("providers")
+	harness.settle(1)
+
+	local featured = harness.byName("Featured")
+	truthy("the featured card is shown", featured ~= nil, harness.dump())
+	check("naming HCNSEC", harness.byName("FeaturedName").Text, "HCNSEC")
+	check("all three featured providers get a card", #harness.allByName("Featured"), 3)
+
+	-- The referral link, rendered in full and exactly as the catalog carries it.
+	local url = harness.byName("FeaturedUrl")
+	check("with the sign-up address", url and url.Text, "https://api.hcnsec.cn/sign-up?aff=drd9")
+	truthy("and a copy control beside it", harness.byName("CopyFeaturedLink") ~= nil)
+	truthy("and a setup button", harness.byName("FeaturedSetup") ~= nil)
+
+	-- The preset behind it resolves and carries its own docs address, which the
+	-- editor renders the same way.
+	local catalog = handle.env.require("provider/catalog")
+	local preset = catalog.get("hcnsec")
+	check("the preset exists", preset ~= nil and true or false, true)
+	check("pointing at the api host", preset.baseUrl, "https://api.hcnsec.cn/v1")
+	check("with the sign-up page as its docs", preset.docs, "https://api.hcnsec.cn/sign-up?aff=drd9")
+	check("and marked featured", preset.featured, true)
+
+	-- OpenCode Zen remains featured alongside HCNSEC and AgentRouter.
+	local zen = catalog.get("zen")
+	check("OpenCode Zen is featured too", zen and zen.featured, true)
+	check("pointing at the Zen relay", zen.baseUrl, "https://opencode.ai/zen/v1")
+
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+-- 47. ask_user, custom instructions, copy prompt --------------------------------
+
+-- The ask tool end to end: the model calls it mid-turn, a modal reaches the surface
+-- it is rendered from, an option press resolves the waiting call, and the answer
+-- travels back as that call's tool result so the next request carries it. A dismissed
+-- question is the other path, and a subagent is refused in words rather than left to
+-- discover there is nobody to ask.
+scenario("ask_user asks, waits and answers", function()
+	local step = 0
+	local harness, handle = bootWith({
+		handler = function(entry)
+			if not tostring(entry.url):find("/chat/completions") then return { StatusCode = 404, Body = "{}" } end
+			step = step + 1
+			if step == 1 then
+				return { StatusCode = 200, Body = chatBody({
+					toolCalls = { toolCall("q1", "ask_user", {
+						question = "Which base do you want rebuilt?",
+						options = { "The skybase", "The one near spawn" },
+					}) },
+				}) }
+			end
+			return { StatusCode = 200, Body = chatBody({ content = "Rebuilding the skybase." }) }
+		end,
+	})
+	handle.config.set("permissions.mode", "full")
+
+	local session = handle.sessions.current()
+	session.send("rebuild my base")
+	harness.settle(4)
+
+	-- The modal is up and the turn is parked on it.
+	contains("the question reached the screen", harness.textOf(), "Which base do you want rebuilt?")
+	contains("with its options as rows", harness.textOf(), "The one near spawn")
+	check("and the turn is waiting", session.busy, true)
+
+	-- Answering through an option row resolves the call.
+	local picked = harness.byName("AskOption1")
+	truthy("the first option is a control", picked ~= nil, harness.dump())
+	harness.click(picked)
+	harness.settle(8)
+
+	local toolResults = {}
+	for _, message in ipairs(session.ctx.messages) do
+		if message.role == "tool" then toolResults[#toolResults + 1] = message end
+	end
+	check("one tool result came back", #toolResults, 1)
+	contains("carrying the answer as the call's result", toolResults[1].content, "The skybase")
+	contains("labelled as the user's answer", toolResults[1].content, "The user answered")
+	check("so the model could finish the turn",
+		session.ctx.messages[#session.ctx.messages].content, "Rebuilding the skybase.")
+	check("and the turn ended", session.busy, false)
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+scenario("a dismissed or typed ask is reported, and a subagent cannot ask", function()
+	local asked = 0
+	local harness, handle = bootWith({
+		handler = function(entry)
+			if not tostring(entry.url):find("/chat/completions") then return { StatusCode = 404, Body = "{}" } end
+			-- The first request of a turn is the one whose last message is the user's:
+			-- keyed on that rather than on a running count, because the count spans
+			-- turns and the second ask would never fire.
+			local body = json.decode(entry.body)
+			local last = body.messages[#body.messages]
+			if last.role == "user" then
+				asked = asked + 1
+				return { StatusCode = 200, Body = chatBody({
+					toolCalls = { toolCall("q" .. tostring(asked), "ask_user", { question = "Open question?" }) },
+				}) }
+			end
+			return { StatusCode = 200, Body = chatBody({ content = "Carrying on with my best reading." }) }
+		end,
+	})
+	handle.config.set("permissions.mode", "full")
+
+	local session = handle.sessions.current()
+	session.send("something ambiguous")
+	harness.settle(4)
+
+	-- No options, so the field is the only answer, and typing one submits it.
+	local shell = harness.byName("AskField")
+	truthy("an open question still has a field", shell ~= nil, harness.dump())
+	local fieldBox = shell and shell:FindFirstChildOfClass("TextBox")
+	truthy("with a text box in it", fieldBox ~= nil)
+	harness.type(fieldBox, "the one by the docks")
+	harness.settle(8)
+	local toolResults = {}
+	for _, message in ipairs(session.ctx.messages) do
+		if message.role == "tool" then toolResults[#toolResults + 1] = message end
+	end
+	contains("a typed answer travels back", toolResults[1].content, "the one by the docks")
+
+	-- A dismissal is a fact the model can work with, not an error.
+	session.send("another ambiguous thing")
+	harness.settle(4)
+	local dismiss = harness.byName("AskDismiss")
+	truthy("the dismissal control is there", dismiss ~= nil)
+	harness.click(dismiss)
+	harness.settle(8)
+	local dismissed
+	for _, message in ipairs(session.ctx.messages) do
+		if message.role == "tool" then dismissed = message.content end
+	end
+	contains("a dismissal says so", dismissed or "", "dismissed the question")
+
+	-- And the headless refusal, checked directly rather than through a dispatch: the
+	-- words are what the next dispatch reads.
+	local headless = handle.sessions.create({ headless = true })
+	local outcome = handle.tools.dispatch({ id = "h", ["function"] = {
+		name = "ask_user",
+		arguments = json.encode({ question = "anyone there?" }),
+	} }, headless.toolContext())
+	check("a subagent's ask fails", outcome.ok, false)
+	contains("with the reason in words", outcome.text, "no user to ask")
+
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+-- The custom instructions block: a textarea in the Behaviour pane, read back
+-- verbatim into the system prompt after the built-in rules, and only then -- a
+-- user who writes "always answer in Spanish" has beaten the style block, which is
+-- the point of having the block at all.
+scenario("custom instructions reach the system prompt", function()
+	local sent = {}
+	local harness, handle = bootWith({
+		handler = function(entry)
+			if not tostring(entry.url):find("/chat/completions") then
+				return { StatusCode = 404, Body = "{}" }
+			end
+			sent[#sent + 1] = json.decode(entry.body)
+			return { StatusCode = 200, Body = chatBody({ content = "Fine." }) }
+		end,
+	})
+
+	handle.config.set("permissions.mode", "auto")
+	handle.sessions.current().send("hello")
+	harness.settle(6)
+	falsy("without instructions the prompt has no block",
+		tostring(sent[1].messages[1].content):find("Your user's instructions", 1, true) ~= nil)
+
+	-- The pane renders the textarea, and blurring it writes the config path.
+	handle.show("settings")
+	harness.settle(2)
+	local box = harness.byName("CustomInstructions")
+	truthy("the textarea is in the Behaviour pane", box ~= nil, harness.dump())
+	local field = box and box:FindFirstChildOfClass("TextBox")
+	truthy("with a text box", field ~= nil)
+	harness.type(field, "Always answer in Spanish. Keep it short.")
+	check("and the value was written", handle.config.get("agent.customInstructions"),
+		"Always answer in Spanish. Keep it short.")
+
+	handle.sessions.current().send("hello again")
+	harness.settle(6)
+	local promptText = tostring(sent[#sent].messages[1].content)
+	contains("the block is in the prompt", promptText, "Your user's instructions")
+	contains("carrying the text verbatim", promptText, "Always answer in Spanish. Keep it short.")
+	truthy("after the built-in rules, so it wins",
+		promptText:find("Style:", 1, true) ~= nil
+			and promptText:find("Style:", 1, true) < promptText:find("Your user's instructions", 1, true))
+
+	-- The copy action puts the same assembled prompt on the clipboard.
+	local copy = harness.byName("CopySystemPrompt")
+	truthy("the copy control is beside it", copy ~= nil)
+	harness.click(copy)
+	harness.settle(1)
+	contains("and the clipboard holds the assembled prompt",
+		tostring(harness.sandbox.__clipboard), "You are UAI")
+	contains("including the custom block", tostring(harness.sandbox.__clipboard), "Always answer in Spanish")
+
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+	check("no property type errors", #harness.instanceState.typeErrors, 0,
+		table.concat(harness.instanceState.typeErrors, "\n"))
+end)
+
+-- 48. Long pastes, cross-conversation search, subagent brief ------------------
+
+-- A pasted script is reference material, not a message. Over the cap it becomes a
+-- file under pastes/ and the conversation carries the user's words plus a pointer,
+-- so the model reads it with file_read instead of drowning the turn's context.
+scenario("a long paste becomes a file, not a wall of context", function()
+	local sent = {}
+	local harness, handle = bootWith({
+		handler = function(entry)
+			if not tostring(entry.url):find("/chat/completions") then
+				return { StatusCode = 404, Body = "{}" }
+			end
+			sent[#sent + 1] = json.decode(entry.body)
+			return { StatusCode = 200, Body = chatBody({ content = "Got the reference." }) }
+		end,
+	})
+
+	-- A short message is untouched.
+	handle.sessions.current().send("quick one")
+	harness.settle(6)
+	check("a short message goes whole", sent[1].messages[2].content, "quick one")
+
+	-- A long one: the script ends up on disk, the conversation carries a pointer,
+	-- and the file tools can read it back by the name the pointer gave.
+	local script = "-- a big pasted script\n"
+	for index = 1, 900 do
+		script = script .. "local value" .. tostring(index) .. " = " .. tostring(index) .. "\n"
+	end
+	local long = "what is wrong with this script?\n\n" .. script
+	handle.sessions.current().send(long)
+	harness.settle(6)
+
+	local carried = tostring(sent[2].messages[#sent[2].messages].content)
+	contains("the conversation says where it went", carried, "[Attached file:")
+	contains("naming the file", carried, "pastes/")
+	falsy("the reference has no source preview", carried:find("what is wrong with this script?", 1, true) ~= nil)
+	falsy("and does not carry the whole script",
+		carried:find("local value500", 1, true) ~= nil)
+
+	local savedOne = false
+	for path in pairs(harness.files) do
+		if path:find("^UAI/pastes/") and path:find("%.txt$") then savedOne = true end
+	end
+	truthy("the paste is on disk", savedOne)
+
+	local context = handle.sessions.current().toolContext()
+	local read = handle.tools.dispatch({ id = "r", ["function"] = {
+		name = "file_read",
+		arguments = (function()
+			local name
+			for path in pairs(harness.files) do
+				if path:find("^UAI/pastes/") and path:find("%.txt$") then
+					name = path:gsub("^UAI/pastes/", "")
+					break
+				end
+			end
+			return json.encode({ path = name, limit = 20000 })
+		end)(),
+	} }, context)
+	truthy("file_read finds it by bare name", read.ok, read.text)
+	-- The result the model receives is itself capped by agent.resultCap, so the
+	-- assertion is on a line inside that window rather than one deep in the file:
+	-- the point is that the whole body is reachable, and the file reports its full
+	-- size on the first line.
+	contains("with the body", read.text, "local value50")
+	contains("and its true size stated", read.text, "of " .. tostring(#long) .. ";")
+
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+-- The other conversations are the user's own history: "like last time" is a fact
+-- the agent can look up rather than ask about.
+scenario("conversation_search reads other threads", function()
+	local harness, handle = bootWith({
+		handler = function()
+			return { StatusCode = 200, Body = chatBody({ content = "Noted." }) }
+		end,
+	})
+
+	local first = handle.sessions.current()
+	first.rename("The raft job")
+	first.send("the raft spawns at the wrong place, fix the SpawnLocation")
+	harness.settle(6)
+
+	handle.app.openSession(handle.sessions.newThread().id)
+	local second = handle.sessions.current()
+	second.send("remember the raft fix from before?")
+	harness.settle(6)
+
+	local context = second.toolContext()
+	local found = handle.tools.dispatch({ id = "s", ["function"] = {
+		name = "conversation_search",
+		arguments = json.encode({ query = "raft" }),
+	} }, context)
+	truthy("the search succeeds", found.ok, found.text)
+	contains("and finds the older conversation", found.text, "The raft job")
+	contains("with the line that matched", found.text, "SpawnLocation")
+	falsy("but not the conversation it ran from", found.text:find("remember the raft fix", 1, true) ~= nil)
+
+	local none = handle.tools.dispatch({ id = "n", ["function"] = {
+		name = "conversation_search",
+		arguments = json.encode({ query = "quantum submarine" }),
+	} }, context)
+	truthy("a miss is reported, not an error", none.ok, none.text)
+	contains("saying nothing was found", none.text, "No other conversation or paste")
+
+	local listed = handle.tools.dispatch({ id = "l", ["function"] = {
+		name = "conversation_list",
+		arguments = json.encode({}),
+	} }, context)
+	truthy("listing other conversations succeeds", listed.ok, listed.text)
+	contains("the list names the older thread", listed.text, "The raft job")
+	contains("and marks the current one", listed.text, "(this conversation)")
+	contains("the list previews the opening request", listed.text, "raft spawns at the wrong place")
+
+	local readBack = handle.tools.dispatch({ id = "r", ["function"] = {
+		name = "conversation_read",
+		arguments = json.encode({ id = first.id }),
+	} }, context)
+	truthy("reading a thread by id succeeds", readBack.ok, readBack.text)
+	contains("the transcript carries the matching line", readBack.text, "SpawnLocation")
+	contains("labelled with the conversation it came from", readBack.text, "The raft job")
+	contains("the review is condensed by default", readBack.text, "condensed")
+
+	local fullRead = handle.tools.dispatch({ id = "rf", ["function"] = {
+		name = "conversation_read",
+		arguments = json.encode({ id = first.id, full = true }),
+	} }, context)
+	truthy("a verbatim read succeeds", fullRead.ok, fullRead.text)
+	contains("the verbatim read is labelled full", fullRead.text, "(full)")
+
+	local missing = handle.tools.dispatch({ id = "m", ["function"] = {
+		name = "conversation_read",
+		arguments = json.encode({ id = "s_not_a_real_id" }),
+	} }, context)
+	falsy("an unknown id is a clean failure, not a crash", missing.ok)
+end)
+
+-- The conversation list is read by a person, and a title taken from the opening
+-- message goes stale once the thread moves on. The agent may name its own
+-- conversation; it must never touch a name the user typed.
+scenario("the agent names its own conversation, never the user's", function()
+	local sent = {}
+	local harness, handle = bootWith({
+		handler = function(entry)
+			if not tostring(entry.url):find("/chat/completions") then
+				return { StatusCode = 404, Body = "{}" }
+			end
+			sent[#sent + 1] = json.decode(entry.body)
+			return { StatusCode = 200, Body = chatBody({ content = "Noted." }) }
+		end,
+	})
+	local current = handle.sessions.current()
+	local context = current.toolContext()
+
+	local renamed = handle.tools.dispatch({ id = "r1", ["function"] = {
+		name = "conversation_rename",
+		arguments = json.encode({ title = "Raft spawn fix" }),
+	} }, context)
+	truthy("the agent can name its own conversation", renamed.ok, renamed.text)
+	check("and the title is applied", current.title, "Raft spawn fix")
+	falsy("without counting as the user's own name", current.named == true)
+
+	local function offered()
+		for _, definition in ipairs(sent[#sent].tools or {}) do
+			if definition["function"] and definition["function"].name == "conversation_rename" then return true end
+		end
+		return false
+	end
+	current.send("carry on")
+	harness.settle(6)
+	truthy("an unnamed conversation is offered the rename tool", offered())
+
+	current.rename("My raft notes")
+	current.send("and again")
+	harness.settle(6)
+	falsy("a user-named conversation is not offered it", offered())
+
+	local refused = handle.tools.dispatch({ id = "r2", ["function"] = {
+		name = "conversation_rename",
+		arguments = json.encode({ title = "Something else" }),
+	} }, context)
+	falsy("and a direct call to rename it is refused", refused.ok)
+	check("with the user's title untouched", current.title, "My raft notes")
+
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+-- The subagent's own catalogue must not contain ask_user, and its brief has to say
+-- what it is: a delegated worker nobody can answer.
+scenario("a subagent has no ask tool and knows what it is", function()
+	local harness, handle = bootWith({
+		handler = function()
+			return { StatusCode = 200, Body = chatBody({ content = "Done." }) }
+		end,
+	})
+	handle.config.set("permissions.mode", "full")
+
+	local child = handle.env.require("agent/subagent")
+	-- A dispatch whose child session we can inspect directly. The dispatch returns
+	-- its report, so the session is read from the register it keeps.
+	local dispatched = child.dispatch({
+		task = "inspect nothing",
+		preset = "full",
+		turns = 1,
+	})
+	harness.settle(4)
+	truthy("the dispatch came back", dispatched ~= nil)
+
+	local register = child.list()
+	local session = register[1] and register[1].session or nil
+	truthy("the child exists", session ~= nil)
+	if session then
+		local definitions = handle.tools.definitions({
+			only = session.toolFilter,
+			groups = session.toolGroups,
+			exclude = session.toolExclude,
+		})
+		local names = {}
+		for _, definition in ipairs(definitions) do
+			names[definition["function"].name] = true
+		end
+		falsy("the child is not offered ask_user", names["ask_user"] ~= nil)
+		falsy("and has no conversation of its own to name", names["conversation_rename"] ~= nil)
+		-- The main conversation still is, which is what makes it an exclusion and
+		-- not the tool having vanished everywhere.
+		local main = handle.tools.definitions({})
+		local mainNames = {}
+		for _, definition in ipairs(main) do
+			mainNames[definition["function"].name] = true
+		end
+		truthy("while the main conversation keeps it", mainNames["ask_user"] ~= nil)
+		truthy("and can rename itself", mainNames["conversation_rename"] ~= nil)
+	end
+
+	-- The brief states the identity and the no-asking rule in words.
+	local brief = handle.env.require("agent/prompt").subagent("a task", {})
+	contains("it says what it is", brief, "subagent of UAI")
+	contains("and that nobody can answer it", brief, "no user to ask")
+	contains("with what to do instead", brief, "state both readings")
+	contains("and where dumped files belong", brief, "dump/ subfolder")
+
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+-- The prompt blocks: denial handling, the date, and ask-early are all in the
+-- assembled prompt the next request carries.
+scenario("the system prompt teaches denials, dates and asking early", function()
+	local sent = {}
+	local harness, handle = bootWith({
+		handler = function(entry)
+			if not tostring(entry.url):find("/chat/completions") then
+				return { StatusCode = 404, Body = "{}" }
+			end
+			sent[#sent + 1] = json.decode(entry.body)
+			return { StatusCode = 200, Body = chatBody({ content = "Fine." }) }
+		end,
+	})
+	handle.config.set("permissions.mode", "auto")
+	handle.sessions.current().send("hello")
+	harness.settle(6)
+
+	local promptText = tostring(sent[1].messages[1].content)
+	contains("a denial is the user's answer", promptText, "the user's answer")
+	contains("which must not be retried", promptText, "Do not repeat the call")
+	contains("asking early beats asking late", promptText, "Ask early, not after")
+	-- The date comes from the real clock rather than the mock's virtual one, so the
+	-- assertion is on the shape of the line rather than a fixed date.
+	truthy("the date is stated", promptText:find("Date: %d%d%d%d%-%d%d%-%d%d %d%d:%d%d UTC") ~= nil,
+		"no Date line in the prompt")
+	contains("and quotes must be exact", (promptText:gsub("\n%s+", " ")), "character for character")
+	-- The per-game workspace layout: authored scripts in the game folder root,
+	-- dumps in its dump/ subfolder, and the whole thing a default rather than a fence.
+	contains("game work has a per-place home", promptText, "Organise the workspace by game")
+	contains("dumps are kept apart from authored code", promptText, "dump/ subfolder")
+	contains("the layout does not fence the agent in", promptText, "default, not a fence")
+
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+-- 49. Migration, sweeps, answers, inherited instructions ---------------------
+
+-- A returning user's older files sat at the app root; after the workspace split the
+-- tools no longer saw them. The migration moves them into files/ once, leaves the
+-- client's own state alone, and is idempotent.
+scenario("legacy files migrate into the workspace", function()
+	local harness, handle = bootWith({ provider = false })
+	local fsx = handle.env.require("runtime/fsx")
+
+	-- The pre-split state, planted by hand: agent files at the root, one in a folder
+	-- the agent made, and the client's own files beside them.
+	fsx.write("old-notes.txt", "kept note")
+	fsx.write("builds/raft.lua", "local raft = true")
+	fsx.write("config.json", "{\"fake\":true}")
+	fsx.write("my_skill.md", "# My Skill", { scope = "skills" })
+	fsx.write("icons/spark.png", "fake icon")
+	fsx.write("skills/displaced.md", "# Recovered Skill", { scope = "files" })
+
+	local moved = fsx.migrate()
+	check("two agent files moved", moved, 2)
+	truthy("the root note moved", harness.files["UAI/files/old-notes.txt"] == "kept note")
+	truthy("and the folder's file moved", harness.files["UAI/files/builds/raft.lua"] == "local raft = true")
+	falsy("the root copy is gone", harness.files["UAI/old-notes.txt"] ~= nil)
+	falsy("config.json was left alone", harness.files["UAI/config.json"] == nil)
+	truthy("skills folder was left alone", harness.files["UAI/skills/my_skill.md"] == "# My Skill")
+	falsy("skills was not moved to files/", harness.files["UAI/files/skills/my_skill.md"] ~= nil)
+	truthy("icons folder was left alone", harness.files["UAI/icons/spark.png"] == "fake icon")
+	truthy("displaced skill was recovered", harness.files["UAI/skills/displaced.md"] == "# Recovered Skill")
+	falsy("displaced skill file removed from files/", harness.files["UAI/files/skills/displaced.md"] ~= nil)
+
+	-- Idempotent: the second sweep finds nothing to move.
+	local again = fsx.migrate()
+	check("a second sweep moves nothing", again, 0)
+
+	-- And the tools see the migrated files.
+	handle.config.set("permissions.mode", "full")
+	local listed = handle.tools.dispatch({ id = "l", ["function"] = {
+		name = "file_list", arguments = json.encode({}),
+	} }, handle.sessions.current().toolContext())
+	contains("including the migrated note", listed.text, "old-notes.txt")
+	contains("and the folder", listed.text, "builds/")
+
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+-- Stopping a turn mid-ask closes the question: answering a dead turn is answering
+-- nobody, and the modal left up was exactly that.
+scenario("stopping a turn closes its question", function()
+	local step = 0
+	local harness, handle = bootWith({
+		handler = function(entry)
+			if not tostring(entry.url):find("/chat/completions") then return { StatusCode = 404, Body = "{}" } end
+			step = step + 1
+			if step == 1 then
+				return { StatusCode = 200, Body = chatBody({
+					toolCalls = { toolCall("q1", "ask_user", { question = "Which one?" }) },
+				}) }
+			end
+			return { StatusCode = 200, Body = chatBody({ content = "Carrying on." }) }
+		end,
+	})
+	handle.config.set("permissions.mode", "full")
+
+	local session = handle.sessions.current()
+	session.send("do the ambiguous thing")
+	harness.settle(4)
+	truthy("the question is up", harness.byName("AskSend") ~= nil)
+
+	session.abort()
+	harness.settle(4)
+	check("the turn stopped", session.busy, false)
+	check("and the modal went with it", harness.byName("AskSend"), nil)
+
+	local told
+	for _, message in ipairs(session.ctx.messages) do
+		if message.role == "tool" then told = message.content end
+	end
+	truthy("the model was told the turn stopped rather than left waiting", told ~= nil)
+
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+-- An ask's answer is the user's own words. Opening activity shows that attribution
+-- in its compact row without needing to expand the raw tool details.
+scenario("an answered question reads as answered", function()
+	local step = 0
+	local harness, handle = bootWith({
+		handler = function(entry)
+			if not tostring(entry.url):find("/chat/completions") then return { StatusCode = 404, Body = "{}" } end
+			step = step + 1
+			if step == 1 then
+				return { StatusCode = 200, Body = chatBody({
+					toolCalls = { toolCall("q1", "ask_user", {
+						question = "Which base?",
+						options = { "The skybase", "The one near spawn" },
+					}) },
+				}) }
+			end
+			return { StatusCode = 200, Body = chatBody({ content = "Rebuilding." }) }
+		end,
+	})
+	handle.config.set("permissions.mode", "full")
+
+	handle.sessions.current().send("rebuild")
+	harness.settle(4)
+	harness.click(harness.byName("AskOption1"))
+	harness.settle(8)
+
+	local row = harness.byName("Tool")
+	harness.click(harness.byName("RunHeader"))
+	check("the answer needs no raw tool details", harness.byName("Detail", row).Visible, false)
+	local shown = harness.byName("ToolSummary", row).Text
+	contains("the row says who answered", shown, "You answered")
+	contains("with the answer itself", shown, "The skybase")
+
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+	check("no property type errors", #harness.instanceState.typeErrors, 0,
+		table.concat(harness.instanceState.typeErrors, "\n"))
+end)
+
+-- A subagent reports to the parent, not the user -- but the user's standing
+-- instructions are context about the work, and a report written without them is a
+-- report written for someone else.
+scenario("subagents inherit the user's standing instructions", function()
+	local harness, handle = bootWith({ provider = false })
+	local prompt = handle.env.require("agent/prompt")
+
+	local bare = prompt.subagent("a task", {})
+	falsy("without instructions there is no block",
+		bare:find("standing instructions", 1, true) ~= nil)
+
+	handle.config.set("agent.customInstructions", "I only build obby games.")
+	local with = prompt.subagent("a task", {})
+	contains("the brief carries them", with, "standing instructions")
+	contains("verbatim", with, "I only build obby games.")
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+-- A paste is a thing the user said, in a file -- "that script I sent you" should
+-- find it.
+scenario("conversation_search also scans pastes", function()
+	local harness, handle = bootWith({ provider = false })
+	local fsx = handle.env.require("runtime/fsx")
+	handle.config.set("permissions.mode", "full")
+
+	fsx.write("the-gui-script.txt", "local ScreenGui = Instance.new('ScreenGui')",
+		{ scope = "pastes" })
+
+	local found = handle.tools.dispatch({ id = "p", ["function"] = {
+		name = "conversation_search",
+		arguments = json.encode({ query = "ScreenGui" }),
+	} }, handle.sessions.current().toolContext())
+	truthy("the search succeeds", found.ok, found.text)
+	contains("and finds the paste", found.text, "pastes/")
+	contains("with the line that matched", found.text, "Instance.new")
+end)
+
+-- Multi-key rotation --------------------------------------------------------
+
+-- What this locks in: a record carrying several keys rotates on a 429 without
+-- sleeping, the benched key is skipped afterwards, and a single-key record
+-- never rotates (the pool is what makes the retry free). The harness answers
+-- 429 to whichever key arrives first and 200 afterwards, so the number of
+-- requests is the observable: one rotation, then success.
+scenario("a key pool rotates on a rate limit without delay", function()
+	local seenKeys = {}
+	local handler = function(spec)
+		local auth = spec.headers and (spec.headers["Authorization"] or spec.headers["x-api-key"]) or ""
+		seenKeys[#seenKeys + 1] = auth
+		if #seenKeys == 1 then
+			return { StatusCode = 429, Body = json.encode({ error = { message = "rate limit exceeded" } }) }
+		end
+		return { StatusCode = 200, Body = chatBody({ content = "rotated" }) }
+	end
+
+	local harness, handle = bootWith({ handler = handler })
+	local registry = handle.providers
+	local record = registry.active()
+	record.apiKey = "key-one\nkey-two\nkey-three"
+
+	local calls = {}
+	local result = handle.env.require("provider/openai").complete(record, {
+		messages = { { role = "user", content = "hi" } },
+		stream = false,
+		onRetry = function(info) calls[#calls + 1] = info end,
+	})
+
+	truthy("the completion succeeds after rotating", result ~= nil)
+	check("two keys were tried", #seenKeys, 2)
+	falsy("the first key is benched, not repeated", seenKeys[2] == seenKeys[1])
+	contains("the rotation was reported", #calls > 0 and calls[1].reason or "", "rotating to key")
+	contains("with no wait", #calls > 0 and tostring(calls[1].wait) or "", "0")
+
+	-- The benched key is skipped on the next completion too: its cooldown is
+	-- 30s and the virtual clock has not moved that far.
+	local nextKey = registry.nextKey(record)
+	check("the cooled key is not selected again", nextKey, "key-two")
+end)
+
+scenario("quota wording in a 200-body style refusal also rotates", function()
+	local seenKeys = {}
+	local handler = function(spec)
+		local auth = spec.headers and (spec.headers["Authorization"] or spec.headers["x-api-key"]) or ""
+		seenKeys[#seenKeys + 1] = auth
+		if #seenKeys == 1 then
+			return { StatusCode = 403, Body = json.encode({
+				error = { code = 429, message = "RESOURCE_EXHAUSTED: quota exceeded" },
+			}) }
+		end
+		return { StatusCode = 200, Body = chatBody({ content = "rotated" }) }
+	end
+
+	local harness, handle = bootWith({ handler = handler })
+	local record = handle.providers.active()
+	record.apiKey = "alpha-key\nbeta-key"
+
+	local result = handle.env.require("provider/openai").complete(record, {
+		messages = { { role = "user", content = "hi" } },
+		stream = false,
+	})
+	truthy("a RESOURCE_EXHAUSTED 403 rotates to the next key", result ~= nil)
+	check("two keys were tried", #seenKeys, 2)
+end)
+
+scenario("a single key is never rotated", function()
+	local seenKeys = {}
+	local handler = function(spec)
+		local auth = spec.headers and (spec.headers["Authorization"] or spec.headers["x-api-key"]) or ""
+		seenKeys[#seenKeys + 1] = auth
+		return { StatusCode = 429, Body = json.encode({ error = { message = "rate limit" } }) }
+	end
+
+	local harness, handle = bootWith({ handler = handler })
+	local record = handle.providers.active()
+	record.apiKey = "one-key-only"
+
+	local result = handle.env.require("provider/openai").complete(record, {
+		messages = { { role = "user", content = "hi" } },
+		stream = false,
+		attempts = 1,
+	})
+	falsy("a single-key pool has nothing to rotate to", result ~= nil)
+	-- The 429 may still be retried by the transport layer, but every attempt
+	-- carries the same key.
+	for index = 1, #seenKeys do
+		check("attempt " .. index .. " carried the only key", seenKeys[index], "Bearer one-key-only")
+	end
+end)
+
+scenario("the key pool parser splits on lines, commas and whitespace", function()
+	local harness, handle = bootWith({ provider = false })
+	local registry = handle.providers
+	local record = registry.blank("custom")
+	record.apiKey = "alpha\nbeta,  gamma\r\n\r\ndelta"
+	local keys = registry.keysOf(record)
+	check("four keys parsed", #keys, 4)
+	check("in order", table.concat(keys, ","), "alpha,beta,gamma,delta")
+
+	record.apiKey = "alpha\nalpha\nalpha"
+	check("duplicates collapse", #registry.keysOf(record), 1)
+
+	record.apiKey = ""
+	check("empty means no pool", #registry.keysOf(record), 0)
+
+	record.apiKey = "one-key"
+	check("a single key is a pool of one", #registry.keysOf(record), 1)
+
+	-- authHeaders binds whichever key it is handed, or the record's own when
+	-- nothing is passed -- the pre-pool behaviour, unchanged.
+	record.apiKey = "the-record-key"
+	local headers = registry.authHeaders(record)
+	check("default binding is the record key", headers.Authorization, "Bearer the-record-key")
+	headers = registry.authHeaders(record, "an-explicit-key")
+	check("an explicit key overrides", headers.Authorization, "Bearer an-explicit-key")
+end)
+
+-- IY plugin store -------------------------------------------------------------
+
+-- What this locks in: the store tools register, search hits the real catalogue
+-- shape, and install refuses cleanly when IY is not available rather than
+-- fetching a file nothing can load.
+scenario("iy plugin store tools register and search a catalogue", function()
+	local harness, handle = bootWith({ provider = false })
+	local registry = handle.tools
+
+	local search = registry.get("iy_plugin_search")
+	truthy("iy_plugin_search is registered", search ~= nil)
+	check("iy_plugin_search group", search and search.group, "iy")
+	check("iy_plugin_search risk", search and search.risk, "read")
+
+	local install = registry.get("iy_plugin_install")
+	truthy("iy_plugin_install is registered", install ~= nil)
+	check("iy_plugin_install risk", install and install.risk, "write")
+
+	local remove = registry.get("iy_plugin_uninstall")
+	truthy("iy_plugin_uninstall is registered", remove ~= nil)
+	check("iy_plugin_uninstall risk", remove and remove.risk, "write")
+
+	local store = handle.env.require("runtime/iy_store")
+	-- A catalogue injected straight into the cache, in the shape the live site
+	-- returns: plugins[].files[] with is_plugin, plus non-plugin media entries
+	-- that must be skipped.
+	store.catalog = {
+		plugins = {
+			{
+				id = "1", name = "dexrecontinued", author = "Agent",
+				files = {
+					{ filename = "shot.png", url = "plugins/1/shot.png", size = 100, is_plugin = false },
+					{ filename = "dexrecontinued.iy", url = "plugins/1/dexrecontinued.iy", size = 613, is_plugin = true },
+				},
+			},
+			{ id = "2", name = "IYfix", author = "Agent",
+				files = { { filename = "IYfix.iy", url = "plugins/2/IYfix.iy", size = 584, is_plugin = true } } },
+			{ id = "3", name = "BetterESP", author = "Other",
+				files = { { filename = "BetterESP.iy", url = "plugins/3/BetterESP.iy", size = 900, is_plugin = true } } },
+		},
+	}
+	store.catalogAt = handle.env.require("runtime/clock").ms()
+
+	local results, err = store.search("dex", 10)
+	truthy("the search matches by name", results ~= nil and #results == 1, tostring(err))
+	check("the .iy file is picked, not the png", results[1].file.name, "dexrecontinued.iy")
+	check("the author is carried", results[1].author, "Agent")
+
+	-- Author match scores below name match, but still matches.
+	local byAuthor = store.search("agent", 10)
+	truthy("the search matches by author", byAuthor ~= nil and #byAuthor >= 2)
+
+	-- Empty query matches everything, capped.
+	local all = store.search("", 2)
+	check("an empty query is capped at the limit", #all, 2)
+
+	local none = store.search("nothing-matches-this", 10)
+	check("a miss is empty, not an error", type(none) == "table" and #none, 0)
+
+	-- Install without IY available: mode off, so ensure() refuses and nothing
+	-- is fetched.
+	handle.config.set("iy.mode", "off")
+	handle.env.require("runtime/iy").mode = "off"
+	local ok, why = store.install("dexrecontinued")
+	falsy("install without IY refuses", ok)
+	contains("and says it is the setting", tostring(why), "Settings")
+
+	local unok, unwhy = store.uninstall("dexrecontinued")
+	falsy("uninstall without IY refuses", unok)
+	contains("and says it is the setting", tostring(unwhy), "Settings")
+end)
+
+-- Markdown skills -------------------------------------------------------------
+
+-- What this locks in: the two access paths converge on one engine. A file
+-- dropped into skills/ is listed, described and readable; a skill the agent
+-- writes carries a header the catalogue can parse back; the toggle gates the
+-- read without touching the file; the index block carries names and
+-- descriptions only -- never a body, which is the token contract the engine
+-- exists to keep.
+scenario("markdown skills: drop, list, read, toggle", function()
+	local harness, handle = bootWith({ provider = false })
+	local fsx = handle.env.require("runtime/fsx")
+	local skills = handle.env.require("runtime/skills")
+
+	-- The file-drop path: a user writes this by hand, frontmatter and body.
+	fsx.ensure("skills")
+	local ok = fsx.write("ponytail.md", table.concat({
+		"---",
+		"name: Ponytail",
+		"description: Senior developer mindset. Prevents over-engineering.",
+		"---",
+		"",
+		"Prefer the one-liner. Use platform built-ins.",
+		"",
+		"## Rules",
+		"",
+		"- No new dependencies without a fight",
+		"- The boring solution first",
+	}, "\n"), { scope = "skills" })
+	truthy("the file lands in skills/", ok)
+
+	local list = skills.list()
+	check("one skill listed", #list, 1)
+	check("the name comes from the header", list[1].name, "Ponytail")
+	check("the description comes from the header",
+		list[1].description, "Senior developer mindset. Prevents over-engineering.")
+	check("on by default", list[1].enabled, true)
+
+	local body = skills.read("Ponytail")
+	truthy("read by name", body ~= nil)
+	contains("the body is returned", body, "Prefer the one-liner")
+	contains("with its structure", body, "The boring solution first")
+	local strayHeader = body:find("description:", 1, true)
+	falsy("the frontmatter is stripped from the body", strayHeader ~= nil)
+
+	local byFile = skills.read("ponytail.md")
+	contains("read by filename too", byFile, "Prefer the one-liner")
+
+	-- A file with no frontmatter at all is still a skill: the filename is the
+	-- name and the whole text is the body.
+	fsx.write("headerless.md", "Just a rule: always yield in loops.", { scope = "skills" })
+	local bare = skills.list()
+	check("two skills now", #bare, 2)
+	local found = skills.find("headerless")
+	truthy("findable by filename", found ~= nil)
+	check("the filename is the fallback name", found and found.name, "headerless")
+	local bareBody = skills.read("headerless")
+	contains("a headerless file reads whole", bareBody, "always yield in loops")
+
+	-- The toggle: gates the read, leaves the file alone.
+	skills.setEnabled("ponytail.md", false)
+	local refused, refuseWhy = skills.read("Ponytail")
+	falsy("a switched-off skill is refused", refused)
+	contains("and says so", tostring(refuseWhy), "switched off")
+	local stillThere = fsx.read("ponytail.md", { scope = "skills" })
+	contains("the file itself is untouched", stillThere, "Prefer the one-liner")
+
+	-- And the index block -- the token contract. Names and descriptions only,
+	-- checked while the skill is off so its absence is proven, then on so its
+	-- return is.
+	local indexOff = skills.indexBlock()
+	falsy("the index omits a switched-off skill", indexOff ~= nil and indexOff:find("Ponytail", 1, true) ~= nil)
+	skills.setEnabled("ponytail.md", true)
+	local index = skills.indexBlock()
+	contains("the index names the skill", index, "Ponytail")
+	contains("with its description", index, "Prevents over-engineering")
+	local bodyLeak = index:find("one-liner", 1, true)
+	falsy("the index never carries a body", bodyLeak)
+end)
+
+scenario("skills_write builds a readable skill and skills_delete removes it", function()
+	local harness, handle = bootWith({ provider = false })
+	local skills = handle.env.require("runtime/skills")
+	local fsx = handle.env.require("runtime/fsx")
+
+	local ok, file = skills.save("RemoteHooking",
+		"How to hook remotes safely for this client.",
+		"1. Inspect first with remotes_list\n2. Hook one at a time\n3. Always restore")
+	truthy("the save succeeds", ok, file)
+	check("the filename is derived", file, "RemoteHooking.md")
+
+	-- What was written parses back: the catalogue can describe it and the read
+	-- returns the body without the header the engine added.
+	local list = skills.list()
+	check("the written skill is listed", #list, 1)
+	check("with its description", list[1].description, "How to hook remotes safely for this client.")
+	local body = skills.read("RemoteHooking")
+	contains("the body round-trips", body, "Hook one at a time")
+	local headerLeak = body:find("description:", 1, true)
+	falsy("the generated frontmatter is stripped on read", headerLeak ~= nil)
+
+	local del = skills.remove("RemoteHooking")
+	truthy("the delete succeeds", del)
+	check("the list is empty again", #skills.list(), 0)
+
+	local bad = skills.remove("RemoteHooking")
+	falsy("deleting again fails cleanly", bad)
+end)
+
+scenario("skills install from github resolves, fetches and saves", function()
+	-- A GitHub-shaped body: frontmatter plus a playbook, the shape of an
+	-- Anthropic-style skill repo.
+	local fetched = {}
+	local handler = function(entry)
+		fetched[#fetched + 1] = entry.url
+		return { StatusCode = 200, Body = table.concat({
+			"---",
+			"name: Ponytail",
+			"description: Installed playbook.",
+			"---",
+			"",
+			"Favour one-liners and platform built-ins.",
+		}, "\n") }
+	end
+
+	local harness, handle = bootWith({ provider = false, handler = handler })
+	local skills = handle.env.require("runtime/skills")
+
+	-- owner/repo form: resolves to raw.githubusercontent, main, SKILL.md.
+	local ok, name = skills.fromGitHub("DietrichGebert/ponytail", nil)
+	truthy("the install succeeds", ok, name)
+	check("the skill is named", name, "Ponytail")
+	check("one fetch was made", #fetched, 1)
+	contains("at the raw host", fetched[1], "raw.githubusercontent.com/DietrichGebert/ponytail/main/SKILL.md")
+
+	local list = skills.list()
+	check("the installed skill is listed", #list, 1)
+	local body = skills.read("Ponytail")
+	contains("with its body", body, "platform built-ins")
+
+	-- A github.com blob URL becomes the same raw URL.
+	skills.remove("Ponytail")
+	local okUrl = skills.fromGitHub("https://github.com/DietrichGebert/ponytail/blob/main/docs/SKILL.md", nil)
+	truthy("a blob URL installs", okUrl)
+	contains("rewritten to raw", fetched[2], "raw.githubusercontent.com/DietrichGebert/ponytail/main/docs/SKILL.md")
+
+	-- A bare name is refused: guessing an owner installs a stranger's code.
+	local refused = skills.fromGitHub("ponytail", nil)
+	falsy("a bare name is refused", refused)
+
+	-- A 404 says so rather than saving an error page.
+	harness.http.handler = function() return { StatusCode = 404, Body = "not found" } end
+	local missing, missingWhy = skills.fromGitHub("someone/missing", nil)
+	falsy("a missing repo fails cleanly", missing)
+	contains("with the status", tostring(missingWhy), "404")
+end)
+
+scenario("the skills tool group registers and the prompt carries the index", function()
+	local harness, handle = bootWith({ provider = false })
+	local registry = handle.tools
+	local fsx = handle.env.require("runtime/fsx")
+	local skills = handle.env.require("runtime/skills")
+
+	local expected = {
+		{ id = "skills_list", risk = "read" },
+		{ id = "skills_read", risk = "read" },
+		{ id = "skills_write", risk = "write" },
+		{ id = "skills_install", risk = "write" },
+		{ id = "skills_delete", risk = "write" },
+	}
+	for _, spec in ipairs(expected) do
+		local tool = registry.get(spec.id)
+		truthy(spec.id .. " is registered", tool ~= nil)
+		check(spec.id .. " group", tool and tool.group, "skills")
+		check(spec.id .. " risk", tool and tool.risk, spec.risk)
+	end
+	check("skills group label", registry.groupLabel("skills"), "Skills")
+
+	-- The environment block: nothing when there are no skills, the index when
+	-- there is one, and never a body.
+	local prompt = handle.env.require("agent/prompt")
+	local built = prompt.build({})
+	falsy("no skills, no block", built:find("Skills available", 1, true))
+
+	fsx.ensure("skills")
+	skills.save("Tiny", "One line.", "The body of the tiny skill.")
+	built = prompt.build({})
+	contains("the index line appears", built, "Skills available")
+	contains("naming the skill", built, "Tiny")
+	contains("with its description", built, "One line.")
+	local leak = built:find("The body of the tiny skill", 1, true)
+	falsy("the body never reaches the prompt", leak ~= nil)
+end)
+
+-- Changelog --------------------------------------------------------------------
+
+-- What this locks in: the full release history is present and ordered newest
+-- first, every entry carries the categories the modal badges, the unread
+-- marker flips when the modal opens, and the modal itself renders every
+-- version card -- on a desktop viewport and on a phone-sized one, where the
+-- header moves the title to its own line rather than truncating it.
+scenario("the changelog carries every release and marks itself read", function()
+	local harness, handle = bootWith({ provider = false })
+	local changelog = handle.env.require("runtime/changelog")
+	local config = handle.env.require("runtime/config")
+
+	local all = changelog.all()
+	truthy("there is history", #all >= 10)
+	local initial = false
+	for _, entry in ipairs(all) do
+		if entry.version == "1.0.0" and entry.title == "Initial release" then initial = true end
+	end
+	truthy("the initial release is present", initial)
+
+	-- Newest first, strictly: a duplicate or a misorder breaks the marker.
+	for index = 2, #all do
+		truthy("version " .. all[index - 1].version .. " is newer than " .. all[index].version,
+			all[index - 1].version > all[index].version)
+	end
+
+	-- Every entry is renderable: a title, a date, and at least one section
+	-- whose category the modal knows how to badge.
+	for _, entry in ipairs(all) do
+		truthy("v" .. entry.version .. " has a title", type(entry.title) == "string" and entry.title ~= "")
+		truthy("v" .. entry.version .. " has a date", type(entry.date) == "string" and entry.date ~= "")
+		truthy("v" .. entry.version .. " has sections", #(entry.sections or {}) > 0)
+		for _, section in ipairs(entry.sections) do
+			truthy("v" .. entry.version .. " " .. section.category .. " has items", #(section.items or {}) > 0)
+		end
+	end
+
+	-- The read marker: unread until opened, read after.
+	check("the marker starts unread on a fresh client", changelog.isUnread(), true)
+	truthy("marking it read succeeds", changelog.markRead())
+	check("and it is read now", changelog.isUnread(), false)
+	check("the setting holds the version", config.get("ui.lastSeenVersion"), changelog.latest().version)
+	config.set("ui.lastSeenChangelog", "")
+	check("updated notes are unread for users who already opened this version", changelog.isUnread(), true)
+	changelog.markRead()
+	check("opening the revised notes clears the marker", changelog.isUnread(), false)
+	assert(config.saveNow())
+	config.set("ui.lastSeenChangelog", "", { quiet = true })
+	config.load()
+	check("the revised read marker survives a settings reload", changelog.isUnread(), false)
+	local revision = changelog.ENTRIES[1].revision
+	changelog.ENTRIES[1].revision = revision .. "-next"
+	check("another note revision restores the marker without a version bump", changelog.isUnread(), true)
+	changelog.ENTRIES[1].revision = revision
+	check("the already-read revision stays read", changelog.isUnread(), false)
+
+	-- The running version is the newest entry -- otherwise the marker can
+	-- never clear for a user who opens the modal.
+	local version = tostring(handle.env.info.version)
+	check("the client version matches the newest entry", changelog.latest().version, version)
+end)
+
+scenario("the what's new modal renders every release on wide and narrow viewports", function()
+	local harness, handle = bootWith({})
+	local app = handle.app
+	local changelog = handle.env.require("runtime/changelog")
+
+	-- Desktop: the full window opens the modal from the app's entry point.
+	local modal = app.showChangelog()
+	truthy("the modal opens", modal ~= nil)
+	local text = harness.textOf(harness.byName("Modal"))
+	for _, entry in ipairs(changelog.all()) do
+		truthy("v" .. entry.version .. " is on screen", text:find(entry.version, 1, true) ~= nil)
+		contains("with its title", text, entry.title)
+	end
+	contains("category badges label the sections", text, "New")
+	contains("and the improved ones", text, "Improved")
+	contains("and the fixed ones", text, "Fixed")
+	-- Opening marked it read.
+	check("opening the modal marked it read", changelog.isUnread(), false)
+	modal.close()
+	harness.settle(1)
+
+	-- Phone-sized: the same content, with the title on its own line.
+	harness.services.UserInputService.TouchEnabled = true
+	local responsive = handle.env.require("ui/responsive")
+	responsive.refresh("test")
+	harness.setViewport(390, 740)
+	harness.settle(2)
+	local phoneModal = app.showChangelog()
+	truthy("the modal opens on a phone viewport", phoneModal ~= nil)
+	local phoneText = harness.textOf(harness.byName("Modal"))
+	for _, entry in ipairs(changelog.all()) do
+		truthy("v" .. entry.version .. " is on the phone too", phoneText:find(entry.version, 1, true) ~= nil)
+	end
+	phoneModal.close()
+	harness.settle(1)
+
+	harness.services.UserInputService.TouchEnabled = false
+	responsive.refresh("test")
+	harness.setViewport(1280, 720)
+	harness.settle(2)
+	check("no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+scenario("universal model pricing resolves across inference providers", function()
+	local _, handle = bootWith({ provider = false })
+	local usage = handle.env.require("agent/usage")
+
+	-- Bare models from different vendors
+	local gpt4o = usage.priceFor("gpt-4o")
+	check("gpt-4o resolves prompt rate", gpt4o and gpt4o[1], 2.50)
+	check("gpt-4o resolves completion rate", gpt4o and gpt4o[2], 10.00)
+
+	local sonnet5 = usage.priceFor("claude-sonnet-5")
+	check("claude-sonnet-5 resolves prompt rate", sonnet5 and sonnet5[1], 2.00)
+
+	local deepseek = usage.priceFor("deepseek-chat")
+	truthy("deepseek-chat resolves", deepseek ~= nil)
+
+	local gemini = usage.priceFor("gemini-3.8-flash")
+	check("gemini-3.8-flash resolves", gemini and gemini[1], 0.75)
+
+	-- OpenRouter prefixed names
+	local orGpt = usage.priceFor("openai/gpt-4o")
+	check("openai/gpt-4o resolves identically", orGpt and orGpt[1], 2.50)
+
+	local orClaude = usage.priceFor("anthropic/claude-sonnet-5")
+	check("anthropic/claude-sonnet-5 resolves identically", orClaude and orClaude[1], 2.00)
+
+	-- Dated snapshot prefix matching
+	local snapshot = usage.priceFor("gpt-4o-2024-11-20")
+	check("dated snapshot matches base model pricing", snapshot and snapshot[1], 2.50)
+
+	-- Local providers always cost $0.00
+	local ollamaPrice = usage.priceFor("llama-3.3-70b", { preset = "ollama" })
+	check("ollama preset costs nothing", ollamaPrice and ollamaPrice[1], 0)
+	check("ollama completion costs nothing", ollamaPrice and ollamaPrice[2], 0)
+
+	local localPrice = usage.priceFor("any-model", { baseUrl = "http://localhost:11434/v1" })
+	check("localhost endpoint costs nothing", localPrice and localPrice[1], 0)
+
+	-- OpenCode free models cost $0.00
+	local zen = { baseUrl = "https://opencode.ai/zen/v1" }
+	local pickle = usage.priceFor("big-pickle", zen)
+	check("big-pickle on OpenCode costs nothing", pickle and pickle[1], 0)
+	check("big-pickle completion costs nothing", pickle and pickle[2], 0)
+end)
+
+-- The profile menu's donation entry. The Roblox route asks first, because a
+-- teleport cannot be undone from here; Ko-fi copies its link instead.
+scenario("the profile menu offers a donation that confirms before teleporting", function()
+	local harness, handle = bootWith({ provider = false })
+	local anchor = harness.byName("ProfileBar")
+	truthy("the profile control exists", anchor ~= nil)
+	local menu = handle.app.showProfileMenu(anchor)
+	truthy("the profile menu opens", menu ~= nil)
+	local donate = harness.byName("Option_donate", menu.card)
+	truthy("with a Donate entry", donate ~= nil, harness.dump(menu.card))
+	harness.click(donate)
+	harness.settle(1)
+
+	local modal = harness.byName("Modal")
+	truthy("the donation modal opens", modal ~= nil)
+	contains("it names the project", harness.textOf(modal), "Project Ptolemy")
+	contains("it offers Robux", harness.textOf(modal), "Robux")
+	contains("and Ko-fi", harness.textOf(modal), "Ko-fi")
+
+	local function button(root, label)
+		for _, node in ipairs(root:GetDescendants()) do
+			if node.ClassName == "TextLabel" and node.Text == label then
+				local parent = node.Parent
+				while parent and parent.ClassName ~= "TextButton" do parent = parent.Parent end
+				if parent then return parent end
+			end
+		end
+		return nil
+	end
+	local robux = button(modal, "Donate with Robux")
+	truthy("the Robux action exists", robux ~= nil, harness.dump(modal))
+	harness.click(robux)
+	harness.settle(1)
+	local confirmModal = harness.byName("Modal")
+	truthy("it confirms before teleporting", confirmModal ~= nil
+		and harness.textOf(confirmModal):find("Open the donation place", 1, true) ~= nil,
+		harness.dump(confirmModal or handle.app.screen))
+	local teleport = button(confirmModal, "Teleport")
+	truthy("with a Teleport action", teleport ~= nil)
+	harness.click(teleport)
+	harness.settle(1)
+	check("and no thread errors", #harness.errors(), 0,
+		harness.errors()[1] and harness.errors()[1].traceback or nil)
+end)
+
+print(("="):rep(72))
+print(string.format("%d scenarios, %d checks passed, %d failed",
+	suite.scenarios, suite.passed, suite.failed))if suite.failed > 0 then
+	print("")
+	for _, failure in ipairs(suite.failures) do print("  - " .. failure) end
+end
+os.exit(suite.failed > 0 and 1 or 0)

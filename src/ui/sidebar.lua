@@ -1,0 +1,703 @@
+-- The sidebar: navigation, the mode switch, and the real conversation list.
+--
+-- Everything in here reads from `agent/session`. The list used to be three hardcoded
+-- project names with eleven invented titles under them, copied from a screenshot --
+-- which looked exactly right and told you nothing, and whose rows typed their own
+-- label into the composer instead of opening anything. What is here now is the
+-- threads the client actually has, grouped by their game or chosen folder, and
+-- clicking one switches to it.
+return function(env)
+	local util = env.require("runtime/util")
+	local config = env.require("runtime/config")
+	local clock = env.require("runtime/clock")
+	local theme = env.require("ui/theme")
+	local responsive = env.require("ui/responsive")
+	local icons = env.require("ui/icons")
+	local overlay = env.require("ui/overlay")
+	local P = env.require("ui/primitives")
+	local profileUI = env.require("ui/profile")
+	local C = env.require("ui/controls")
+	local sessions = env.require("agent/session")
+	local subagent = env.require("agent/subagent")
+	local providers = env.require("provider/registry")
+	local place = env.require("runtime/place")
+
+	local M = {}
+
+	-- The panels the "More" row reveals. Chat is not in it: the mode switch above is
+	-- what selects between the conversation and the shared session.
+	local MORE_PANELS = {
+		{ id = "agents", label = "Subagents", icon = "spark" },
+		{ id = "providers", label = "Providers", icon = "sliders" },
+		{ id = "tools", label = "Tools", icon = "worktree" },
+		{ id = "logs", label = "Logs & traces", icon = "document" },
+		{ id = "settings", label = "Settings", icon = "gear" },
+	}
+
+	function M.new(parent, host)
+		local handle = {}
+
+		-- One inset and one icon size for every row in here.
+		--
+		-- There were six of each. Row padding ran xxs, xs and md depending on which row
+		-- it was, and the icon slot -- whose width is what decides where the label starts
+		-- -- was written three different ways as `icon`, `icon - hair` and `icon - xxs`.
+		-- The result was six different left text edges down one 240px column, two of them
+		-- two pixels apart on adjacent rows. Both are also dimensionally wrong to
+		-- subtract from each other: `space` scales by 0.78 under compact density and
+		-- `size` by 0.86, so the gaps drifted rather than holding.
+		local ROW_INSET = theme.space.sm
+		local ROW_ICON = theme.size.icon
+
+		local sidebar = P.column(parent, {
+			name = "Sidebar",
+			size = UDim2.fromScale(1, 1),
+			-- One step of air between groups rather than the same six pixels used inside
+			-- them: the nav strip, the mode switch, the new-conversation button, the action
+			-- rows and the history are five separate things, and at a uniform xs they read
+			-- as one undifferentiated stack.
+			gap = theme.space.sm,
+			padding = { x = theme.space.sm, y = theme.space.md },
+		})
+
+		-- Top row: the app menu, the collapse toggle, search, and the two history
+		-- arrows. Every one of them does something; the pair that used to announce
+		-- "Navigated to previous session" in a toast now actually goes there.
+		--
+		-- Wrap only when the selected density leaves too little room for the row.
+		local topNav = P.row(sidebar, {
+			name = "TopNav",
+			size = UDim2.new(1, 0, 0, 0),
+			auto = "Y",
+			wrap = true,
+			gap = theme.space.xxs,
+			layoutOrder = 1,
+		})
+
+		local function navButton(name, icon, order, onClick, enabled)
+			local button = P.iconButton(topNav, {
+				name = name,
+				icon = icon,
+				diameter = theme.size.controlSmall,
+				layoutOrder = order,
+				onClick = onClick,
+			})
+			button.instance.LayoutOrder = order
+			if enabled == false then button.setEnabled(false) end
+			return button
+		end
+
+		navButton("Nav_menu", "bars", 1, function()
+			host.showAppMenu(topNav)
+		end)
+		navButton("Nav_sidebar", "sidebarToggle", 2, function()
+			host.toggleSidebar()
+		end)
+		navButton("Nav_search", "search", 3, function()
+			host.showSearch()
+		end)
+		handle.back = navButton("Nav_back", "arrowLeft", 4, function()
+			host.back()
+		end, host.canBack())
+		handle.forward = navButton("Nav_forward", "arrowRight", 5, function()
+			host.forward()
+		end, host.canForward())
+
+		-- Shared conversation and Code workspace destinations.
+		local modeRow = P.row(sidebar, {
+			name = "ModeSwitcher",
+			size = UDim2.new(1, 0, 0, math.max(theme.size.controlSmall, responsive.minTarget(),
+				theme.text.caption.height) + theme.space.hair * 2),
+			bg = theme.color.surface,
+			radius = theme.radius.lg,
+			padding = theme.space.hair,
+			gap = theme.space.hair,
+			layoutOrder = 2,
+			stretch = true,
+		})
+
+		local modes = {}
+		local function modeButton(id, label, icon, order)
+			local selected = host.panel == id
+			local button = P.rowButton(modeRow, {
+				name = "Segment_" .. id,
+				size = UDim2.new(0, 0, 1, 0),
+				flex = "Fill",
+				height = theme.size.controlSmall,
+				radius = theme.radius.md,
+				bgSelected = theme.color.surfaceActive,
+				selected = selected,
+				alignX = "Center",
+				gap = theme.space.xxs,
+				padding = theme.space.none,
+				layoutOrder = order,
+				onClick = function()
+					host.show(id)
+				end,
+			})
+			button.icon(icon, 1, selected and theme.color.text or theme.color.textTertiary,
+				theme.size.icon - theme.space.xxs)
+			local label2 = P.text(button.row, {
+				text = label,
+				role = "caption",
+				color = selected and theme.color.text or theme.color.textTertiary,
+				size = UDim2.new(0, 0, 0, theme.text.caption.height),
+				auto = "X",
+				flex = "Shrink",
+				truncate = true,
+				layoutOrder = 2,
+			})
+			modes[id] = { button = button, label = label2 }
+			return button
+		end
+		modeButton("cowork", "Cowork", "terminal", 1)
+		modeButton("chat", "Chat", "spark", 2)
+		modeButton("code", "Code", "terminal", 3)
+
+		-- New conversation. A real thread rather than a wipe of the current one: the
+		-- list below is what makes the difference visible, and clearing in place is what
+		-- the composer's own clear control is for.
+		local newButton = P.button(sidebar, {
+			name = "NewChat",
+			text = "New conversation",
+			icon = "plus",
+			variant = "secondary",
+			size = "md",
+			fill = true,
+			layoutOrder = 3,
+			onClick = function()
+				host.newConversation()
+			end,
+		})
+		newButton.instance.LayoutOrder = 3
+
+		local actions = P.column(sidebar, {
+			name = "ActionRows",
+			size = UDim2.new(1, 0, 0, 0),
+			auto = "Y",
+			gap = theme.space.hair,
+			layoutOrder = 4,
+		})
+
+		local customize = P.rowButton(actions, {
+			name = "Customize",
+			bg = nil,
+			padding = { x = ROW_INSET },
+			layoutOrder = 1,
+			onClick = function()
+				host.showSettingsDialog("claude_code")
+			end,
+		})
+		customize.icon("sliders", 1, theme.color.textSecondary, ROW_ICON)
+		customize.label("Customize", 2, theme.color.textSecondary)
+
+		local expanded = config.get("ui.sidebarExpanded", false) == true
+		local more = P.rowButton(actions, {
+			name = "More",
+			padding = { x = ROW_INSET },
+			layoutOrder = 2,
+			onClick = function()
+				expanded = not expanded
+				config.set("ui.sidebarExpanded", expanded, { quiet = true })
+				handle.renderMore()
+			end,
+		})
+		local moreIcon = more.icon("chevron", 1, theme.color.textSecondary, ROW_ICON)
+		more.label("More", 2, theme.color.textSecondary)
+
+		local moreList = P.column(actions, {
+			name = "MorePanels",
+			size = UDim2.new(1, 0, 0, 0),
+			auto = "Y",
+			gap = theme.space.hair,
+			layoutOrder = 3,
+		})
+		local foldersButton = P.rowButton(actions, { name = "ConversationFolders", padding = { x = ROW_INSET },
+			layoutOrder = 4, onClick = function() host.manageFolders() end })
+		foldersButton.label("Conversation folders", 1, theme.color.textSecondary)
+
+		function handle.renderMore()
+			for _, child in ipairs(moreList:GetChildren()) do
+				if child:IsA("GuiObject") then child:Destroy() end
+			end
+			-- The chevron points at what pressing it will do.
+			for _, child in ipairs(moreIcon:GetChildren()) do child:Destroy() end
+			icons.chevron(moreIcon, ROW_ICON, theme.color.textSecondary,
+				expanded and "up" or "down")
+			if not expanded then return end
+			for index, entry in ipairs(MORE_PANELS) do
+				local selected = host.panel == entry.id
+				local row = P.rowButton(moreList, {
+					name = "NavRow_" .. entry.id,
+					padding = { x = ROW_INSET },
+					selected = selected,
+					layoutOrder = index,
+					onClick = function()
+						host.show(entry.id)
+					end,
+				})
+				row.icon(entry.icon, 1, selected and theme.color.text or theme.color.textTertiary, ROW_ICON)
+				-- How many subagents are working, on the row that leads to them. A
+				-- dispatch runs for minutes with nothing on screen once its card has
+				-- scrolled away, so the count is the only standing sign of it.
+				local label = entry.label
+				if entry.id == "agents" then
+					local running = #subagent.running()
+					if running > 0 then label = label .. "  " .. tostring(running) end
+				end
+				row.label(label, 2, selected and theme.color.text or theme.color.textSecondary)
+			end
+		end
+
+		-- Same guard as the history, for the same reason: this rebuilds five rows and it
+		-- is called from refresh, which runs on every status event of every turn. The
+		-- three things it can show are which panel is selected, whether it is open, and
+		-- how many subagents are running.
+		local function moreSignature()
+			return string.format("%s|%s|%d", tostring(host.panel),
+				expanded and "+" or "-", #subagent.running())
+		end
+
+		function handle.syncMore(force)
+			local signature = moreSignature()
+			if not force and signature == handle.moreSignature then return false end
+			handle.moreSignature = signature
+			handle.renderMore()
+			return true
+		end
+
+		handle.renderMore()
+		handle.moreSignature = moreSignature()
+
+		-- The conversation list, which takes whatever height is left rather than a
+		-- hand-summed remainder: the stack above it changes height with density, with
+		-- the platform's hit-target floor and with whether More is open, and a fixed
+		-- offset was wrong in all three directions at once.
+		local historyHolder = P.frame(sidebar, {
+			name = "HistoryHolder",
+			size = UDim2.new(1, 0, 0, 0),
+			layoutOrder = 5,
+		})
+		local historyFlex = Instance.new("UIFlexItem", historyHolder)
+		historyFlex.FlexMode = Enum.UIFlexMode.Fill
+
+		local history = P.scroll(historyHolder, {
+			name = "HistoryScroll",
+			size = UDim2.fromScale(1, 1),
+			gap = theme.space.xs,
+			padding = { top = theme.space.xs, bottom = theme.space.sm },
+		})
+		-- Expanded navigation can exceed a short window by itself. It shares the
+		-- scroll viewport with history so the profile remains reachable below it.
+		actions.Parent = history.instance
+		actions.LayoutOrder = 1
+		local historyList = P.column(history.instance, { name = "HistoryList",
+			size = UDim2.new(1, 0, 0, 0), auto = "Y", gap = theme.space.xs, layoutOrder = 2 })
+
+		-- Which place groups are folded, by placeId.
+		--
+		-- Stored rather than kept in a local: the list is rebuilt from scratch on every
+		-- new thread, rename, delete, place change and busy transition, so a local would
+		-- unfold everything several times a minute. Quiet writes, because this is a
+		-- record of what the user folded and not a token anything derives from -- a noisy
+		-- one would reach the theme's subscription and rebuild the whole interface.
+		local function collapsedKey(group)
+			return group.kind == "game" and ("ui.placeCollapsed." .. tostring(group.placeId))
+				or ("ui.folderCollapsed." .. group.id)
+		end
+
+		local function isCollapsed(group)
+			return config.get(collapsedKey(group), false) == true
+		end
+
+		local function setCollapsed(group, value)
+			config.set(collapsedKey(group), value == true, { quiet = true })
+		end
+
+		local function sessionMenu(session, target)
+			overlay.menu({
+				target = target,
+				width = theme.size.menu,
+				options = {
+					{ isHeader = true, title = session.title, subtitle = sessions.folderLabel(session) },
+					{ label = "Open", value = "open", icon = "arrowRight" },
+					{ label = "Rename", value = "rename", icon = "document" },
+					{ label = "Move to folder", value = "move" },
+					{ label = "Delete", value = "delete", icon = "trash", tone = "bad" },
+				},
+				onSelect = function(value)
+					if value == "open" then
+						host.openSession(session.id)
+					elseif value == "rename" then
+						overlay.prompt({
+							title = "Rename this conversation",
+							description = "The transcript is untouched; only what the list calls it changes.",
+							placeholder = "a short title",
+							value = session.title,
+							confirmText = "Rename",
+							onConfirm = function(text)
+								local ok, why = session.rename(text)
+								if not ok then overlay.toast(tostring(why), "warn", 2) end
+							end,
+						})
+					elseif value == "move" then
+						host.moveConversation(session)
+					elseif value == "delete" then
+						overlay.confirm({
+							title = "Delete this conversation?",
+							description = "The transcript and its file are both removed. This cannot be undone.",
+							confirmText = "Delete",
+							danger = true,
+							onConfirm = function()
+								sessions.remove(session.id)
+								host.openSession(sessions.current().id)
+							end,
+						})
+					end
+				end,
+			})
+		end
+
+		function handle.renderHistory()
+			for _, child in ipairs(historyList:GetChildren()) do
+				if child:IsA("GuiObject") then child:Destroy() end
+			end
+			local active = sessions.current()
+			local groups = sessions.groups()
+			local order = 0
+
+			for _, group in ipairs(groups) do
+				order = order + 1
+				local column = P.column(historyList, {
+					name = group.kind == "game" and ("Place_" .. tostring(group.placeId)) or ("Folder_" .. group.id),
+					size = UDim2.new(1, 0, 0, 0),
+					auto = "Y",
+					gap = theme.space.hair,
+					layoutOrder = order,
+				})
+
+				-- The group header is the fold control, so the whole line answers a click
+				-- rather than a chevron nobody can hit. The count rides on it because a
+				-- folded group has to say how much it is hiding -- otherwise folding one
+				-- loses the only sign those conversations exist.
+				local collapsed = isCollapsed(group)
+				local head = P.rowButton(column, {
+					name = "PlaceHead",
+					height = theme.size.rowTight,
+					-- The same inset as the rows it heads. It was xxs against their xs, so
+					-- a group's name sat two pixels left of every conversation under it.
+					padding = { x = ROW_INSET },
+					gap = theme.space.xxs,
+					layoutOrder = 1,
+					onClick = function()
+						setCollapsed(group, not isCollapsed(group))
+						-- Through the signature, so the fold state it just wrote becomes the
+						-- baseline the next change is compared against.
+						handle.syncHistory()
+					end,
+				})
+				-- Points at what pressing it will do, like the More row above.
+				local caret = P.frame(head.row, {
+					name = "PlaceCaret",
+					size = UDim2.fromOffset(theme.size.icon, theme.size.icon),
+					layoutOrder = 1,
+				})
+				icons.chevron(caret, theme.size.icon, theme.color.textTertiary,
+					collapsed and "right" or "down")
+				P.text(head.row, {
+					name = "PlaceName",
+					text = group.label,
+					role = "overline",
+					color = theme.color.textTertiary,
+					size = UDim2.new(0, 0, 0, theme.text.overline.height),
+					flex = "Fill",
+					truncate = true,
+					layoutOrder = 2,
+				})
+				-- How many are in there, and how many of those are working. The second
+				-- number is the reason a fold is safe to leave shut: a group with a turn
+				-- running in it still says so from the header.
+				local busyCount = 0
+				for _, session in ipairs(group.sessions) do
+					if session.busy then busyCount = busyCount + 1 end
+				end
+				if busyCount > 0 then
+					local slot = P.frame(head.row, {
+						name = "PlaceBusy",
+						size = UDim2.fromOffset(theme.size.icon, theme.size.icon),
+						layoutOrder = 3,
+					})
+					C.spinner(slot, {
+						diameter = theme.size.icon,
+						anchor = Vector2.new(0.5, 0.5),
+						position = UDim2.fromScale(0.5, 0.5),
+					})
+				end
+				local countLabel = P.text(head.row, {
+					name = "PlaceCount",
+					text = tostring(#group.sessions),
+					role = "caption",
+					color = theme.color.textTertiary,
+					align = "Right",
+					auto = "X",
+					layoutOrder = 4,
+				})
+				countLabel.Size = UDim2.fromOffset(0, theme.text.caption.height)
+				-- Custom folders and Universal are available in every game.
+				if group.current or group.kind ~= "game" then
+					local plus = P.iconButton(head.row, {
+						name = group.kind == "game" and "NewInPlace" or "NewInFolder",
+						icon = "plus",
+						diameter = theme.size.rowTight,
+						layoutOrder = 5,
+						onClick = function()
+							host.newConversation(group.id)
+						end,
+					})
+					plus.instance.LayoutOrder = 5
+				end
+
+				-- The rows go in a holder of their own so folding hides one frame rather
+				-- than each row: a hidden child still takes its slot in a list layout only
+				-- if the layout can see it, and hiding thirty of them one at a time is
+				-- thirty writes where one will do.
+				local body = P.column(column, {
+					name = "PlaceSessions",
+					size = UDim2.new(1, 0, 0, 0),
+					auto = "Y",
+					gap = theme.space.hair,
+					layoutOrder = 2,
+					visible = not collapsed,
+				})
+
+				for index, session in ipairs(group.sessions) do
+					local selected = session.id == active.id
+					local row = P.rowButton(body, {
+						name = "SessionRow",
+						height = theme.size.rowSmall,
+						padding = { x = ROW_INSET },
+						selected = selected,
+						layoutOrder = index,
+						onClick = function()
+							host.openSession(session.id)
+						end,
+					})
+					-- The leading slot is always there and usually empty.
+					--
+					-- It used to hold a hollow circle per row and a filled dot on the active
+					-- one: a column of bullets down a 240px list whose only job was to say
+					-- which row was selected, which the row's own highlight already says and
+					-- says better. The slot itself stays, at the icon's width, because it is
+					-- what puts every title on the same left edge as the group name above it
+					-- -- and because a spinner has to be able to appear in a row without
+					-- moving that row's text.
+					--
+					-- The spinner is the one thing here that survived: a conversation you are
+					-- not looking at can still be working, leaving one does not stop it, and
+					-- that is the one fact a row cannot state any other way. It is also the
+					-- reason the list refreshes on every busy transition.
+					local slot = P.frame(row.row, {
+						name = "IconSlot",
+						size = UDim2.fromOffset(ROW_ICON, ROW_ICON),
+						layoutOrder = 1,
+					})
+					if session.busy then
+						C.spinner(slot, {
+							diameter = ROW_ICON,
+							anchor = Vector2.new(0.5, 0.5),
+							position = UDim2.fromScale(0.5, 0.5),
+						})
+					end
+					local titleText = session.title
+					if session.ephemeral then titleText = titleText .. "  (not saved)" end
+					row.label(titleText, 2,
+						selected and theme.color.text or theme.color.textSecondary,
+						selected and "label" or nil)
+					local menuButton = P.iconButton(row.row, {
+						name = "SessionMenu",
+						icon = "ellipsis",
+						diameter = theme.size.rowTight,
+						layoutOrder = 3,
+						onClick = function(button)
+							sessionMenu(session, button.instance)
+						end,
+					})
+					menuButton.instance.LayoutOrder = 3
+				end
+			end
+
+			if order == 0 then
+				local empty = P.text(historyList, {
+					name = "NoHistory",
+					text = "Your conversations will appear here, organized by folder.",
+					role = "caption",
+					color = theme.color.textTertiary,
+					wrap = true,
+					auto = "Y",
+					padding = { x = ROW_INSET },
+					layoutOrder = 1,
+				})
+				empty.Size = UDim2.new(1, 0, 0, 0)
+			end
+		end
+
+		handle.renderHistory()
+
+		P.divider(sidebar, { color = theme.color.borderSubtle, layoutOrder = 6 })
+
+		-- A distinct identity control, with room for a headshot and two readable lines.
+		local identity = profileUI.identity()
+		local identityHeight = theme.text.heading.height + theme.text.caption.height + theme.space.hair
+		local profile, profileMenu, chevron
+		profile = P.rowButton(sidebar, {
+			name = "ProfileBar",
+			-- Matched to the chat composer's *visible* box, not its shell. The composer
+			-- shell is taller (control + sm*3 + xxs) but its bordered surface is inset
+			-- within it at control + sm*2; the profile bar is a bordered box that fills
+			-- its whole height. Sizing to the surface is what makes the two read as the
+			-- same height where they dock side by side at the bottom of the window.
+			height = math.max(theme.size.control, responsive.minTarget()) + theme.space.sm * 2,
+			bg = theme.color.surface,
+			radius = theme.radius.lg,
+			stroke = true,
+			gap = theme.space.md,
+			padding = { x = ROW_INSET },
+			layoutOrder = 7,
+			onClick = function()
+				if profileMenu and not profileMenu.closed then profileMenu.close(); return end
+				profileMenu = host.showProfileMenu(profile.instance, function()
+					if not profile.instance.Parent then return end
+					profile.setSelected(false)
+					chevron.Rotation = 0
+				end)
+				if profileMenu and not profileMenu.closed then
+					profile.setSelected(true)
+					chevron.Rotation = 180
+				end
+			end,
+		})
+		profileUI.avatar(profile.row, identity, theme.size.profileAvatar, 1)
+		local profileText = P.column(profile.row, {
+			name = "ProfileIdentity",
+			size = UDim2.new(0, 0, 0, identityHeight),
+			flex = "Fill",
+			gap = theme.space.hair,
+			layoutOrder = 2,
+		})
+		P.text(profileText, {
+			name = "ProfileName",
+			text = identity.name,
+			role = "heading",
+			size = UDim2.new(1, 0, 0, theme.text.heading.height),
+			color = theme.color.text,
+			truncate = true,
+			layoutOrder = 1,
+		})
+		local profileDetail = P.text(profileText, {
+			name = "ProfileProvider",
+			text = profileUI.providerLabel(),
+			role = "caption",
+			size = UDim2.new(1, 0, 0, theme.text.caption.height),
+			color = theme.color.textTertiary,
+			truncate = true,
+			layoutOrder = 2,
+		})
+		chevron = P.frame(profile.row, {
+			name = "ProfileChevron",
+			size = UDim2.fromOffset(ROW_ICON, ROW_ICON),
+			layoutOrder = 3,
+		})
+		icons.chevron(chevron, ROW_ICON, theme.color.textTertiary, "up")
+
+		-- What the list currently shows, as a string.
+		--
+		-- The list is rebuilt from destroyed instances, and everything that can change it
+		-- -- a new thread, a rename, a delete, a switch, a busy transition, a place
+		-- resolving -- arrives as the same signal with no description of what moved. So
+		-- the cheap thing is to ask whether the answer would differ before spending
+		-- thirty instances per row finding out that it would not.
+		--
+		-- This is the stutter. `session.emit` fires listChanged on send, and app.syncNav
+		-- runs on every status event -- of which a turn emits one per step plus one per
+		-- request -- and each of those was tearing down and rebuilding every row in the
+		-- sidebar. A twelve-conversation client spent about 1800 instance constructions
+		-- per turn redrawing a list whose contents had not changed since the first one.
+		local function listSignature()
+			local parts = { tostring(sessions.activeId) }
+			for _, group in ipairs(sessions.groups()) do
+				parts[#parts + 1] = string.format("%s|%s|%s",
+					tostring(group.id), tostring(group.label),
+					isCollapsed(group) and "-" or "+")
+				for _, session in ipairs(group.sessions) do
+					parts[#parts + 1] = string.format("%s\1%s\1%s\1%s",
+						tostring(session.id), tostring(session.title),
+						session.busy and "b" or "-", session.ephemeral and "e" or "-")
+				end
+			end
+			return table.concat(parts, "\2")
+		end
+
+		-- The list, only if it would look different. `force` is for the paths that know
+		-- it changed for a reason the signature cannot see -- a fold, a theme rebuild.
+		function handle.syncHistory(force)
+			local signature = listSignature()
+			if not force and signature == handle.signature then return false end
+			handle.signature = signature
+			handle.renderHistory()
+			return true
+		end
+
+		function handle.refresh()
+			profileDetail.Text = profileUI.providerLabel()
+			for id, entry in pairs(modes) do
+				local selected = host.panel == id
+				entry.button.setSelected(selected)
+				entry.label.TextColor3 = selected and theme.color.text or theme.color.textTertiary
+			end
+			handle.back.setEnabled(host.canBack())
+			handle.forward.setEnabled(host.canForward())
+			handle.syncMore()
+			handle.syncHistory()
+		end
+
+		handle.signature = listSignature()
+
+		-- The list is the app's own state: a new thread, a rename, a delete or a switch
+		-- all have to show up here without the panel knowing this exists.
+		local unsubscribeSessions = sessions.listChanged:connect(function()
+			if not sidebar.Parent then return end
+			handle.syncHistory()
+		end)
+		local unsubscribeProviders = providers.changed:connect(function()
+			if not sidebar.Parent then return end
+			profileDetail.Text = profileUI.providerLabel()
+		end)
+		local unsubscribePlace = place.changed:connect(function()
+			if not sidebar.Parent then return end
+			-- The place decides a group's label, which the signature covers.
+			handle.syncHistory()
+		end)
+		-- The count on the Subagents row. Debounced, because the register changes on
+		-- every tool call a child makes and this rebuilds a list of rows -- and
+		-- debounced rather than throttled so the last change in a burst, which is the
+		-- one that drops the count back to nothing, is not the one that gets dropped.
+		local refreshAgents, cancelAgents = clock.debounce(function()
+			if not sidebar.Parent then return end
+			handle.syncMore()
+		end, 0.3)
+		local unsubscribeAgents = subagent.changed:connect(refreshAgents)
+
+		sidebar.Destroying:Connect(function()
+			pcall(unsubscribeSessions)
+			pcall(unsubscribeProviders)
+			pcall(unsubscribePlace)
+			pcall(unsubscribeAgents)
+			cancelAgents()
+		end)
+
+		handle.instance = sidebar
+		return handle
+	end
+
+	return M
+end

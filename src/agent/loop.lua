@@ -1,0 +1,429 @@
+-- The turn loop.
+--
+-- Send the conversation, run whatever tools come back, repeat until the model
+-- answers in prose or a limit stops it. Everything around that -- provider
+-- failover, compaction, repeat detection, usage, the event stream -- is here
+-- because it all has to interleave with the same loop, and splitting it would
+-- mean threading state through five modules to achieve the same thing.
+return function(env)
+	local util = env.require("runtime/util")
+	local config = env.require("runtime/config")
+	local clock = env.require("runtime/clock")
+	local log = env.require("runtime/log")
+	local prompt = env.require("agent/prompt")
+	local registry = env.require("agent/registry")
+	local usage = env.require("agent/usage")
+	local hooks = env.require("agent/hooks")
+	local providers = env.require("provider/registry")
+	local chat = env.require("provider/chat")
+	local stream = env.require("agent/stream")
+
+	local M = {}
+
+	local function stopped(session)
+		session.emit("abort", {})
+		session.emit("status", { text = "Ready" })
+		return "Stopped."
+	end
+
+	local function failed(session, text)
+		session.emit("turn:end", { text = text, failed = true })
+		session.emit("status", { text = "Ready" })
+		return text
+	end
+
+	local function callSignature(calls)
+		local parts = {}
+		for _, call in ipairs(calls or {}) do
+			local fn = call["function"] or {}
+			parts[#parts + 1] = tostring(fn.name) .. "(" .. tostring(fn.arguments) .. ")"
+		end
+		table.sort(parts)
+		return table.concat(parts, "|")
+	end
+
+	-- One completion, walking the provider chain. Returns result, error, record.
+	--
+	-- A provider that fails is demoted by the registry and the next one is tried,
+	-- so a rate-limited primary does not end the turn. Only when every candidate
+	-- has failed does the turn fail, and the message names the first failure --
+	-- which is almost always the informative one.
+	local function complete(session, request, recoverContext)
+		local epoch = session.toolEpoch
+		local function aborted() return session.toolEpoch ~= epoch or session.aborted() end
+		local chain = providers.chain()
+		if #chain == 0 then
+			return nil, "No provider is configured. Open the Providers panel and add one."
+		end
+
+		local firstError
+		for index, record in ipairs(chain) do
+			if aborted() then return nil, "aborted" end
+			if index > 1 then
+				session.emit("provider:switch", {
+					from = chain[index - 1].label,
+					to = record.label,
+					reason = firstError,
+				})
+			end
+
+			local recovered = false
+			while true do
+				if aborted() then return nil, "aborted" end
+				local payload = { record = record, request = request, session = session }
+				hooks.run("preRequest", payload)
+				local accounting = session.ctx.observeRequest(payload.request.messages, payload.request.tools, record)
+				local preview = stream.new(session, record.model, aborted)
+
+				session.emit("request:start", {
+					streamId = preview.id,
+					provider = record.label,
+					providerId = record.id,
+					model = record.model,
+					attempt = index,
+					messages = #payload.request.messages,
+					stream = payload.request.stream,
+				})
+
+				local started = clock.ms()
+				local result, err, response = chat.complete(record, {
+					sessionId = not session.headless and session.id or nil, session = session,
+					messages = payload.request.messages,
+					tools = payload.request.tools,
+					toolChoice = payload.request.toolChoice,
+					stream = payload.request.stream,
+					temperature = payload.request.temperature,
+					maxTokens = payload.request.maxTokens,
+					extra = payload.request.extra,
+					aborted = aborted,
+					onRetry = function(info)
+						if aborted() then return end
+						session.emit("request:retry", {
+							provider = record.label,
+							attempt = info.attempt,
+							attempts = info.attempts,
+							wait = info.wait,
+							status = info.status,
+							reason = info.reason,
+						})
+					end,
+					onFrame = function(frame)
+						if aborted() then return end
+						preview.feed(frame)
+						if request.onFrame then request.onFrame(frame) end
+					end,
+				})
+				preview.close()
+
+				if aborted() then return nil, "aborted" end
+				if result then
+					session.emit("request:done", {
+						streamId = preview.id,
+						provider = record.label,
+						model = result.model or record.model,
+						ms = clock.since(started),
+						streamed = result.streamed,
+						via = result.via,
+					})
+					local after = { result = result, record = record, session = session }
+					hooks.run("postResponse", after)
+					if util.trim(after.result.model) == "" then after.result.model = record.model end
+					after.result.streamId = preview.id
+					return after.result, nil, record, accounting
+				end
+
+				session.emit("request:done", {
+					streamId = preview.id,
+					provider = record.label,
+					model = record.model,
+					ms = clock.since(started),
+					error = err,
+				})
+				if err == "aborted" or session.aborted() then return nil, "aborted" end
+				if (response and response.terminal) or env.require("net/http").terminal(err) then return nil, err end
+				-- Recover against the provider that actually refused the prompt, before
+				-- failover. A smaller fallback model can have a different window.
+				if recovered or not chat.contextOverflow(err) or not recoverContext or not recoverContext(record) then
+					firstError = firstError or err
+					break
+				end
+				recovered = true
+			end
+		end
+
+		return nil, firstError or "every provider failed"
+	end
+
+	-- Compaction uses whatever provider is healthy, with no tools and a tight
+	-- ceiling: it is a cheap call whose only job is to keep the transcript
+	-- affordable. If it fails, the context still trims -- it just loses the note.
+	local function summariser(session)
+		return function(transcript)
+			local epoch = session.toolEpoch
+			local record = providers.active()
+			if not record then return nil end
+			local result = chat.complete(record, { session = session,
+				messages = {
+					{ role = "system", content = prompt.compaction() },
+					{ role = "user", content = transcript },
+				},
+				temperature = 0,
+				maxTokens = 512,
+				attempts = 1,
+				aborted = session.aborted,
+			})
+			if session.toolEpoch ~= epoch or session.aborted() then return nil end
+			return result and result.content or nil
+		end
+	end
+
+	-- Runs one user prompt to completion. Returns the assistant's final text.
+	function M.run(session, text, images)
+		local ctx = session.ctx
+		local maxTurns = session.maxTurns or config.get("agent.maxTurns", 24)
+		local repeatLimit = config.get("agent.repeatLimit", 3)
+
+		-- Unlimited tool calling. Two switches reach this and they are deliberately
+		-- separate.
+		--
+		-- `agent.unlimitedTurns` is for the conversation the user is watching, so a
+		-- session carrying its own step budget -- every subagent -- ignores it.
+		-- `session.unlimited` is set by whoever created the session, which is how the
+		-- dispatcher passes on `agent.subagentUnlimited`: a delegated child is lifted
+		-- only when someone has asked for that in those words, because a child is the
+		-- one session with nobody's attention on it.
+		local unlimited = session.unlimited == true
+			or (session.maxTurns == nil and config.get("agent.unlimitedTurns", false) == true)
+
+		-- The wall-clock bound goes with the step limit rather than outliving it. A
+		-- fifteen-minute ceiling left standing behind a switch labelled unlimited
+		-- stops the same long job at roughly twice the step count and calls it running
+		-- out of time -- the same wall wearing a different sign.
+		local deadline = nil
+		if not unlimited then
+			deadline = clock.ms() + (session.budgetSeconds or 900) * 1000
+		end
+
+		-- Turn totals belong to the turn the user started. A subagent runs this same
+		-- loop, so without this guard every dispatch reset the counter the interface is
+		-- showing, and a batch of them reset it repeatedly, mid-turn, to whatever the
+		-- last child happened to have spent.
+		if not session.headless then usage.startTurn() end
+		ctx.pushUser(text, images)
+		session.emit("turn:start", { turns = unlimited and 0 or maxTurns, unlimited = unlimited })
+
+		local lastSignature, streak = "", 0
+		local finalText = nil
+		local turn = 0
+
+		while unlimited or turn < maxTurns do
+			turn = turn + 1
+			if session.aborted() then
+				return stopped(session)
+			end
+			if deadline and clock.ms() > deadline then
+				session.emit("error", { message = "This turn ran out of time.", fatal = false })
+				return failed(session, "I ran out of time on this turn. Ask me to continue if you want me to keep going.")
+			end
+
+			session.emit("status", { text = turn == 1 and "Thinking" or ("Working (step " .. turn .. ")") })
+
+			local record = providers.active()
+			-- A session may carry its own brief. A subagent does: it answers to the
+			-- parent agent rather than to the user, so inheriting the main prompt
+			-- would have it write a chat reply instead of a report.
+			local systemText
+			if type(session.systemPrompt) == "function" then
+				systemText = session.systemPrompt()
+			elseif type(session.systemPrompt) == "string" and util.trim(session.systemPrompt) ~= "" then
+				systemText = session.systemPrompt
+			else
+				systemText = prompt.build({
+					model = record and record.model or nil,
+					provider = record and record.label or nil,
+					-- Which conversation this is for. The task list rides on the session,
+					-- so a prompt built without it is built without the plan.
+					session = session,
+				})
+			end
+
+			-- A conversation the user has named keeps that name: the rename tool is
+			-- absent from its catalogue rather than described and refused, the same
+			-- way a missing capability or a disabled group is handled. A headless
+			-- child has no visible title to name either.
+			local exclude = session.toolExclude
+			if session.named or session.headless then
+				exclude = util.copy(exclude or {})
+				exclude.conversation_rename = true
+			end
+			local request = {
+				messages = ctx.wire(systemText),
+				tools = registry.definitions({
+					only = session.toolFilter,
+					groups = session.toolGroups,
+					exclude = exclude,
+				}),
+				stream = session.stream,
+				onFrame = session.onFrame,
+			}
+
+			ctx.observeRequest(request.messages, request.tools, record)
+			local before = ctx.tokens()
+			local summarise = config.get("agent.compaction", true) ~= false and summariser(session) or nil
+			local summary = ctx.compact(summarise, { model = record and record.model })
+			if summary then session.emit("compact", { summary = summary, before = before, after = ctx.tokens() }) end
+			request.messages = ctx.wire(systemText)
+
+			local result, err, usedRecord, accounting = complete(session, request, function(refusedRecord)
+				if session.aborted() then return false end
+				local prior = ctx.tokens()
+				local folded = ctx.compact(summarise, { model = refusedRecord.model, force = true })
+				if not folded then return false end
+				session.emit("compact", { summary = folded, before = prior, after = ctx.tokens() })
+				request.messages = ctx.wire(systemText)
+				return true
+			end)
+			record = usedRecord or record
+
+			if not result then
+				if err == "aborted" then
+					return stopped(session)
+				end
+				session.emit("error", { message = err, fatal = true })
+				return failed(session, "I could not reach a provider. " .. tostring(err))
+			end
+
+			local spent = usage.record(result.usage, result.model or (record and record.model), {
+				prompt = accounting and (accounting.history + accounting.estimate) or usage.estimateMessages(request.messages),
+				completion = usage.estimateText(result.content) + usage.estimateText(result.reasoning),
+			}, record)
+			session.emit("usage", { session = usage.session, turn = usage.turn })
+
+			if util.trim(result.reasoning) ~= "" then
+				session.emit("assistant:reasoning", { text = result.reasoning, requestId = result.requestId, streamId = result.streamId, model = result.model })
+			end
+			local displayed = result.content or ""
+			if #result.toolCalls == 0 and result.finish == "length" then
+				displayed = displayed .. "\n\n[The provider reached its output limit before finishing this reply.]"
+			elseif #result.toolCalls == 0 and result.finish == "content_filter" then
+				displayed = displayed .. "\n\n[The provider filtered part of this reply.]"
+			end
+			if util.trim(displayed) ~= "" then
+				session.emit("assistant:text", { text = displayed, final = #result.toolCalls == 0, requestId = result.requestId, streamId = result.streamId, model = result.model })
+			end
+			session.emit("assistant:complete", { streamId = result.streamId })
+
+			-- Calibrate the context estimate against what the provider actually
+			-- counted for this prompt, before the reply is stored: the real figure
+			-- includes the system prompt and tool schemas the message estimate omits,
+			-- so the next compaction check measures true window pressure.
+			if spent and not spent.estimated then ctx.calibrate(spent.prompt, accounting) end
+			ctx.pushAssistant(result)
+
+			if #result.toolCalls == 0 then
+				finalText = displayed
+				break
+			end
+
+			-- Identical batches mean the model is stuck. Rather than let it burn the
+			-- turn budget, the results are replaced with a refusal that names the
+			-- problem, which is enough for most models to change tack.
+			local signature = callSignature(result.toolCalls)
+			if signature == lastSignature then
+				streak = streak + 1
+			else
+				lastSignature, streak = signature, 1
+			end
+
+			if streak >= repeatLimit then
+				for _, call in ipairs(result.toolCalls) do
+					local name = (call["function"] or {}).name or "tool"
+					ctx.pushToolResult(call.id, name,
+						"This exact call has already been made " .. tostring(streak) ..
+						" times with the same arguments. It will not be run again. Change the approach, or answer with what you already know.")
+				end
+				session.emit("status", { text = "Breaking a repeat loop" })
+				log.warn("loop", "repeat limit hit on " .. util.ellipsis(signature, 120))
+			else
+				for _, call in ipairs(result.toolCalls) do
+					local fn = call["function"] or {}
+					local tool = registry.get(fn.name)
+					session.emit("tool:call", {
+						id = call.id,
+						name = fn.name,
+						group = tool and tool.group or nil,
+						risk = tool and tool.risk or "write",
+						arguments = fn.arguments,
+					})
+				end
+
+				session.emit("status", { text = result.finish == "length" and "Requesting smaller tool calls" or #result.toolCalls == 1
+					and ("Running " .. ((result.toolCalls[1]["function"] or {}).name or "tool"))
+					or ("Running " .. util.pluralise(#result.toolCalls, "tool")) })
+
+				-- The transcript sees a result as soon as that call finishes. Keep the
+				-- model's results in original call order after the entire batch settles.
+				local results
+				if result.finish == "length" then
+					-- Even a complete first call may depend on a later one that was cut
+					-- off. Return a result for every id so the next request can recover.
+					results = {}
+					for index, call in ipairs(result.toolCalls) do
+						results[index] = {
+							id = call.id, name = (call["function"] or {}).name or "tool",
+							ok = false, error = "truncated arguments", ms = 0,
+							text = "The provider cut off this tool batch at its token limit. No calls in this batch ran. "
+								.. "Send smaller complete calls; split large scripts into sequential file_write/file_append calls or targeted file_edit edits.",
+						}
+						session.emit("tool:error", results[index])
+					end
+				else
+					results = registry.runAll(result.toolCalls, session.toolContext(), function(outcome)
+						session.emit(outcome.ok and "tool:result" or "tool:error", outcome)
+					end)
+				end
+
+				for index, call in ipairs(result.toolCalls) do
+					local outcome = results[index] or {
+						id = call.id,
+						name = (call["function"] or {}).name or "tool",
+						ok = false,
+						text = "The tool produced no result.",
+					}
+					ctx.pushToolResult(call.id, outcome.name, outcome.text)
+				end
+				if session.aborted() then return stopped(session) end
+			end
+		end
+
+		if finalText == nil then
+			session.emit("error", {
+				message = "Reached the step limit of " .. tostring(maxTurns) .. ".",
+				fatal = false,
+			})
+			finalText = "I reached this session's step limit before finishing. Tell me to continue and I will pick up where I stopped."
+		end
+
+		session.emit("turn:end", { text = finalText })
+		session.emit("status", { text = "Ready" })
+		return finalText
+	end
+
+	-- Compact on demand, outside a turn -- the composer's Compact now action. Uses
+	-- the same summariser as the automatic path and forces a pass even when the
+	-- conversation is under budget, so an explicit request always folds whatever
+	-- history there is. Returns the summary (or nil when there was nothing to fold)
+	-- and the before/after token estimates.
+	function M.compact(session)
+		local ctx = session.ctx
+		local record = providers.active()
+		local before = ctx.tokens()
+		local summary = ctx.compact(summariser(session), { model = record and record.model, force = true })
+		if summary then
+			session.emit("compact", { summary = summary, before = before, after = ctx.tokens(), manual = true })
+		end
+		return summary, before, ctx.tokens()
+	end
+
+	return M
+end

@@ -1,0 +1,605 @@
+-- Provider records: creation, validation, persistence, health and fallback order.
+--
+-- A record is the whole description of one endpoint, so switching provider is a
+-- data change rather than a code path. Nothing above this module knows which
+-- vendor is in use.
+return function(env)
+	local util = env.require("runtime/util")
+	local config = env.require("runtime/config")
+	local caps = env.require("runtime/caps")
+	local clock = env.require("runtime/clock")
+	local log = env.require("runtime/log")
+	local signal = env.require("runtime/signal")
+	local catalog = env.require("provider/catalog")
+	local urls = env.require("net/url")
+
+	local COOLDOWN_AFTER = 3
+	local COOLDOWN_SECONDS = 45
+
+	local M = {
+		changed = signal.new("providers"),
+	}
+
+	-- Key pool ------------------------------------------------------------
+	--
+	-- One record may carry several keys, pasted one per line (or comma
+	-- separated). The pool is what beats a free-tier RPM ceiling: Google AI
+	-- Studio hands out keys in batches and caps each at 10-15 requests a
+	-- minute, so N keys in one record is N times the ceiling with no second
+	-- provider to configure.
+	--
+	-- The selection is sticky, not round-robin: the same key is used until it
+	-- is rate limited, then the next one takes over instantly. Round-robin
+	-- would spread the limit evenly but also spend every key's quota on
+	-- requests a single exhausted key could have answered, and it makes a
+	-- genuinely dead key indistinguishable from a cooling one.
+	local KEY_COOLDOWN_SECONDS = 30
+
+	function M.keysOf(record)
+		local raw = tostring(record and record.apiKey or "")
+		local keys, seen = {}, {}
+		-- Line breaks are the primary form (that is what a multi-line paste
+		-- produces); commas are accepted because a user who was handed
+		-- "key1,key2" should not have to edit it.
+		for token in raw:gmatch("[^\r\n,]+") do
+			local key = util.trim(token)
+			if key ~= "" and not seen[key] then
+				seen[key] = true
+				keys[#keys + 1] = key
+			end
+		end
+		return keys
+	end
+
+	function M.keyPoolSize(record)
+		return #M.keysOf(record)
+	end
+
+	-- Rotation state is kept on the record, not in this module's memory, so it
+	-- survives nothing it should not and is visible to the health views. It is
+	-- deliberately NOT persisted to config: which key is current is a fact about
+	-- this session, and a saved index would be stale on the next start.
+	local function keyState(record)
+		record.keyRotation = record.keyRotation or { index = 1, cooldowns = {} }
+		return record.keyRotation
+	end
+
+	-- The key a request should use. Sticky: the current index unless that key
+	-- is on cooldown, then the next one that is not. When every key is cooling,
+	-- the one whose cooldown expires soonest -- a pool that is entirely spent
+	-- is a pool that was just load-balanced, and waiting out the shortest
+	-- remaining bench is faster than hammering any single key.
+	function M.nextKey(record)
+		local keys = M.keysOf(record)
+		if #keys == 0 then return nil end
+		if #keys == 1 then return keys[1] end
+
+		local state = keyState(record)
+		local now = clock.ms()
+		local function ready(index)
+			local until_ = state.cooldowns[keys[index]]
+			return until_ == nil or until_ <= now
+		end
+
+		-- Walk the pool from the current index, wrapping once.
+		for offset = 0, #keys - 1 do
+			local index = ((state.index - 1 + offset) % #keys) + 1
+			if ready(index) then
+				state.index = index
+				return keys[index]
+			end
+		end
+
+		-- All cooling: soonest to expire.
+		local best, bestAt = nil, math.huge
+		for index = 1, #keys do
+			local until_ = state.cooldowns[keys[index]] or 0
+			if until_ < bestAt then
+				best, bestAt = keys[index], until_
+			end
+		end
+		return best
+	end
+
+	-- Bench one key after it was refused. `seconds` may be overridden by a
+	-- caller that read a Retry-After header, which outranks our default.
+	function M.cooldownKey(record, key, seconds)
+		local keys = M.keysOf(record)
+		if #keys < 2 then return false end
+		local state = keyState(record)
+		state.cooldowns[key] = clock.ms() + (seconds or KEY_COOLDOWN_SECONDS) * 1000
+		return true
+	end
+
+	function M.keyCooldowns(record)
+		local state = record and record.keyRotation
+		if type(state) ~= "table" then return nil end
+		return state.cooldowns
+	end
+
+	-- Base URL normalisation, done once on save so no request path has to guess.
+	--
+	--   api.openai.com            -> https://api.openai.com/v1
+	--   https://x.dev/            -> https://x.dev/v1
+	--   https://x.dev/openai/v1   -> unchanged (it already names a path)
+	--   https://x.dev/v1/chat/completions -> unchanged, used verbatim
+	function M.normaliseBaseUrl(raw)
+		return urls.normaliseBase(raw)
+	end
+
+	function M.isFullEndpoint(url)
+		return urls.isFullEndpoint(url)
+	end
+
+	function M.endpoint(record, suffix)
+		return urls.endpoint(record.baseUrl or "", suffix, record.query)
+	end
+
+	function M.authHeaders(record, explicitKey)
+		local key = util.trim(explicitKey or M.nextKey(record))
+		local style = record.authStyle or "bearer"
+		if key == "" or style == "none" then return {} end
+		if style == "x-api-key" then return { ["x-api-key"] = key } end
+		if style == "api-key" then return { ["api-key"] = key } end
+		if style == "both" then
+			return { ["Authorization"] = "Bearer " .. key, ["x-api-key"] = key }
+		end
+		return { ["Authorization"] = "Bearer " .. key }
+	end
+
+	function M.needsExecutor(record)
+		return urls.isLocalHost(urls.host(M.normaliseBaseUrl(record.baseUrl)))
+	end
+
+	function M.protocolProblem(record)
+		if record.api ~= nil and record.api ~= "openai" and record.api ~= "anthropic" then
+			return "choose Chat completions or Anthropic messages; this API protocol is not implemented"
+		end
+		local parsed = urls.parse(M.normaliseBaseUrl(record.baseUrl))
+		local path = parsed and parsed.path:gsub("/+$", "") or ""
+		if path:match("/api/chat$") or path:match("/api/generate$") then
+			return "Ollama's native /api routes use a different protocol; use its OpenAI-compatible base URL, usually http://127.0.0.1:11434/v1"
+		end
+		if path:match("/responses$") or path:match(":generateContent$") or path:match("/generateContent$") then
+			return "this route uses a different API; use the provider's Chat Completions or Anthropic Messages endpoint"
+		end
+	end
+
+	-- Limits and learned request repairs belong to one endpoint, protocol and model.
+	function M.compatibilityKey(record)
+		return table.concat({ record.api or "openai", M.endpoint(record, "/models"), record.model or "" }, "\n")
+	end
+
+	local PROXY_HOST = "puai-proxy.davidzk.tech"
+	local function providerRoute(record)
+		local parsed = urls.parse(M.normaliseBaseUrl(record and record.baseUrl or ""))
+		if not parsed then return nil end
+		local path = parsed.path:gsub("/+$", "")
+		local base = path:match("^(.*)/chat/completions$") or path:match("^(.*)/messages$") or path:match("^(.*)/models$")
+		return parsed, base or path
+	end
+
+	-- Only these exact HTTPS proxy routes inherit vendor behavior. A preset label
+	-- or a matching substring cannot attach an identity to an unrelated endpoint.
+	function M.proxyProvider(record)
+		local parsed, path = providerRoute(record)
+		if not parsed or parsed.scheme ~= "https" or parsed.host ~= PROXY_HOST then return nil end
+		local port = parsed.authority:match(":(%d+)$")
+		if port and port ~= "443" then return nil end
+		if path == "/opencode/v1" then return "opencode" end
+		if path == "/agentrouter/v1" then return "agentrouter" end
+	end
+
+	-- Custom hosts, paths and nonstandard ports are never silently rewritten.
+	function M.proxyTarget(record)
+		local parsed, path = providerRoute(record)
+		if not parsed or (parsed.scheme ~= "https" and parsed.scheme ~= "http") then return nil end
+		local port = parsed.authority:match(":(%d+)$")
+		if port and port ~= (parsed.scheme == "https" and "443" or "80") then return nil end
+		local vendor
+		if parsed.host == "opencode.ai" and path == "/zen/v1" then vendor = "opencode" end
+		if (parsed.host == "agentrouter.org" or parsed.host:match("^[%w%.%-]+%.agentrouter%.org$")) and path == "/v1" then vendor = "agentrouter" end
+		if not vendor then return nil end
+		return "https://" .. PROXY_HOST .. "/" .. vendor .. "/v1"
+			.. (parsed.query and parsed.query ~= "" and ("?" .. parsed.query) or "")
+	end
+
+	-- OpenCode compatibility metadata belongs to the official host or its UAI proxy.
+	function M.isOpencode(record)
+		if M.proxyProvider(record) == "opencode" then return true end
+		local base = util.trim(tostring(record and record.baseUrl or "")):lower()
+		local authority = base:match("^https?://([^/%?#]+)")
+		if not authority then return false end
+		return authority == "opencode.ai" or authority:match("^opencode%.ai:%d+$") ~= nil
+	end
+
+	-- Host based so manually entered gateways keep the same required identity.
+	function M.requiresClaude(record)
+		if M.proxyProvider(record) == "agentrouter" then return true end
+		local base = util.trim(tostring(record and record.baseUrl or "")):lower()
+		local authority = base:match("^https?://([^/%?#]+)")
+		if not authority or authority:find("@", 1, true) then return false end
+		local host = authority:gsub(":%d+$", ""):gsub("%.$", "")
+		return host == "agentrouter.org" or host:match("^[%w%.%-]+%.agentrouter%.org$") ~= nil
+	end
+
+	function M.identityFor(record)
+		-- A manually entered Zen endpoint gets the same compatibility identity as
+		-- the preset without competing Claude/Stainless headers.
+		if M.isOpencode(record) then return "none" end
+		if M.requiresClaude(record) then return "claude" end
+		return (record.claudeUa ~= false) and "claude" or "none"
+	end
+
+	local BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+	local function randomBase62(len)
+		local t = {}
+		for i = 1, len do
+			local r = math.random(1, 62)
+			t[i] = BASE62:sub(r, r)
+		end
+		return table.concat(t)
+	end
+
+	local function randomHex(len)
+		local t = {}
+		for i = 1, len do
+			local r = math.random(0, 15)
+			t[i] = string.format("%x", r)
+		end
+		return table.concat(t)
+	end
+
+	local function opencodeId(prefix)
+		return (prefix or "ses_") .. randomHex(12) .. randomBase62(14)
+	end
+	M.opencodeId = opencodeId
+
+	local sessionCache = {}
+	M.opencodeSessionCache = sessionCache
+
+	function M.opencodeSessionFor(record, context)
+		local session = nil
+		local sessionId = nil
+		if type(context) == "table" then
+			if context.session then
+				session = context.session
+				sessionId = session.id or context.sessionId
+			elseif context.id and (type(context.emit) == "function" or type(context.send) == "function") then
+				session = context
+				sessionId = session.id
+			elseif context.sessionId then
+				sessionId = context.sessionId
+			end
+		elseif type(context) == "string" and context ~= "" then
+			sessionId = context
+		end
+
+		if session then
+			local existing = session.opencodeSession
+			if type(existing) == "string" and util.trim(existing) ~= "" and #existing >= 25 then
+				if session.id then sessionCache[session.id] = existing end
+				return existing
+			end
+			if session.id and sessionCache[session.id] then
+				session.opencodeSession = sessionCache[session.id]
+				return sessionCache[session.id]
+			end
+			local created = opencodeId("ses_")
+			session.opencodeSession = created
+			if session.id then sessionCache[session.id] = created end
+			return created
+		end
+
+		if sessionId then
+			if sessionCache[sessionId] then
+				return sessionCache[sessionId]
+			end
+			local created = opencodeId("ses_")
+			sessionCache[sessionId] = created
+			return created
+		end
+
+		if util.trim(record.opencodeSession or "") == "" or #record.opencodeSession < 25 then
+			record.opencodeSession = opencodeId("ses_")
+			-- Header construction also runs for unsaved provider-editor drafts.
+			if M.get(record.id) == record then M.save(record, { quiet = true }) end
+		end
+		return record.opencodeSession
+	end
+
+	function M.opencodeHeaders(record, context)
+		if not M.isOpencode(record) then return {} end
+		-- Match the current upstream CLI defaults; saved overrides remain supported.
+		local version, client = "1.18.31", "cli"
+		if type(record.opencode) == "table" then
+			local configuredVersion = util.trim(tostring(record.opencode.version or ""))
+			local configuredClient = util.trim(tostring(record.opencode.client or ""))
+			if configuredVersion ~= "" then version = configuredVersion end
+			if configuredClient ~= "" then client = configuredClient end
+		end
+		local sessionId = M.opencodeSessionFor(record, context)
+		return {
+			["x-opencode-session"] = sessionId,
+			["x-opencode-request"] = opencodeId("req_"),
+			["x-opencode-project"] = "global",
+			["x-opencode-client"] = client,
+			["User-Agent"] = "opencode/" .. version,
+		}
+	end
+
+	-- A record always has every field, so no consumer needs a nil check.
+	function M.blank(presetId)
+		local preset = catalog.get(presetId or "custom") or catalog.get("custom")
+		return {
+			id = "",
+			preset = preset.id,
+			label = preset.label,
+			baseUrl = preset.baseUrl,
+			apiKey = "",
+			authStyle = preset.authStyle or "bearer",
+			-- Which wire protocol the record speaks. Absent means chat completions,
+			-- which is what every record saved before the second adapter existed has.
+			api = preset.api or "openai",
+			models = util.deepCopy(preset.models or {}),
+			model = (preset.models or {})[1] or "",
+			headers = util.deepCopy(preset.headers or {}),
+			params = util.deepCopy(preset.params or {}),
+			query = util.deepCopy(preset.query or {}),
+
+			stream = true,
+			-- `~= false` rather than an and/or chain: `(x == false) and false or true`
+			-- is still true when x is false, which is the trap both forms of this line
+			-- fell into. A preset's deliberate `false` has to survive the copy.
+			claudeUa = preset.claudeUa ~= false,
+			enabled = true,
+			order = 0,
+			wsUrl = "",
+			note = preset.note,
+			requires = preset.requires,
+			health = { ok = 0, fail = 0, streak = 0, lastError = "", cooldownUntil = 0, lastMs = 0 },
+		}
+	end
+
+	local function ensureId(wanted)
+		local base = util.trim(wanted):lower():gsub("[^%w%-_]", "-"):gsub("%-+", "-"):gsub("^%-", "")
+		if base == "" then base = "provider" end
+		local taken = {}
+		for _, record in ipairs(M.list()) do taken[record.id] = true end
+		if not taken[base] then return base end
+		for index = 2, 99 do
+			local candidate = base .. "-" .. tostring(index)
+			if not taken[candidate] then return candidate end
+		end
+		return base .. "-" .. tostring(clock.ms())
+	end
+
+	function M.list()
+		local stored = config.get("providers.list", {})
+		if type(stored) ~= "table" then return {} end
+		local out = {}
+		for _, record in ipairs(stored) do
+			if type(record) == "table" then out[#out + 1] = record end
+		end
+		table.sort(out, function(a, b)
+			if (a.order or 0) ~= (b.order or 0) then return (a.order or 0) < (b.order or 0) end
+			return tostring(a.id) < tostring(b.id)
+		end)
+		return out
+	end
+
+	function M.get(id)
+		for _, record in ipairs(M.list()) do
+			if record.id == id then return record end
+		end
+		return nil
+	end
+
+	function M.count()
+		return #M.list()
+	end
+
+	-- Validation is deliberately about reachability, not taste: a record with a
+	-- plausible URL and, where needed, a key is allowed even if the vendor turns
+	-- out to reject it. The health counters are what report that.
+	function M.validate(record)
+		local problems = {}
+		if util.trim(record.label) == "" then problems[#problems + 1] = "give the provider a name" end
+		local base, urlError = M.normaliseBaseUrl(record.baseUrl)
+		if base == "" then
+			problems[#problems + 1] = "base URL is required"
+		elseif urlError then
+			problems[#problems + 1] = urlError
+		end
+		local protocolProblem = M.protocolProblem(record)
+		if protocolProblem then problems[#problems + 1] = protocolProblem end
+		if util.trim(record.wsUrl) ~= "" then
+			local socketUrl = urls.parse(record.wsUrl)
+			if not socketUrl or (socketUrl.scheme ~= "ws" and socketUrl.scheme ~= "wss") then
+				problems[#problems + 1] = "socket URL must be a ws:// or wss:// gateway that implements UAI's envelope protocol"
+			end
+		end
+		if (record.authStyle or "bearer") ~= "none" and util.trim(record.apiKey) == "" then
+			problems[#problems + 1] = "an API key is required for this auth style"
+		end
+		-- Azure takes the model from the deployment in the URL; everyone else needs
+		-- one named, and nothing here will guess it.
+		if record.preset ~= "azure" and util.trim(record.model) == "" then
+			problems[#problems + 1] = "fetch the model list or add a model id"
+		end
+		if M.needsExecutor(record) and caps.http ~= "executor" then
+			problems[#problems + 1] = "local/private endpoints need an executor HTTP function on the machine that can reach the server; this host has none"
+		end
+		return #problems == 0, problems
+	end
+
+	function M.save(record, opts)
+		opts = opts or {}
+		record.baseUrl = M.normaliseBaseUrl(record.baseUrl)
+		if M.requiresClaude(record) then record.claudeUa = true end
+		local ok, problems = M.validate(record)
+		if not ok and not opts.force then return false, problems end
+
+		local list = config.get("providers.list", {})
+		if type(list) ~= "table" then list = {} end
+		if util.trim(record.id) == "" then
+			record.id = ensureId(record.label ~= "" and record.label or record.preset)
+			record.order = #list + 1
+			list[#list + 1] = record
+		else
+			local replaced = false
+			for index, existing in ipairs(list) do
+				if existing.id == record.id then
+					list[index] = record
+					replaced = true
+				end
+			end
+			if not replaced then
+				record.order = #list + 1
+				list[#list + 1] = record
+			end
+		end
+		config.set("providers.list", list)
+		if util.trim(config.get("providers.active", "")) == "" then
+			config.set("providers.active", record.id)
+		end
+		M.changed:fire("save", record)
+		return true, record
+	end
+
+	function M.remove(id)
+		local list = config.get("providers.list", {})
+		local kept = {}
+		for _, record in ipairs(list) do
+			if record.id ~= id then kept[#kept + 1] = record end
+		end
+		config.set("providers.list", kept)
+		if config.get("providers.active", "") == id then
+			config.set("providers.active", kept[1] and kept[1].id or "")
+		end
+		M.changed:fire("remove", id)
+		return true
+	end
+
+	function M.setActive(id)
+		if not M.get(id) then return false, "unknown provider" end
+		config.set("providers.active", id)
+		M.changed:fire("active", id)
+		return true
+	end
+
+	function M.active()
+		local wanted = config.get("providers.active", "")
+		local record = M.get(wanted)
+		if record then return record end
+		for _, candidate in ipairs(M.list()) do
+			if candidate.enabled ~= false then return candidate end
+		end
+		return nil
+	end
+
+	function M.setModel(id, model)
+		local record = M.get(id)
+		if not record then return false end
+		record.model = model
+		if not util.find(record.models or {}, function(item) return item == model end) then
+			record.models = record.models or {}
+			table.insert(record.models, 1, model)
+		end
+		M.save(record, { force = true })
+		M.changed:fire("model", record)
+		return true
+	end
+
+	function M.reorder(id, direction)
+		local list = M.list()
+		for index, record in ipairs(list) do
+			if record.id == id then
+				local swapWith = list[index + direction]
+				if not swapWith then return false end
+				local mine, theirs = record.order or index, swapWith.order or (index + direction)
+				record.order, swapWith.order = theirs, mine
+				config.set("providers.list", list)
+				M.changed:fire("order", id)
+				return true
+			end
+		end
+		return false
+	end
+
+	-- Health -----------------------------------------------------------------
+
+	local function health(record)
+		record.health = record.health or { ok = 0, fail = 0, streak = 0, lastError = "", cooldownUntil = 0 }
+		return record.health
+	end
+
+	function M.markOk(record, ms)
+		local state = health(record)
+		state.ok = state.ok + 1
+		state.streak = 0
+		state.lastError = ""
+		state.cooldownUntil = 0
+		state.lastMs = ms or state.lastMs
+		M.changed:fire("health", record)
+	end
+
+	-- Consecutive failures put a provider on the bench rather than the first one:
+	-- a single 500 from an otherwise healthy endpoint is noise, and demoting on it
+	-- would flap the active provider on every hiccup.
+	function M.markFail(record, message)
+		local state = health(record)
+		state.fail = state.fail + 1
+		state.streak = state.streak + 1
+		state.lastError = util.ellipsis(message or "request failed", 200)
+		if state.streak >= COOLDOWN_AFTER then
+			state.cooldownUntil = clock.ms() + COOLDOWN_SECONDS * 1000
+			log.warn("provider", record.label .. " benched for " .. tostring(COOLDOWN_SECONDS) .. "s", state.lastError)
+		end
+		M.changed:fire("health", record)
+	end
+
+	function M.cooling(record)
+		local state = health(record)
+		return (state.cooldownUntil or 0) > clock.ms()
+	end
+
+	-- Ordered attempt list: the active provider, then every other enabled one that
+	-- is not cooling down, then -- if that leaves nothing -- the cooling ones
+	-- anyway, because refusing to try at all is worse than trying a bad endpoint.
+	function M.chain()
+		local out = {}
+		local seen = {}
+		local activeRecord = M.active()
+		if activeRecord and activeRecord.enabled ~= false then
+			out[#out + 1] = activeRecord
+			seen[activeRecord.id] = true
+		end
+		if config.get("agent.fallback", true) then
+			for _, record in ipairs(M.list()) do
+				if not seen[record.id] and record.enabled ~= false and not M.cooling(record) then
+					out[#out + 1] = record
+					seen[record.id] = true
+				end
+			end
+			if #out == 0 then
+				for _, record in ipairs(M.list()) do
+					if record.enabled ~= false then out[#out + 1] = record end
+				end
+			end
+		end
+		return out
+	end
+
+	function M.summary(record)
+		if not record then return "no provider configured" end
+		local state = health(record)
+		local bits = { record.label }
+		if record.model ~= "" then bits[#bits + 1] = record.model end
+		if M.cooling(record) then bits[#bits + 1] = "cooling down" end
+		if state.lastMs and state.lastMs > 0 then bits[#bits + 1] = util.formatDuration(state.lastMs) end
+		return table.concat(bits, " | ")
+	end
+
+	return M
+end
