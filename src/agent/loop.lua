@@ -226,7 +226,15 @@ return function(env)
 				return failed(session, "I ran out of time on this turn. Ask me to continue if you want me to keep going.")
 			end
 
-			session.emit("status", { text = turn == 1 and "Thinking" or ("Working (step " .. turn .. ")") })
+			local statusText = "Thinking"
+			if turn == 1 then
+				statusText = "Thinking"
+			elseif turn <= 3 then
+				statusText = "Working (step " .. turn .. ")"
+			else
+				statusText = "Still working (step " .. turn .. ")"
+			end
+			session.emit("status", { text = statusText })
 
 			local record = providers.active()
 			-- A session may carry its own brief. A subagent does: it answers to the
