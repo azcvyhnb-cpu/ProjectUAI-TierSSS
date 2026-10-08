@@ -38,10 +38,17 @@ return function(env)
 		if type(value) ~= "table" then return util.encode(value) end
 		depth = (depth or 0) + 1
 		if depth > 32 then return util.encode(value) end
-		if next(value) == nil then return "{}" end
+		-- JSONDecode can represent both {} and [] as empty Luau tables. If an
+		-- empty container occurs, keep the provider's original JSON instead of
+		-- risking a false match between semantically different arguments.
+		if next(value) == nil then return nil end
 		if util.isArray(value) then
 			local items = {}
-			for index, item in ipairs(value) do items[#items + 1] = canonicalValue(item, depth) end
+			for _, item in ipairs(value) do
+				local encoded = canonicalValue(item, depth)
+				if not encoded then return nil end
+				items[#items + 1] = encoded
+			end
 			return "[" .. table.concat(items, ",") .. "]"
 		end
 		local keys = {}
@@ -49,7 +56,9 @@ return function(env)
 		table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
 		local fields = {}
 		for _, key in ipairs(keys) do
-			fields[#fields + 1] = util.encode(tostring(key)) .. ":" .. canonicalValue(value[key], depth)
+			local encoded = canonicalValue(value[key], depth)
+			if not encoded then return nil end
+			fields[#fields + 1] = util.encode(tostring(key)) .. ":" .. encoded
 		end
 		return "{" .. table.concat(fields, ",") .. "}"
 	end
@@ -60,7 +69,8 @@ return function(env)
 			local fn = call["function"] or {}
 			local raw = fn.arguments or call.arguments or "{}"
 			local args = util.decode(raw)
-			local signatureArgs = type(args) == "table" and canonicalValue(args) or tostring(raw)
+			local signatureArgs = type(args) == "table" and canonicalValue(args) or nil
+			if not signatureArgs then signatureArgs = tostring(raw) end
 			parts[#parts + 1] = tostring(fn.name or call.name) .. "(" .. signatureArgs .. ")"
 		end
 		table.sort(parts)
