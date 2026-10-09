@@ -511,7 +511,7 @@ return function(env)
 		local headers = rebuildHeaders()
 
 		local started = clock.ms()
-		local deadline = started + math.max(1, math.min(900, tonumber(requestTimeout(request)) or 120)) * 1000
+		local deadline = started + math.max(1, math.min(600, tonumber(requestTimeout(request)) or 120)) * 1000
 		local recovery = proxy.new(record, { aborted = request.aborted, onRetry = request.onRetry, deadlineMs = deadline })
 		local lastRequestMs = 0
 		local rotationsLeft = math.max(#pool - 1, 0)
@@ -604,7 +604,7 @@ return function(env)
 		-- can finish inside the wall. Only after 20-130 seconds without a response,
 		-- and only when the smaller ask is actually smaller.
 		local recoveredTokens
-		if not res and err and not http.terminal(err) and lastRequestMs >= 20000 and lastRequestMs <= 130000 then
+		if not res and err and (not http.terminal(err) or tostring(err):find("nothing returned after", 1, true)) and lastRequestMs >= 20000 and lastRequestMs <= 130000 then
 			local lowered, note = smallerAsk(body)
 			if lowered and util.encode(lowered) ~= util.encode(body) then
 				log.info("provider", record.label .. ": hit the transport wall, retrying smaller (" .. note .. ")")
