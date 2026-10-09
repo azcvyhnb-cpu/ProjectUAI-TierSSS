@@ -23,6 +23,27 @@ local function fixture()
 	return env, config, context
 end
 
+scenario("trimming estimates each removed turn once instead of rescanning history", function()
+	local env, config, context = fixture()
+	local ctx = context.new()
+	local usage = env.require("agent/usage")
+	local original, estimates = usage.estimateMessages, 0
+	usage.estimateMessages = function(messages)
+		estimates = estimates + 1
+		return original(messages)
+	end
+	for index = 1, 100 do
+		ctx.pushUser(string.rep("question ", 12) .. index)
+		ctx.pushAssistant({ content = string.rep("answer ", 12) .. index, reasoning = "", toolCalls = {} })
+	end
+	local before = #ctx.messages
+	local removed = ctx.trim(1000, 2, false)
+	check("old turn blocks were removed", #removed > 0 and #ctx.messages < before)
+	check("the latest two user turns remain", ctx.messages[#ctx.messages - 3].role == "user" and ctx.messages[#ctx.messages - 1].role == "user")
+	check("token estimator calls scale with removed turns", estimates <= #removed + 5)
+	usage.estimateMessages = original
+end)
+
 scenario("limitFor scales to the model window and honours the hard cap", function()
 	local _, config, context = fixture()
 	config.set("agent.contextFraction", 0.8)
