@@ -311,7 +311,7 @@ return function(env)
 				local decoded = util.decode(payload)
 				if type(decoded) == "table" then
 					if decoded.error then
-						streamError = streamError or "malformed_stream: provider reported a stream error"
+						streamError = streamError or ("malformed_stream: " .. M.errorMessage(decoded))
 					else
 						assembler.feedChunk(decoded)
 					end
