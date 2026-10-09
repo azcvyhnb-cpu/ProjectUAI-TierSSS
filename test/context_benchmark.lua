@@ -47,7 +47,7 @@ for _, size in ipairs(sizes) do
 	local before = ctx.tokens()
 	local started = os.clock()
 	local removed = ctx.compact(function() return "Earlier turns were summarized." end,
-		{ tokenLimit = 6000, keepBlocks = 14 })
+		{ tokenLimit = 2500, keepBlocks = 14 })
 	local elapsed = (os.clock() - started) * 1000
 	local after = ctx.tokens()
 	print(string.format("%s\t%d\t%d\t%d\t%d\t%d\t%.3f",
