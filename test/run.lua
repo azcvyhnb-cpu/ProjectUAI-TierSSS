@@ -7212,6 +7212,31 @@ scenario("the what's new modal renders every release on wide and narrow viewport
 		harness.errors()[1] and harness.errors()[1].traceback or nil)
 end)
 
+scenario("per-provider token diagnostics distinguish reported usage and retry exposure", function()
+	local _, handle = bootWith({ provider = false })
+	local usage = handle.env.require("agent/usage")
+	local record = { id = "metrics-test", label = "Metrics test", model = "fixture-model" }
+	local accounting = { history = 100, estimate = 30, system = 20, schema = 10 }
+	usage.observeRequest(record, record.model, accounting)
+	usage.observeRetry(record, record.model, accounting, "request timeout")
+	usage.record(nil, record.model, { prompt = 130, completion = 12 }, record)
+	local key = "metrics-test|fixture-model"
+	local stats = usage.providerSnapshot()[key]
+	truthy("provider diagnostics are exposed", stats ~= nil)
+	check("request attempts are counted", stats and stats.requests, 1)
+	check("retries are counted", stats and stats.retries, 1)
+	check("system and schema estimates stay separate", stats and stats.systemEstimate, 20)
+	check("tool schema estimate is retained", stats and stats.schemaEstimate, 10)
+	check("retry exposure is not called billed usage", stats and stats.retryPromptExposure, 130)
+	check("estimated prompt is not reported as provider usage", stats and stats.reportedPrompt, 0)
+	check("fallback prompt is labelled estimated", stats and stats.estimatedPrompt, 130)
+	usage.record({ prompt_tokens = 80, completion_tokens = 8 }, record.model,
+		{ prompt = 130, completion = 12 }, record)
+	stats = usage.providerSnapshot()[key]
+	check("provider-reported prompt usage is tracked separately", stats and stats.reportedPrompt, 80)
+	check("estimated output fallback is separate from reported output", stats and stats.reportedOutput, 8)
+end)
+
 scenario("universal model pricing resolves across inference providers", function()
 	local _, handle = bootWith({ provider = false })
 	local usage = handle.env.require("agent/usage")
