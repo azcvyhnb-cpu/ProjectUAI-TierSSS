@@ -16,6 +16,7 @@ return function(env)
 	local responsive = env.require("ui/responsive")
 	local P = env.require("ui/primitives")
 	local C = env.require("ui/controls")
+	local thai = env.require("ui/thai_help")
 
 	local R = {}
 
@@ -36,7 +37,7 @@ return function(env)
 		})
 		P.sectionHeader(group, {
 			title = props.title,
-			description = props.description,
+			description = thai.text(props.description),
 			layoutOrder = 1,
 		})
 		return P.card(group, {
@@ -78,7 +79,7 @@ return function(env)
 		P.text(text, { text = props.label, role = "label", wrap = true, auto = "Y" })
 		if props.hint then
 			P.text(text, {
-				text = props.hint,
+				text = thai.text(props.hint),
 				role = "caption",
 				color = theme.color.textTertiary,
 				wrap = true,
@@ -161,7 +162,7 @@ return function(env)
 			end,
 		})
 		if hint then
-			P.text(column, { text = hint, role = "caption", color = theme.color.textTertiary, wrap = true, auto = "Y" })
+			P.text(column, { text = thai.text(hint), role = "caption", color = theme.color.textTertiary, wrap = true, auto = "Y" })
 		end
 		return column
 	end
