@@ -9,6 +9,12 @@ on:
 permissions:
   contents: write
 
+# Bundle generation writes back to main; serialize push-triggered jobs to avoid
+# concurrent CI runs racing while committing the same generated artifacts.
+concurrency:
+  group: projectuai-quality-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   quality:
     runs-on: ubuntu-latest
