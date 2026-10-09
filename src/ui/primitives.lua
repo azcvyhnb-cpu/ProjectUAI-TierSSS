@@ -22,27 +22,39 @@ return function(env)
 	function P.animate(instance, motion, goals, onComplete)
 		local state = transitions[instance]
 		if not state then
-			state = {}
+			state = { goals = {} }
 			transitions[instance] = state
 			instance.Destroying:Connect(function()
 				state.dead = true
 				if state.finished then state.finished:Disconnect() end
 				if state.tween then state.tween:Cancel() end
+				state.tween, state.finished, state.goals, state.onComplete = nil, nil, nil, nil
 				transitions[instance] = nil
 			end)
 		end
+		-- Calls targeting the same instance can animate different properties (for
+		-- example, position from a panel transition and transparency from a fade).
+		-- Merge their targets before replacing the tween so cancelling one transition
+		-- cannot silently strand the other properties at intermediate values.
+		state.goals = state.goals or {}
+		for property, value in pairs(goals) do
+			state.goals[property] = value
+		end
+		state.onComplete = onComplete
 		if state.finished then state.finished:Disconnect() end
 		local previous = state.tween
 		state.tween = nil
 		if previous then previous:Cancel() end
-		local tween = env.tween:Create(instance, theme.tween(motion), goals)
+		local tween = env.tween:Create(instance, theme.tween(motion), state.goals)
 		state.tween = tween
 		state.finished = tween.Completed:Connect(function(playback)
 			if state.dead or state.tween ~= tween then return end
 			state.tween = nil
 			if state.finished then state.finished:Disconnect() end
 			state.finished = nil
-			if playback ~= Enum.PlaybackState.Cancelled and onComplete then onComplete() end
+			local callback = state.onComplete
+			state.onComplete, state.goals = nil, nil
+			if playback ~= Enum.PlaybackState.Cancelled and callback then callback() end
 		end)
 		tween:Play()
 		return tween
