@@ -43,6 +43,9 @@ jobs:
       - name: Run mobile UI and minimized launcher tests
         run: luajit test/mobile_ui.lua
 
+      - name: Run shared UI layout and animation regressions
+        run: luajit test/shared_ui_layout.lua
+
       - name: Run Thai UI help localization tests
         run: luajit test/thai_help.lua
 
