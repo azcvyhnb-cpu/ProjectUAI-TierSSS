@@ -226,6 +226,7 @@ scenario("handheld keeps compact desktop geometry with readable text and icons",
 	check("expanding restores the same sidebar and draft", app.app.sideHolder.Visible and app.app.window == window and composer.field.get() == "Keep the shared draft")
 	h.click(h.byName("Minimize", window.root))
 	check("the shared minimize control exposes the launcher", not window.visible and app.app.launcher.Visible)
+	check("minimized mobile launcher is a compact 44 px square", app.app.launcher.Size.X.Offset == 44 and app.app.launcher.Size.Y.Offset == 44)
 	h.click(app.app.launcher)
 	check("restore keeps the same mounted draft", window.visible and app.app.chatPanel.composer.field.instance == field and composer.field.get() == "Keep the shared draft")
 	local oldCaption = theme.text.caption.size
