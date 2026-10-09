@@ -75,9 +75,9 @@ return function(env)
 			unlimitedTurns = true,
 			toolConcurrency = 8,
 			toolTimeout = 45,
-			-- Configured per-request budget in seconds. Native HTTP is capped by the
-			-- transport layer, and Delta/executor transports may impose a shorter limit.
-			requestTimeout = 240,
+			-- Configured per-request budget in seconds. Native HTTP permits up to 900 seconds;
+			-- Delta/executor transports and providers may impose a shorter limit.
+			requestTimeout = 900,
 			-- When enabled, adapters request an 86400-second budget and bypass the
 			-- configured requestTimeout. The transport or executor may still cap the wait.
 			requestUnlimited = true,
