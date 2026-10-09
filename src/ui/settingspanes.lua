@@ -37,6 +37,7 @@ return function(env)
 	local ua = env.require("net/ua")
 	local http = env.require("net/http")
 	local bridgeModule = env.require("net/bridge")
+	local thai = env.require("ui/thai_help")
 
 	local M = {}
 	function M.observeChanges(callback)
@@ -84,11 +85,11 @@ return function(env)
 				gap = theme.space.xs,
 				layoutOrder = api.order(),
 			})
-			P.sectionHeader(group, { title = title, description = description, layoutOrder = 1 })
+			P.sectionHeader(group, { title = title, description = thai.text(description), layoutOrder = 1 })
 			return P.card(group, { layoutOrder = 2, gap = theme.space.md, padding = theme.space.lg })
 		end
 		function api.note(text, colour)
-			return R.paragraph(container, text, { color = colour, layoutOrder = api.order() })
+			return R.paragraph(container, thai.text(text), { color = colour, layoutOrder = api.order() })
 		end
 		return api
 	end
