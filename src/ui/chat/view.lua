@@ -278,13 +278,30 @@ return function(env)
 			view.run = nil
 		end
 
+		local MAX_VISIBLE_THOUGHT_BYTES = 32768
+
 		local function appendThought(run, event, previewHandle)
 			local handle = previewHandle or run.thought
 			if not handle or not handle.root.Parent then handle = message.reasoning(run.rows, "", run.slot()) end
 			local chunks = handle.thoughtChunks or {}
 			local store = view.session and view.session.transcript
 			local retained = event.transcriptId and store and store.get(event.transcriptId)
-			chunks[#chunks + 1] = { id = event.transcriptId, text = (retained or event).text }
+			local chunkText = tostring((retained or event).text or "")
+			-- A long-running agent can emit thousands of reasoning fragments. Keep the
+			-- rendered disclosure bounded so one ever-growing TextLabel cannot become a
+			-- large GUI allocation on mobile. The session transcript remains authoritative;
+			-- this only trims the live display window, not saved conversation data.
+			if #chunkText > MAX_VISIBLE_THOUGHT_BYTES then chunkText = chunkText:sub(-MAX_VISIBLE_THOUGHT_BYTES) end
+			chunks[#chunks + 1] = { id = event.transcriptId, text = chunkText }
+			handle.thoughtBytes = (handle.thoughtBytes or 0) + #chunkText
+			while handle.thoughtBytes > MAX_VISIBLE_THOUGHT_BYTES and #chunks > 1 do
+				local removed = table.remove(chunks, 1)
+				handle.thoughtBytes = handle.thoughtBytes - #removed.text
+				if removed.id and handle.transcriptIds then
+					handle.transcriptIds[removed.id] = nil
+					if view.rows[removed.id] == handle then view.rows[removed.id] = nil end
+				end
+			end
 			setThoughtChunks(handle, chunks)
 			run.thought = track(handle, event)
 		end
