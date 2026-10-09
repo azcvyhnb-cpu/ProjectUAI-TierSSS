@@ -40,6 +40,9 @@ jobs:
       - name: Run persistent research memory tests
         run: luajit test/research_memory.lua
 
+      - name: Run mobile UI and minimized launcher tests
+        run: luajit test/mobile_ui.lua
+
       - name: Benchmark small, medium, and large transcripts
         run: luajit test/context_benchmark.lua
 
