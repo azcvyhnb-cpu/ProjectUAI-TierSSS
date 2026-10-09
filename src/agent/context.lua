@@ -200,19 +200,35 @@ return function(env)
 			local limit = tokenLimit or config.get("agent.contextTokens", 24000)
 			local keep = math.max(keepBlocks or 2, 1)
 			local removed = {}
+			local starts = blockStarts()
+			local blockCount = #starts
+			local currentTokens = ctx.tokens()
+			local cutTo = 0
+			local firstBlock = 1
 
-			while force or ctx.tokens() > limit do
-				local starts = blockStarts()
-				if #starts <= keep then break end
-				local cutTo = starts[2] and (starts[2] - 1) or 0
-				if cutTo <= 0 then break end
-				local kept = {}
-				for index, message in ipairs(ctx.messages) do
-					if index <= cutTo then
+			-- Estimate and remove each leading turn once, then rebuild the retained
+			-- message array once. Re-scanning and copying the whole transcript for
+			-- every removed turn made large compactions quadratic in history size.
+			while firstBlock < blockCount and (force or currentTokens > limit)
+				and blockCount - firstBlock + 1 > keep do
+				local nextStart = starts[firstBlock + 1]
+				local block = {}
+				for index = cutTo + 1, nextStart - 1 do
+					local message = ctx.messages[index]
+					if message then
+						block[#block + 1] = message
 						removed[#removed + 1] = message
-					else
-						kept[#kept + 1] = message
 					end
+				end
+				currentTokens = currentTokens - usage.estimateMessages(block)
+				cutTo = nextStart - 1
+				firstBlock = firstBlock + 1
+			end
+
+			if cutTo > 0 then
+				local kept = {}
+				for index = cutTo + 1, #ctx.messages do
+					kept[#kept + 1] = ctx.messages[index]
 				end
 				ctx.messages = kept
 			end
@@ -222,11 +238,13 @@ return function(env)
 			-- dropping the block and losing the user's actual question. A forced pass
 			-- (Compact now) skips this: it is folding history, not rescuing a request,
 			-- and must not gut the recent turns it deliberately keeps.
-			if not force and ctx.tokens() > limit then
+			if not force and currentTokens > limit then
 				for _, message in ipairs(ctx.messages) do
 					if message.role == "tool" and #tostring(message.content) > 400 then
+						local beforeTokens = usage.estimateMessages({ message })
 						message.content = util.truncate(message.content, 400, "trimmed to fit the context budget")
-						if ctx.tokens() <= limit then break end
+						currentTokens = currentTokens - beforeTokens + usage.estimateMessages({ message })
+						if currentTokens <= limit then break end
 					end
 				end
 			end
