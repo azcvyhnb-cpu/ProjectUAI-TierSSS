@@ -222,6 +222,7 @@ return function(env)
 	function M.reset()
 		M.session = { prompt = 0, completion = 0, total = 0, cost = 0, requests = 0, estimated = false }
 		M.turn = { prompt = 0, completion = 0, total = 0, cost = 0 }
+		M.providers = {}
 		M.changed:fire(M.session, M.turn)
 	end
 
