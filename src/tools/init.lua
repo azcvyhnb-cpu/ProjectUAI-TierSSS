@@ -26,6 +26,7 @@ local GROUPS = {
 	"iy",
 	"gravity",
 	"skills",
+	"research",
 	"analyzer",
 }
 
