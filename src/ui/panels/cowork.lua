@@ -16,6 +16,7 @@ return function(env)
 	local theme = env.require("ui/theme")
 	local P = env.require("ui/primitives")
 	local C = env.require("ui/controls")
+	local thai = env.require("ui/thai_help")
 	local overlay = env.require("ui/overlay")
 	local bridge = env.require("net/bridge")
 	local sessions = env.require("agent/session")
@@ -33,7 +34,7 @@ return function(env)
 
 		P.sectionHeader(scroll.instance, {
 			title = "Cowork",
-			description = "Give your conversation more room in the browser. Follow the steps below on this computer. "
+			description = thai.text("Give your conversation more room in the browser. Follow the steps below on this computer. ")
 				.. "Messages, tools, and permissions stay connected to this Roblox session.",
 			layoutOrder = 1,
 		})
