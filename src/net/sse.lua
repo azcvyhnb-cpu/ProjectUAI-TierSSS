@@ -92,6 +92,34 @@ return function(env)
 		return self
 	end
 
+	-- Preserve actionable provider diagnostics from an in-band SSE error without
+	-- echoing the whole payload (which could contain request data). Gateways vary
+	-- between OpenAI-style {error={message,type,code}} and top-level message fields.
+	function M.errorMessage(payload)
+		local decoded = type(payload) == "table" and payload or util.decode(tostring(payload or ""))
+		if type(decoded) ~= "table" then return nil end
+		local err = decoded.error
+		local message, kind, code
+		if type(err) == "table" then
+			message, kind, code = err.message, err.type, err.code
+		elseif type(err) == "string" then
+			message = err
+		end
+		message = type(message) == "string" and util.trim(message) or ""
+		kind = type(kind) == "string" and util.trim(kind) or ""
+		code = type(code) == "string" or type(code) == "number" and tostring(code) or ""
+		if type(code) ~= "string" then code = "" end
+		if message == "" then message = type(decoded.message) == "string" and util.trim(decoded.message) or "" end
+		if message == "" then message = type(decoded.detail) == "string" and util.trim(decoded.detail) or "" end
+		if message == "" then message = kind end
+		if message == "" then message = code end
+		if message == "" then return "provider reported a stream error" end
+		local suffix = ""
+		if code ~= "" and not message:find(code, 1, true) then suffix = suffix .. " [" .. code .. "]" end
+		if kind ~= "" and not message:find(kind, 1, true) then suffix = suffix .. " (" .. kind .. ")" end
+		return util.ellipsis(message .. suffix, 320)
+	end
+
 	function M.frames(body)
 		local out = {}
 		local decoder = M.decoder(function(frame) out[#out + 1] = frame end)
