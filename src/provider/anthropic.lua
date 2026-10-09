@@ -27,8 +27,8 @@ return function(env)
 
 	local M = {}
 
-	-- Requested budget; native HTTP permits up to 900 seconds and the executor
-	-- or provider may impose a shorter deadline.
+	-- Requested budget; HTTP and WebSocket transports cap waits at 600 seconds.
+	-- The executor or provider may impose a shorter deadline.
 	local function requestTimeout(request)
 		if request.timeout then return request.timeout end
 		if config.get("agent.requestUnlimited", false) then return 86400 end
