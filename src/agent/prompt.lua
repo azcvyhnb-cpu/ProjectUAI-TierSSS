@@ -368,9 +368,51 @@ Background chat:
 	-- Assembled fresh each turn. The order matters: identity, then the facts, then
 	-- the rules, then the mutable blocks last so they are closest to the
 	-- conversation and hardest to lose to attention decay.
+	local function taskGuides(opts)
+		-- The two detailed workflow manuals cost tokens on every request even when
+		-- the user is asking an ordinary question. Use the recent user turns to keep
+		-- them for coding/UI work, while preserving the full prompt for previews and
+		-- callers without a session. A false negative is avoided by treating map and
+		-- general feature work as implementation tasks.
+		local session = opts and opts.session
+		local messages = session and session.ctx and session.ctx.messages
+		if type(messages) ~= "table" then return true, true end
+		local recent, users = {}, 0
+		for index = #messages, 1, -1 do
+			local message = messages[index]
+			if type(message) == "table" and message.role == "user" then
+				local body = type(message.content) == "string" and message.content or ""
+				recent[#recent + 1] = body:lower()
+				users = users + 1
+				if users >= 4 then break end
+			end
+		end
+		local task = table.concat(recent, "\n")
+		local function containsAny(words)
+			for _, word in ipairs(words) do
+				if task:find(word, 1, true) then return true end
+			end
+			return false
+		end
+		local implementation = containsAny({
+			"script", "code", "source", "function", "module", "file", "test", "build",
+			"refactor", "implement", "create", "fix", "bug", "error", "feature",
+			"optimize", "repository", "roblox", "map", "minimap", "waypoint",
+			"โค้ด", "สคริปต์", "ฟังก์ชัน", "พัฒนา", "แก้", "ระบบ", "แมพ", "แผนที่",
+		})
+		local interface = containsAny({
+			"ui", "gui", "interface", "screen", "button", "menu", "minimap",
+			"waypoint", "map", "แมพ", "แผนที่", "หน้าจอ", "ปุ่ม",
+		})
+		return implementation, interface
+	end
+
 	function M.build(opts)
 		opts = opts or {}
-		local parts = { IDENTITY, "", SKILLS_FIRST, "", NATIVE_WORKSPACE, "", SCRIPT_UI, "", SCRIPT_PROJECTS, "" }
+		local includeProject, includeUI = taskGuides(opts)
+		local parts = { IDENTITY, "", SKILLS_FIRST, "", NATIVE_WORKSPACE, "" }
+		if includeUI then parts[#parts + 1] = SCRIPT_UI; parts[#parts + 1] = "" end
+		if includeProject then parts[#parts + 1] = SCRIPT_PROJECTS; parts[#parts + 1] = "" end
 
 		parts[#parts + 1] = "Environment:"
 		parts[#parts + 1] = environmentBlock()
