@@ -938,7 +938,7 @@ return function(env)
 					body = payload,
 					aborted = request.aborted,
 					onFrame = request.onFrame,
-					-- The transport bounds this setting to 1..300 seconds.
+					-- The transport bounds this setting to 1..900 seconds.
 					timeout = requestTimeout(request),
 				})
 				if streamBody then
@@ -951,7 +951,7 @@ return function(env)
 			-- A socket setup failure before Send retains its existing HTTP fallback.
 			-- Once HTTP starts, proxy/key/parameter retries share its one deadline.
 			if not deadline then
-				deadline = requestStarted + math.max(1, math.min(300, tonumber(requestTimeout(request)) or 120)) * 1000
+				deadline = requestStarted + math.max(1, math.min(900, tonumber(requestTimeout(request)) or 120)) * 1000
 				recovery = proxy.new(record, { aborted = request.aborted, onRetry = request.onRetry, deadlineMs = deadline })
 			end
 			local res, err = http.send({
