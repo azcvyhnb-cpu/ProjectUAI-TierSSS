@@ -433,7 +433,7 @@ return function(env)
 	-- user cancel during the sleep rather than after it.
 	function M.send(spec)
 		local attempts = math.max(1, math.min(8, tonumber(spec.attempts) or 1))
-		local deadline = tonumber(spec.deadlineMs) or (clock.ms() + math.max(1, math.min(300, tonumber(spec.timeout) or 120)) * 1000)
+		local deadline = tonumber(spec.deadlineMs) or (clock.ms() + math.max(1, math.min(900, tonumber(spec.timeout) or 120)) * 1000)
 		local lastRes, lastErr
 		for attempt = 1, attempts do
 			if aborted(spec) then return nil, "aborted" end
