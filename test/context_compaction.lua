@@ -101,6 +101,13 @@ scenario("prepared requests include prompt and tool overhead before a provider r
 	local request = ctx.observeRequest(wire, tools, record)
 	local expected = usage.estimateMessages(wire) + usage.estimateText(env.require("runtime/util").encode(tools))
 	check("first-request pressure includes both system and schemas", ctx.pressure(record) == expected)
+	check("request accounting separates system instructions", request.system == usage.estimateMessages(wire) - usage.estimateMessages(ctx.messages))
+	check("request accounting separates tool schema tokens", request.schema == usage.estimateText(env.require("runtime/util").encode(tools)))
+	usage.observeRequest(record, record.model, request)
+	usage.observeRetry(record, record.model, request, "request timeout")
+	local provider = usage.providerSnapshot()["first|fixture"]
+	check("provider metrics count request and retry", provider and provider.requests == 1 and provider.retries == 1)
+	check("retry exposure is tracked as an estimate", provider and provider.retryPromptExposure == request.history + request.estimate)
 	local parts = ctx.breakdown(record)
 	check("breakdown categories sum to pressure", parts.system + parts.messages + parts.summary == expected and parts.estimatedPrompt and not parts.calibrated)
 	ctx.pushAssistant({ content = "reply added after dispatch" })
