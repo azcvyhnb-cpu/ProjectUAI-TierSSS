@@ -108,6 +108,7 @@ return function(env)
 				local payload = { record = record, request = request, session = session }
 				hooks.run("preRequest", payload)
 				local accounting = session.ctx.observeRequest(payload.request.messages, payload.request.tools, record)
+				usage.observeRequest(record, record.model, accounting)
 				local preview = stream.new(session, record.model, aborted)
 
 				session.emit("request:start", {
@@ -133,6 +134,7 @@ return function(env)
 					aborted = aborted,
 					onRetry = function(info)
 						if aborted() then return end
+						usage.observeRetry(record, record.model, accounting, info.reason or info.status)
 						session.emit("request:retry", {
 							provider = record.label,
 							attempt = info.attempt,
