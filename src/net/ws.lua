@@ -22,7 +22,7 @@ return function(env)
 		local accepting, finished, failure, sawFinish, released, dispatched = true, false, nil, false, false, false
 		local timeout = tonumber(spec.timeout) or 120
 		if timeout ~= timeout then timeout = 120 end
-		local deadline = clock.ms() + math.max(1, math.min(300, timeout)) * 1000
+		local deadline = clock.ms() + math.max(1, math.min(600, timeout)) * 1000
 		local function aborted()
 			if not alive then return true end
 			if not spec.aborted then return false end
