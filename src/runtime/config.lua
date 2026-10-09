@@ -75,9 +75,9 @@ return function(env)
 			unlimitedTurns = true,
 			toolConcurrency = 8,
 			toolTimeout = 45,
-			-- Configured per-request budget in seconds. Native HTTP permits up to 900 seconds;
+			-- Configured per-request budget in seconds. HTTP and WebSocket inference permit up to 600 seconds;
 			-- Delta/executor transports and providers may impose a shorter limit.
-			requestTimeout = 900,
+			requestTimeout = 600,
 			-- When enabled, adapters request an 86400-second budget and bypass the
 			-- configured requestTimeout. The transport or executor may still cap the wait.
 			requestUnlimited = true,
