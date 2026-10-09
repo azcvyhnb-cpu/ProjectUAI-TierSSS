@@ -56,13 +56,9 @@ return function(env)
 	local REPLY_STOPS = { 256, 512, 1024, 2048, 4096, 8192, 16000, 24000, 32000, 64000, 96000, 128000 }
 	local RESULT_STOPS = { 1000, 2000, 4000, 6000, 8000, 12000, 16000, 24000, 32000, 48000, 64000, 96000, 128000 }
 
-	-- The request timeout. The top stop is the default and is the highest of any
-	-- clock in this client: no other deadline can rescue a model call that times out,
-	-- so it has to sit above every other budget by default. The stops are the
-	-- plausible lowerings rather than a linear scale -- the difference between sixty
-	-- seconds and ninety is a setting someone might want, and the difference between
-	-- eight hours and nine is not.
-	local REQUEST_STOPS = { 30, 60, 120, 180, 300, 600, 900, 1800, 3600, 7200, 21600, 43200, 86400 }
+	-- Model calls have a hard ten-minute transport ceiling. Keep the selector within
+	-- that ceiling so the UI never promises a wait the transport cannot honor.
+	local REQUEST_STOPS = { 30, 60, 120, 180, 300, 600 }
 
 	-- Each pane builds into a fresh column, so the layout order it needs is just a
 	-- running count. This is the only bookkeeping a pane does.
@@ -1152,11 +1148,11 @@ return function(env)
 			"Seconds before a tool is abandoned. Subagents are exempt: they run to their own budget below.",
 			"agent.toolTimeout", 5, 60, 1)
 		R.number(agent, "Request timeout",
-			"How long one model call may run before the transport gives up. The default is a day, the highest of any clock here: replies cannot stream incrementally in this client, so a reasoning model can think for a long time before the first byte. Lower it only for a quick model; the top stop is the default.",
+			"How long one model call may run before the transport gives up. The default is ten minutes. Some executors impose a shorter hard limit; when a request hits the known two-minute wall, UAI retries once with a smaller reasoning/output budget if it can do so safely.",
 			"agent.requestTimeout", REQUEST_STOPS)
 		R.toggle(agent, {
 			label = "Unlimited requests",
-			hint = "Ignore the timeout above and wait as long as the model takes, up to a day. The same wall as the default, spelled as a switch instead of a number: the slider can be lowered for a quick model without losing the day the heavy one needs. Stop still applies, and each attempt still ends at its own deadline.",
+			hint = "Ignore the slider and use the transport's maximum ten-minute budget. An executor may still impose a shorter hard limit. Stop still applies; a known empty-response timeout can trigger one smaller-ask retry.",
 			path = "agent.requestUnlimited",
 		})
 		R.number(agent, "Subagent budget",
