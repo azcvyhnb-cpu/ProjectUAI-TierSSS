@@ -31,5 +31,8 @@ jobs:
       - name: Run context compaction and token-accounting tests
         run: luajit test/context_compaction.lua
 
+      - name: Benchmark small, medium, and large transcripts
+        run: luajit test/context_benchmark.lua
+
       - name: Require committed bundle to match source
         run: git diff --exit-code -- dist/uai.lua dist/uai.manifest.json
