@@ -191,8 +191,13 @@ return function(env)
 		if estimated then M.session.estimated = true end
 
 		local stats = providerStats(record, model)
-		stats.reportedPrompt = stats.reportedPrompt + prompt
-		stats.reportedOutput = stats.reportedOutput + completion
+		if estimated then
+			stats.estimatedPrompt = (stats.estimatedPrompt or 0) + prompt
+			stats.estimatedOutput = (stats.estimatedOutput or 0) + completion
+		else
+			stats.reportedPrompt = stats.reportedPrompt + prompt
+			stats.reportedOutput = stats.reportedOutput + completion
+		end
 		stats.outputEstimate = stats.outputEstimate + ((fallback and fallback.completion) or 0)
 
 		local cached = util.get(usage or {}, "prompt_tokens_details.cached_tokens", 0)
