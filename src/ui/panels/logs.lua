@@ -10,6 +10,7 @@ return function(env)
 	local theme = env.require("ui/theme")
 	local P = env.require("ui/primitives")
 	local C = env.require("ui/controls")
+	local thai = env.require("ui/thai_help")
 	local overlay = env.require("ui/overlay")
 	local http = env.require("net/http")
 	local log = env.require("runtime/log")
@@ -160,7 +161,7 @@ return function(env)
 		local scroll
 		local function render() end
 
-		P.sectionHeader(head, { title = "Logs & traces", description = "Select a request or log entry to inspect its details.", layoutOrder = 1 })
+		P.sectionHeader(head, { title = "Logs & traces", description = thai.text("Select a request or log entry to inspect its details."), layoutOrder = 1 })
 		C.segmented(head, {
 			layoutOrder = 2,
 			options = {
@@ -383,7 +384,7 @@ return function(env)
 					C.emptyState(scroll.instance, {
 						icon = "document",
 						title = "No requests yet",
-						description = "Requests appear here with status, duration and transport details after you send a message.",
+						description = thai.text("Requests appear here with status, duration and transport details after you send a message."),
 						layoutOrder = 1,
 					})
 					return
@@ -393,7 +394,7 @@ return function(env)
 				local entries = util.reverse(log.entries)
 				countLabel.Text = util.pluralise(#entries, "line") .. " kept"
 				if #entries == 0 then
-					C.emptyState(scroll.instance, { icon = "document", title = "All clear", description = "Application events will appear here as they occur.", layoutOrder = 1 })
+					C.emptyState(scroll.instance, { icon = "document", title = "All clear", description = thai.text("Application events will appear here as they occur."), layoutOrder = 1 })
 					return
 				end
 				for index, entry in ipairs(entries) do logRow(entry, index) end
