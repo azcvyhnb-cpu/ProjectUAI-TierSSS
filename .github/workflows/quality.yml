@@ -57,6 +57,10 @@ jobs:
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add dist/uai.lua dist/uai.manifest.json
             git commit -m "Build dist bundle from tested source"
+            # Connector commits can land while CI is building. Rebase the generated
+            # bundle commit onto the latest main before pushing, instead of failing
+            # the entire quality job on a non-fast-forward rejection.
+            git pull --rebase origin main
             git push
           fi
 
