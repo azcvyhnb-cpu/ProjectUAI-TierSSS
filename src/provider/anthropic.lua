@@ -339,7 +339,7 @@ return function(env)
 				if type(event) == "table" then
 					local kind = event.type or frame.event
 					if kind == "error" then
-						streamError = "malformed_stream: provider reported a stream error"
+						streamError = "malformed_stream: " .. sse.errorMessage(event)
 					elseif kind == "message_stop" then done = true
 					elseif kind == "message_start" and type(event.message) == "table" then
 						model, id, usage = event.message.model, event.message.id, event.message.usage
