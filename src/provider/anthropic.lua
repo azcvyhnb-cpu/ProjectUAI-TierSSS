@@ -27,7 +27,7 @@ return function(env)
 
 	local M = {}
 
-	-- Requested budget; native HTTP caps its wait at 300 seconds and the executor
+	-- Requested budget; native HTTP permits up to 900 seconds and the executor
 	-- or provider may impose a shorter deadline.
 	local function requestTimeout(request)
 		if request.timeout then return request.timeout end
@@ -511,7 +511,7 @@ return function(env)
 		local headers = rebuildHeaders()
 
 		local started = clock.ms()
-		local deadline = started + math.max(1, math.min(300, tonumber(requestTimeout(request)) or 120)) * 1000
+		local deadline = started + math.max(1, math.min(900, tonumber(requestTimeout(request)) or 120)) * 1000
 		local recovery = proxy.new(record, { aborted = request.aborted, onRetry = request.onRetry, deadlineMs = deadline })
 		local lastRequestMs = 0
 		local rotationsLeft = math.max(#pool - 1, 0)
