@@ -734,10 +734,7 @@ longer timeout. The old 8,192-token executor ceiling has been removed, including
 HTTP fallback. Requests use `agent.maxTokens` (128,000 by default), explicit
 overrides, documented model limits and limits learned from provider refusals.
 Old saved `agent.executorReplyCeiling` values are ignored.
-Native request deadlines and long unanswered
-transport failures are terminal: the client does not resend a smaller request or
-fall back to another provider after an unknown outcome. A dispatched socket
-failure cannot silently send a second HTTP request. Explicit token-limit refusals
+Native request deadlines remain terminal unless the provider adapter identifies the known empty-response executor wall (20–130 seconds). In that narrow case, it may retry once with reduced reasoning effort and reply ceiling, only when the request can be made smaller. It does not blindly resend an unchanged prompt or fall back to another provider after an unknown outcome. A dispatched socket failure cannot silently send a second HTTP request. Explicit token-limit refusals
 can still teach a smaller ceiling. Large prompts can still spend the request
 window uploading and prefilling; `agent.contextTokens` remains 1,000,000 by
 default and can be lowered when short replies also time out.
