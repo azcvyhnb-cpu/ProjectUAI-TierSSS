@@ -13,6 +13,9 @@ return function(env)
 		session = { prompt = 0, completion = 0, total = 0, cost = 0, requests = 0, estimated = false },
 		turn = { prompt = 0, completion = 0, total = 0, cost = 0 },
 		changed = signal.new("usage"),
+		-- Per-provider diagnostics keep estimates distinct from provider-reported
+		-- billing. Retry prompt tokens are exposure estimates, not claimed charges.
+		providers = {},
 		-- One request, as it was measured, rather than the running totals `changed`
 		-- carries. This is the only place in the client where a model id and the tokens
 		-- it actually spent are in scope together, so anything keeping a per-model
@@ -101,6 +104,54 @@ return function(env)
 		return total
 	end
 
+	local function providerStats(record, model)
+		local key = tostring(type(record) == "table" and (record.id or record.label) or record or "unknown")
+			.. "|" .. tostring(model or (type(record) == "table" and record.model) or "unknown")
+		local stats = M.providers[key]
+		if not stats then
+			stats = { provider = key, requests = 0, retries = 0, promptEstimate = 0,
+				historyEstimate = 0, systemEstimate = 0, schemaEstimate = 0,
+				outputEstimate = 0, retryPromptExposure = 0, reportedPrompt = 0,
+				reportedOutput = 0, timeouts = 0 }
+			M.providers[key] = stats
+		end
+		return stats
+	end
+
+	function M.observeRequest(record, model, accounting)
+		local stats = providerStats(record, model)
+		accounting = accounting or {}
+		stats.requests = stats.requests + 1
+		stats.promptEstimate = stats.promptEstimate + math.max(0, tonumber(accounting.history) or 0) + math.max(0, tonumber(accounting.estimate) or 0)
+		stats.historyEstimate = stats.historyEstimate + math.max(0, tonumber(accounting.history) or 0)
+		stats.systemEstimate = stats.systemEstimate + math.max(0, tonumber(accounting.system) or 0)
+		stats.schemaEstimate = stats.schemaEstimate + math.max(0, tonumber(accounting.schema) or 0)
+		return stats
+	end
+
+	function M.observeRetry(record, model, accounting, reason)
+		local stats = providerStats(record, model)
+		local prompt = math.max(0, tonumber(accounting and accounting.history) or 0)
+			+ math.max(0, tonumber(accounting and accounting.estimate) or 0)
+		stats.retries = stats.retries + 1
+		stats.retryPromptExposure = stats.retryPromptExposure + prompt
+		if tostring(reason or ""):lower():find("timeout", 1, true)
+			or tostring(reason or ""):lower():find("deadline", 1, true) then
+			stats.timeouts = stats.timeouts + 1
+		end
+		return stats
+	end
+
+	function M.providerSnapshot()
+		local out = {}
+		for key, stats in pairs(M.providers) do
+			local copy = {}
+			for field, value in pairs(stats) do copy[field] = value end
+			out[key] = copy
+		end
+		return out
+	end
+
 	function M.startTurn()
 		M.turn = { prompt = 0, completion = 0, total = 0, cost = 0 }
 	end
@@ -138,6 +189,11 @@ return function(env)
 		M.session.cost = M.session.cost + cost
 		M.session.requests = M.session.requests + 1
 		if estimated then M.session.estimated = true end
+
+		local stats = providerStats(record, model)
+		stats.reportedPrompt = stats.reportedPrompt + prompt
+		stats.reportedOutput = stats.reportedOutput + completion
+		stats.outputEstimate = stats.outputEstimate + ((fallback and fallback.completion) or 0)
 
 		local cached = util.get(usage or {}, "prompt_tokens_details.cached_tokens", 0)
 		local reasoning = util.get(usage or {}, "completion_tokens_details.reasoning_tokens", 0)
