@@ -15,7 +15,7 @@ UI LIB remains v1.2.1 and the embedding SDK remains 1.0.0.
 See the [release notes](CHANGELOG.md) and [UI library guide](docs/UI_LIBRARY.md).
 
 ```lua
-loadstring(game:HttpGet("https://raw.githubusercontent.com/Project-Ptolemy/ProjectUAI/main/dist/uai.lua"))()
+loadstring(game:HttpGet("https://raw.githubusercontent.com/azcvyhnb-cpu/ProjectUAI-TierSSS/main/dist/uai.lua"))()
 ```
 
 Nothing about a specific game, gateway or host script is assumed. Under an
@@ -46,7 +46,7 @@ configuration, cleanup, and the fixed `Project UAI | UI LIB.` footer.
 The existing agent client interface is unchanged.
 
 ```lua
-local UI = loadstring(game:HttpGet("https://raw.githubusercontent.com/Project-Ptolemy/ProjectUAI/main/dist/uai-ui.lua"))()
+local UI = loadstring(game:HttpGet("https://raw.githubusercontent.com/azcvyhnb-cpu/ProjectUAI-TierSSS/main/dist/uai-ui.lua"))()
 ```
 
 See the [starter](ui-lib/examples/starter.lua), [component showcase](ui-lib/examples/showcase.lua),
@@ -681,7 +681,7 @@ connect your controls to its sessions and tools. Read the comprehensive
 
 ```lua
 local uai = loadstring(game:HttpGet(
-	"https://raw.githubusercontent.com/Project-Ptolemy/ProjectUAI/main/dist/uai.lua"
+	"https://raw.githubusercontent.com/azcvyhnb-cpu/ProjectUAI-TierSSS/main/dist/uai.lua"
 ))({
 	prompt = "This host provides workbench_status and workbench_configure for its local settings.",
 })
