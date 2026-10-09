@@ -68,6 +68,40 @@ return function(_env)
 		["Stops the current turn, drains every timer and input handler, "] = "หยุดงาน AI ที่กำลังทำ และยกเลิกตัวจับเวลาและตัวรับอินพุตที่เกี่ยวข้อง",
 	}
 
+	local PATTERNS = {
+		{ "An API key is stored in the settings file", "API key จะถูกเก็บไว้ในไฟล์ตั้งค่า ส่วนบันทึกคำขอและไฟล์วิเคราะห์ปัญหาจะแสดงคีย์เพียง 4 ตัวท้าย" },
+		{ "Each of these is immediate and cannot be undone.", "การดำเนินการแต่ละรายการมีผลทันทีและไม่สามารถย้อนกลับได้" },
+		{ "What the client has spent since it started", "ค่าโทเคนและค่าใช้จ่ายตั้งแต่เปิดโปรแกรม โดยอิงข้อมูลที่ผู้ให้บริการรายงาน" },
+		{ "Counted from what this client observed and kept on disk", "สถิติที่โปรแกรมเก็บไว้ในอุปกรณ์ จึงยังอยู่หลังปิดและเปิดใหม่" },
+		{ "How a fenced code block is drawn", "กำหนดรูปแบบการแสดงบล็อกโค้ดในประวัติแชตและส่วนอื่น ๆ" },
+		{ "The type the interface itself is set in.", "เลือกแบบอักษรที่ใช้กับข้อความในหน้าตาโปรแกรม" },
+		{ "A browser on this machine can join the conversation", "เปิดบทสนทนานี้บนเบราว์เซอร์ของอุปกรณ์เดียวกันผ่าน Web bridge" },
+		{ "Copy every saved setting to another device", "ส่งออกการตั้งค่าทั้งหมดเพื่อย้ายไปอุปกรณ์อื่น ไฟล์นี้มี API keys และข้อมูลลับ ควรเก็บเป็นส่วนตัว" },
+		{ "Writes a copy of your settings and the activity history", "บันทึกสำเนาการตั้งค่าและประวัติกิจกรรมเพื่อใช้วิเคราะห์ปัญหา โดยปกปิด API key เหลือ 4 ตัวท้าย" },
+		{ "Reads a file from the client's folder and applies the settings in it.", "อ่านไฟล์จากโฟลเดอร์ของโปรแกรมแล้วนำการตั้งค่าในไฟล์มาใช้ ตรวจสอบไฟล์ก่อนนำเข้า" },
+		{ "Where the interface opens and how much of the screen it takes.", "กำหนดว่าเปิดหน้าต่างที่หน้าใด และใช้พื้นที่หน้าจอมากเท่าไร" },
+		{ "What the client found when it started.", "ข้อมูลความสามารถที่ตรวจพบเมื่อเริ่มทำงาน ค่านี้เป็นข้อมูลอ่านอย่างเดียว" },
+		{ "Every request and every log line the client has kept", "ดูคำขอที่ส่งออกและข้อความบันทึกที่โปรแกรมเก็บไว้ เพื่อวิเคราะห์ปัญหา" },
+		{ "Requests are sent as the Claude Code CLI.", "กำหนดข้อมูลระบุตัวตนที่ส่งไปกับคำขอ สำหรับ Gateway ที่ตรวจสอบส่วนนี้" },
+		{ "Providers, permission rules and memory are kept unless you say otherwise.", "ข้อมูลผู้ให้บริการ กฎสิทธิ์ และหน่วยความจำจะยังอยู่ เว้นแต่คุณเลือกให้ลบด้วย" },
+		{ "How hard it works before it stops and answers.", "กำหนดจำนวนรอบที่ AI ใช้เรียกเครื่องมือก่อนหยุดและตอบกลับ" },
+		{ "Added to the system prompt every turn", "เพิ่มคำสั่งเหล่านี้เข้าไปในคำสั่งระบบทุกครั้งที่ AI ทำงาน" },
+		{ "A family of tools can be withheld from the model entirely.", "ปิดทั้งหมวดเพื่อไม่ให้ AI เห็นเครื่องมือในหมวดนั้น ต่างจากการปฏิเสธคำสั่งเฉพาะครั้ง" },
+		{ "Facts the agent has chosen to keep between sessions.", "ข้อมูลที่ AI บันทึกไว้เพื่อใช้ข้ามเซสชัน สามารถอ่านและลบได้จากส่วนนี้" },
+		{ "Where requests go. A provider is a base URL", "กำหนดปลายทาง API วิธีตรวจสอบสิทธิ์ คีย์ และโมเดลที่จะรับคำขอ" },
+		{ "The one connector that is not a model", "เชื่อมต่อบทสนทนากับเบราว์เซอร์ผ่านโปรแกรม bridge ในอุปกรณ์นี้" },
+		{ "Run Infinite Yield inside this client", "เปิดใช้คำสั่ง Infinite Yield ให้ AI เรียกผ่านเครื่องมือ iy ที่รองรับ" },
+		{ "Tool rounds allowed in one turn", "จำนวนรอบการเรียกเครื่องมือที่อนุญาตในหนึ่งคำตอบ" },
+		{ "Quick chat opens in the middle of the screen", "เปิด Quick chat กลางจอ ส่งข้อความเข้าแชตที่เปิดอยู่ แล้วปิดหน้าต่างเอง" },
+		{ "Draws the Luau, the file body or the property map", "แสดงโค้ด Luau เนื้อหาไฟล์ หรือแผนที่คุณสมบัติที่ส่งให้เครื่องมือใต้รายการเรียกใช้" },
+		{ "Open the remaining arguments and the result by default", "เปิดรายละเอียดพารามิเตอร์และผลลัพธ์ของเครื่องมือไว้ตั้งแต่แรก" },
+		{ "The greeting and the counters an empty conversation", "แสดงการ์ดต้อนรับและสถิติเมื่อเปิดบทสนทนาใหม่" },
+		{ "A toast when a turn finishes", "แสดงการแจ้งเตือนเมื่อ AI ทำงานเสร็จ ล้มเหลว หรือถูกหยุด แม้ย่อหน้าต่างอยู่" },
+		{ "Multiplies every type size.", "ปรับขนาดตัวอักษรทุกส่วนด้วยตัวคูณเดียวกัน" },
+		{ "Press one to use it.", "แตะตัวเลือกแบบอักษรเพื่อเลือกใช้งาน" },
+		{ "This client has no telemetry and no home to call.", "โปรแกรมไม่ส่งข้อมูลการใช้งานกลับบ้าน คำขอภายนอกมีเฉพาะปลายทางที่คุณเพิ่มไว้" },
+	}
+
 	local GROUPS = {
 		agentself = "เครื่องมือสำหรับวิเคราะห์ วางแผน และจัดการงานของ AI",
 		instance = "สำรวจและอ่านโครงสร้าง Instance ของเกม รวมถึงคุณสมบัติและลูกของแต่ละวัตถุ",
@@ -116,7 +150,11 @@ return function(_env)
 
 	function M.text(value)
 		if type(value) ~= "string" then return value end
-		return TEXT[value] or value
+		if TEXT[value] then return TEXT[value] end
+		for _, pattern in ipairs(PATTERNS) do
+			if value:find(pattern[1], 1, true) then return pattern[2] end
+		end
+		return value
 	end
 
 	function M.group(group)
