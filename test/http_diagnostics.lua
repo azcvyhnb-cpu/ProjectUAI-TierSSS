@@ -19,7 +19,7 @@ case("successful responses have no invented transport error", function()
 	f.healthy(); f.close()
 end)
 
-case("ten-minute request budgets reach the executor", function()
+case("transport caps requests at ten minutes", function()
 	local f = F.new()
 	local http, caps = f.env.require("net/http"), f.env.require("runtime/caps")
 	local observed
@@ -27,8 +27,8 @@ case("ten-minute request budgets reach the executor", function()
 		observed = options.Timeout
 		return { StatusCode = 200, Body = '{"reply":"done"}', Headers = { server = "fixture" } }
 	end
-	local response = http.request({ url = "https://fixture.test/slow-model", method = "POST", body = "{}", timeout = 600, identity = "none" })
-	check("600-second timeout is passed to the executor", observed == 600)
+	local response = http.request({ url = "https://fixture.test/slow-model", method = "POST", body = "{}", timeout = 900, identity = "none" })
+	check("900-second request is clamped to the ten-minute executor ceiling", observed == 600)
 	check("ten-minute-budget request still completes normally", response and response.ok)
 	f.healthy(); f.close()
 end)
