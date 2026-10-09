@@ -951,7 +951,7 @@ return function(env)
 			-- A socket setup failure before Send retains its existing HTTP fallback.
 			-- Once HTTP starts, proxy/key/parameter retries share its one deadline.
 			if not deadline then
-				deadline = requestStarted + math.max(1, math.min(900, tonumber(requestTimeout(request)) or 120)) * 1000
+				deadline = requestStarted + math.max(1, math.min(600, tonumber(requestTimeout(request)) or 120)) * 1000
 				recovery = proxy.new(record, { aborted = request.aborted, onRetry = request.onRetry, deadlineMs = deadline })
 			end
 			local res, err = http.send({
@@ -1044,7 +1044,7 @@ return function(env)
 		-- deadline on an already-minimal body would re-send the same prompt to the
 		-- same wall, and that is the one outcome this must not do.
 		local recoveredTokens
-		if not res and err and not http.terminal(err) and lastRequestMs >= 20000 and lastRequestMs <= 130000 then
+		if not res and err and (not http.terminal(err) or tostring(err):find("nothing returned after", 1, true)) and lastRequestMs >= 20000 and lastRequestMs <= 130000 then
 			local lowered, note = smallerAsk(body)
 			if lowered and util.encode(lowered) ~= util.encode(body) then
 				log.info("provider", record.label .. ": hit the transport wall, retrying smaller (" .. note .. ")")
