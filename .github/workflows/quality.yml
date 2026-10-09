@@ -37,6 +37,9 @@ jobs:
       - name: Run context compaction and token-accounting tests
         run: luajit test/context_compaction.lua
 
+      - name: Run persistent research memory tests
+        run: luajit test/research_memory.lua
+
       - name: Benchmark small, medium, and large transcripts
         run: luajit test/context_benchmark.lua
 
