@@ -392,13 +392,13 @@ h.settle(1)
 check("retargeted animations suppress stale completion handlers", completed == 10)
 
 local multiTarget = P.frame(root, {
-	position = UDim2.fromOffset(8, 12),
+	position = U.fromOffset(8, 12),
 	bgTransparency = 1,
 })
-P.animate(multiTarget, "enter", { Position = UDim2.fromOffset(48, 64) })
+P.animate(multiTarget, "enter", { Position = U.fromOffset(48, 64) })
 P.animate(multiTarget, "hover", { BackgroundTransparency = 0 })
 h.settle(1)
-check("concurrent property targets on one instance both finish", multiTarget.Position == UDim2.fromOffset(48, 64)
+check("concurrent property targets on one instance both finish", multiTarget.Position == U.fromOffset(48, 64)
 	and multiTarget.BackgroundTransparency == 0)
 
 root:Destroy()
