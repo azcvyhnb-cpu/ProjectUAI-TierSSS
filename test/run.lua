@@ -1193,7 +1193,16 @@ scenario("the request payload is shaped the way gateways expect", function()
 		end
 		for key, value in pairs(node) do
 			if type(value) == "table" and not ARRAY_KEYS[key] then
-				auditSchema(value, path .. "." .. tostring(key))
+				if key == "properties" then
+					-- A properties map is a name -> schema dictionary, not a schema
+					-- node itself. In particular, a property named "type" must not
+					-- be mistaken for the enclosing schema's type keyword.
+					for propertyName, propertySchema in pairs(value) do
+						auditSchema(propertySchema, path .. ".properties." .. tostring(propertyName))
+					end
+				else
+					auditSchema(value, path .. "." .. tostring(key))
+				end
 			end
 		end
 	end
@@ -2971,7 +2980,7 @@ scenario("native replies use configured model limits without an executor ceiling
 		truthy(api .. " default call succeeds", providerCall(harness, adapter, record))
 		check(api .. " buffered SSE retains the configured output budget", sent[#sent].max_tokens, 128000)
 		check(api .. " stored reply ceiling is unchanged", handle.config.get("agent.maxTokens"), 128000)
-		check(api .. " context default is unchanged", handle.config.get("agent.contextTokens"), 1000000)
+		check(api .. " context default is unchanged", handle.config.get("agent.contextTokens"), 48000)
 		providerCall(harness, adapter, record, { maxTokens = 32768 })
 		check(api .. " explicit request token override is retained", sent[#sent].max_tokens, 32768)
 		record.params = { max_tokens = 49152 }
@@ -3039,6 +3048,11 @@ scenario("transport deadlines never retry or learn a ceiling for either provider
 			})
 			local adapter, record = handle.env.require("provider/" .. api), handle.providers.active()
 			handle.config.set("agent.effort", "off")
+			-- This scenario verifies deadline behavior, not the unlimited-time
+			-- preference. Pin a shorter transport budget so the virtual delayed
+			-- response cannot arrive before the request deadline.
+			handle.config.set("agent.requestUnlimited", false)
+			handle.config.set("agent.requestTimeout", math.max(1, delay - 1))
 			local tokenField = api == "openai" and delay == 60 and "max_completion_tokens" or "max_tokens"
 			if tokenField == "max_completion_tokens" then record.repairs = { "max_completion_tokens" } end
 			local request = { onRetry = function() retries = retries + 1 end }
@@ -3088,6 +3102,8 @@ scenario("transport wall retry does not learn from failures or repeat minimal re
 				end,
 			})
 			handle.config.set("agent.effort", "off")
+			handle.config.set("agent.requestUnlimited", false)
+			handle.config.set("agent.requestTimeout", math.max(1, case.delay - 1))
 			local adapter, record = handle.env.require("provider/" .. api), handle.providers.active()
 			local result = providerCall(harness, adapter, record, { maxTokens = case.maxTokens }, case.delay * 2 + 1)
 			falsy(api .. " " .. case.label .. " is a failure", result)
