@@ -56,7 +56,7 @@ return function(env)
 	end
 
 	-- Requested wait budget, shared by HTTP and gateway sockets. Native transports
-	-- enforce their own 300-second bound; executor/provider limits may be shorter.
+	-- cap requests at 600 seconds; executor/provider limits may be shorter.
 	local function requestTimeout(request)
 		if request.timeout then return request.timeout end
 		if config.get("agent.requestUnlimited", false) then return 86400 end
