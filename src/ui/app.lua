@@ -322,7 +322,13 @@ return function(env)
 
 	function M.buildLauncher()
 		if M.launcher and M.launcher.Parent then return end
-		local diameter = math.max(theme.size.launcher, responsive.minTarget())
+		local function launcherDiameter()
+			-- Keep the minimized floating tile compact on handheld screens, like a
+			-- small executor bubble, while retaining a usable 44 px touch target.
+			return responsive.isMobile() and math.max(44, responsive.minTarget())
+				or math.max(theme.size.launcher, responsive.minTarget())
+		end
+		local diameter = launcherDiameter()
 
 		local button = Instance.new("TextButton", M.screen)
 		button.Name = "Launcher"
@@ -351,7 +357,7 @@ return function(env)
 				math.floor(util.clamp(y, bounds.y, math.max(bounds.y, bounds.y + bounds.height - diameter))))
 		end
 		local function layout()
-			diameter = math.max(theme.size.launcher, responsive.minTarget())
+			diameter = launcherDiameter()
 			button.Size = UDim2.fromOffset(diameter, diameter)
 			local bounds = responsive.usableRect(M.screen, theme.space.lg)
 			positionAt(preferred and preferred.X or bounds.x + bounds.width - diameter,
