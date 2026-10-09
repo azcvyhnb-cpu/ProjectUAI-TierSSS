@@ -107,8 +107,7 @@ return function(env)
 		end
 		message = type(message) == "string" and util.trim(message) or ""
 		kind = type(kind) == "string" and util.trim(kind) or ""
-		code = type(code) == "string" or type(code) == "number" and tostring(code) or ""
-		if type(code) ~= "string" then code = "" end
+		if type(code) == "string" or type(code) == "number" then code = tostring(code) else code = "" end
 		if message == "" then message = type(decoded.message) == "string" and util.trim(decoded.message) or "" end
 		if message == "" then message = type(decoded.detail) == "string" and util.trim(decoded.detail) or "" end
 		if message == "" then message = kind end
