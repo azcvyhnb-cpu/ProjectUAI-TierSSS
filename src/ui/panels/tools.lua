@@ -12,6 +12,7 @@ return function(env)
 	local registry = env.require("agent/registry")
 	local permissions = env.require("agent/permissions")
 	local schema = env.require("agent/schema")
+	local thai = env.require("ui/thai_help")
 
 	local M = {}
 
@@ -129,8 +130,8 @@ return function(env)
 				})
 				local function describeGroup()
 					groupNote.Text = registry.groupEnabled(group)
-						and util.pluralise(#grouped[group], "tool")
-						or (util.pluralise(#grouped[group], "tool") .. ", not offered to the model")
+						and (util.pluralise(#grouped[group], "tool") .. " · " .. thai.group(group))
+						or (util.pluralise(#grouped[group], "tool") .. " · " .. thai.group(group) .. " · ปิดไว้ จึงไม่ส่งให้ AI")
 				end
 				describeGroup()
 				local groupSwitch = C.switch(header, {
@@ -180,7 +181,7 @@ return function(env)
 					end
 
 					local description = P.text(card, {
-						text = tostring(tool.description),
+						text = thai.tool(tool),
 						role = "caption",
 						color = theme.color.textSecondary,
 						wrap = true,
