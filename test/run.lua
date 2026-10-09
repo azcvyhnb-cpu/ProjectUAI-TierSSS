@@ -495,6 +495,12 @@ scenario("a streamed body is assembled", function()
 	check("its name survived", parsed.toolCalls[1]["function"].name, "instance_get")
 	check("its arguments were joined", parsed.toolCalls[1]["function"].arguments, '{"path":"Workspace"}')
 	check("finish reason read", parsed.finish, "tool_calls")
+
+	local failed = sse.parse('data: {"error":{"message":"model is overloaded","type":"server_error","code":"overloaded"}}\n\ndata: [DONE]\n\n')
+	contains("SSE errors retain actionable provider message", failed.streamError, "model is overloaded")
+	contains("SSE errors retain provider error code", failed.streamError, "overloaded")
+	local generic = sse.parse('data: {"type":"error"}\n\n')
+	contains("unstructured SSE errors retain a safe fallback", generic.streamError, "provider reported a stream error")
 end)
 
 -- 8. Retry and fallback ----------------------------------------------------
@@ -2635,6 +2641,9 @@ scenario("the Anthropic Messages API is spoken natively", function()
 	check("its input json was joined", streamed.toolCalls[1]["function"].arguments, '{"a":1}')
 	check("the stop reason was mapped", streamed.finish, "tool_calls")
 	check("and usage normalised", streamed.usage.completion_tokens, 7)
+	local failedStream = anthropic.parseStream('event: error\ndata: {"type":"error","error":{"message":"invalid x-api-key","type":"authentication_error","code":"invalid_api_key"}}\n\n')
+	contains("Anthropic stream errors retain actionable message", failedStream.streamError, "invalid x-api-key")
+	contains("Anthropic stream errors retain error code", failedStream.streamError, "invalid_api_key")
 
 	check("no thread errors", #harness.errors(), 0,
 		harness.errors()[1] and harness.errors()[1].traceback or nil)
