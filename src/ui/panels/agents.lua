@@ -20,6 +20,7 @@ return function(env)
 	local overlay = env.require("ui/overlay")
 	local subagent = env.require("agent/subagent")
 	local registry = env.require("agent/registry")
+	local thai = env.require("ui/thai_help")
 
 	local M = {}
 
@@ -60,9 +61,7 @@ return function(env)
 
 		P.sectionHeader(scroll.instance, {
 			title = "Subagents",
-			description = "The agent hands self-contained work to a subagent with dispatch_agent: "
-				.. "its own context, a subset of the tools, and a written report at the end. "
-				.. "Everything dispatched in this session is here, whichever conversation started it.",
+			description = thai.text("The agent hands self-contained work to a subagent with dispatch_agent: its own context, a subset of the tools, and a written report at the end. Everything dispatched in this session is here, whichever conversation started it."),
 			layoutOrder = 1,
 		})
 
