@@ -147,12 +147,21 @@ return function(env)
 
 		function ctx.observeRequest(messages, tools, record)
 			local history = ctx.tokens()
-			local toolTokens = tools and #tools > 0 and usage.estimateText(util.encode(tools)) or 0
-			promptEstimate = math.max(0, usage.estimateMessages(messages) + toolTokens - history)
+			local messageTokens = usage.estimateMessages(messages)
+			local schemaTokens = tools and #tools > 0 and usage.estimateText(util.encode(tools)) or 0
+			local systemTokens = math.max(0, messageTokens - history)
+			promptEstimate = math.max(0, messageTokens + schemaTokens - history)
 			promptKey = providerKey(record)
 			ctx.calibrated = calibration ~= nil and calibration.key == promptKey
 			ctx.overhead = ctx.calibrated and math.max(0, calibration.overhead + promptEstimate - calibration.estimate) or promptEstimate
-			return { history = history, estimate = promptEstimate, key = promptKey }
+			return {
+				history = history,
+				estimate = promptEstimate,
+				system = systemTokens,
+				schema = schemaTokens,
+				messages = messageTokens,
+				key = promptKey,
+			}
 		end
 
 		function ctx.breakdown(record)
