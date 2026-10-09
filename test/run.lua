@@ -7120,6 +7120,12 @@ scenario("the skills tool group registers and the prompt carries the index", fun
 	local prompt = handle.env.require("agent/prompt")
 	local built = prompt.build({})
 	falsy("no skills, no block", built:find("Skills available", 1, true))
+	local casual = prompt.build({ session = { ctx = { messages = { { role = "user", content = "hello, explain this concept" } } } } })
+	falsy("casual turns omit the detailed script project manual", casual:find("project_scaffold", 1, true))
+	falsy("casual turns omit the detailed UI manual", casual:find("Project UAI UI LIB", 1, true))
+	local coding = prompt.build({ session = { ctx = { messages = { { role = "user", content = "Implement a Roblox map feature" } } } } })
+	contains("implementation turns retain project workflow", coding, "project_scaffold")
+	contains("map work retains UI workflow", coding, "Project UAI UI LIB")
 
 	fsx.ensure("skills")
 	skills.save("Tiny", "One line.", "The body of the tiny skill.")
