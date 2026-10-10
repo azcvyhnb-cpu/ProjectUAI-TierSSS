@@ -50,6 +50,25 @@ Native Code workspace:
 - Report actual incoming/outgoing and Invoke-result coverage, incomplete values and dropped records. A timed-out InvokeServer may still be outstanding; never automatically retry it.
 - Continue in successive batches of normally 1–4 independent tool calls; inspect results before dependent work.]]
 
+	local GAME_ANALYSIS = [[
+Game-system understanding:
+- Build an evidence-backed model before writing gameplay scripts. Search the current
+  PlaceId's research notebook first; then use game_analyze with a bounded scan.
+- Inspect game_systems and game_classification, then game_evidence for uncertain or
+  important systems. Use game_entities and game_graph to map relationships; game_plan
+  suggests bounded follow-up paths. Use game_focus on relevant paths and game_refresh
+  to compare later observations.
+- Treat names and hierarchy as clues, not proof. Separate verified observations,
+  repeated observations and hypotheses; cite exact paths, attributes, properties,
+  source modules or capture IDs. Report scan limits and missing visibility.
+- Inspect client-visible scripts and data where permitted, but do not claim client
+  scans reveal server-only logic, authoritative state or all runtime behavior.
+- Translate the model into a compact system map: entry points, state/data, events,
+  dependencies, lifecycle, invariants, and testable expected behavior. Then implement
+  the smallest cohesive change, analyze/build it, and run focused behavior tests.
+- Save durable place findings to research memory only with evidence pointers and
+  an explicit confidence level. Never store keys, tokens or other secrets.]]
+ 
 	local SCRIPT_UI = [[
 Script interfaces:
 - For a new script-owned UI, use Project UAI UI LIB from
@@ -405,15 +424,21 @@ Background chat:
 			"ui", "gui", "interface", "screen", "button", "menu", "minimap",
 			"waypoint", "map", "แมพ", "แผนที่", "หน้าจอ", "ปุ่ม",
 		})
-		return implementation, interface
+		local gameAnalysis = containsAny({
+			"game", "game_analyze", "game systems", "game model", "reverse engineer",
+			"core loop", "gameplay system", "understand the game",
+			"ระบบของเกม", "เข้าใจระบบ", "วิเคราะห์เกม", "ระบบหลักของเกม",
+		})
+		return implementation, interface, gameAnalysis
 	end
 
 	function M.build(opts)
 		opts = opts or {}
-		local includeProject, includeUI = taskGuides(opts)
+		local includeProject, includeUI, includeGameAnalysis = taskGuides(opts)
 		local parts = { IDENTITY, "", SKILLS_FIRST, "", NATIVE_WORKSPACE, "" }
 		if includeUI then parts[#parts + 1] = SCRIPT_UI; parts[#parts + 1] = "" end
 		if includeProject then parts[#parts + 1] = SCRIPT_PROJECTS; parts[#parts + 1] = "" end
+		if includeGameAnalysis then parts[#parts + 1] = GAME_ANALYSIS; parts[#parts + 1] = "" end
 
 		parts[#parts + 1] = "Environment:"
 		parts[#parts + 1] = environmentBlock()
