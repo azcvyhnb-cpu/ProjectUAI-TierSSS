@@ -46,6 +46,7 @@ local MATRIX = {
 	{ "vllm", "http://127.0.0.1:8000/v1", "openai", "none" },
 	{ "llamacpp", "http://127.0.0.1:8080/v1", "openai", "none" },
 	{ "sglang", "http://127.0.0.1:30000/v1", "openai", "none" },
+	{ "thirx", "https://ai.thirx.com/v1", "openai", "bearer" },
 	{ "custom", "https://fixture.test/proxy/v1", "openai", "bearer" },
 }
 
