@@ -12,6 +12,15 @@ need no running models, API keys or paid inference. Live server availability,
 model quality, tool-call accuracy, executor networking and TLS are outside that
 coverage.
 
+## Thirx AI relay
+
+The built-in **Thirx AI** preset uses `https://ai.thirx.com/v1` with Bearer
+authentication and the Chat Completions protocol. Enter the API key in the provider
+editor; credentials are not shipped in source or the generated bundle. Fetch models
+from the endpoint or enter a model ID supplied by the service. A successful
+`/models` response does not prove that every model supports tool calling or that
+the account's unlimited-use terms will remain unchanged.
+
 ## Image input
 
 PNG, JPEG and WebP attachments from the web bridge are delivered as actual image
