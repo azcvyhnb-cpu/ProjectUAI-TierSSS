@@ -239,6 +239,15 @@ return function(env)
 			note = "Use the server's OpenAI-compatible API. Select Bearer when authentication is configured. Tool support depends on the model, template and server tool-call parser.",
 		},
 		{
+			id = "thirx",
+			label = "Thirx AI",
+			baseUrl = "https://ai.thirx.com/v1",
+			authStyle = "bearer",
+			keyHint = "Thirx API key",
+			docs = "https://ai.thirx.com/",
+			note = "OpenAI-compatible relay. Fetch /models or enter a model ID provided by Thirx. Model availability, tool calling and unlimited-use terms depend on the account and current service policy.",
+		},
+		{
 			id = "custom",
 			label = "Custom endpoint",
 			baseUrl = "",
