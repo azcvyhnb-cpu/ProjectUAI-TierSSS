@@ -14,6 +14,21 @@ return function(env)
     }
     local state = engine.new(identity)
 
+    -- Only sample a tiny, class-specific set of primitive properties. The semantic
+    -- detectors already understand Humanoid health fields, but the old collector
+    -- never supplied properties, making that signal unreachable on live instances.
+    -- Do not reflect every property or retain arbitrary Instance/userdata values.
+    local function semanticProperties(node)
+        local out = {}
+        local okClass, className = pcall(function() return node.ClassName end)
+        if not okClass or className ~= "Humanoid" then return out end
+        for _, name in ipairs({ "Health", "MaxHealth", "HealthDisplayDistance" }) do
+            local ok, value = pcall(function() return node[name] end)
+            if ok and type(value) == "number" then out[name] = value end
+        end
+        return out
+    end
+
     local function collect(root, ctx, limit)
         local records = {}
         local ok, stats = pcall(function()
@@ -21,12 +36,13 @@ return function(env)
                 if #records >= limit then return false end
                 local id = refs.id(node)
                 local okPath, path = pcall(function() return node:GetFullName() end)
-                local attrs = {}
+                local attrs, properties = {}, semanticProperties(node)
                 pcall(function() attrs = node:GetAttributes() end)
                 records[#records + 1] = {
                     id=id, name=node.Name, className=node.ClassName,
                     path=okPath and path or node.Name,
-                    attributes=attrs, source="instance_scan", observedAt=os.clock(),
+                    attributes=attrs, properties=properties,
+                    source="instance_scan", observedAt=os.clock(),
                 }
             end, limit)
         end)
