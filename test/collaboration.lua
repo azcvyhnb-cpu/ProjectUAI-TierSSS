@@ -1,0 +1,16 @@
+-- Offline smoke test for the multi-model collaboration tool.
+package.path = "test/?.lua;test/mock/?.lua;" .. package.path
+local F = require("workspace_fixture")
+local f = F.new()
+local tools = f.env.require("tools/collaboration")
+assert(type(tools) == "table" and #tools == 1, "collaboration tool loads")
+assert(tools[1].name == "ai_collaborate", "tool is registered under its public name")
+assert(tools[1].risk == "read", "collaboration is analysis-only")
+local missing = tools[1].run({ task = "Review this design." }, {})
+assert(type(missing) == "table" and missing.ok == false, "missing provider fails safely")
+assert(missing.text:find("Configure and save an enabled Thirx provider", 1, true), "setup requirement is actionable")
+local empty = tools[1].run({ task = "  " }, {})
+assert(type(empty) == "table" and empty.ok == false and empty.text:find("task is required", 1, true), "empty tasks are rejected")
+f.healthy()
+f.close()
+print("multi-model collaboration: 5 checks passed")
