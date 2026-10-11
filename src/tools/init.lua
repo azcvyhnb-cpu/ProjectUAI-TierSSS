@@ -6,6 +6,7 @@
 -- the client down -- a broken tool should cost one capability, not the session.
 local GROUPS = {
 	"agentself",
+	"collaboration",
 	"instance",
 	"script",
 	"coding",
