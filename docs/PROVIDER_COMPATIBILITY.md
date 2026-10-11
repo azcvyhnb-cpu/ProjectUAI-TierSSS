@@ -21,6 +21,26 @@ from the endpoint or enter a model ID supplied by the service. A successful
 `/models` response does not prove that every model supports tool calling or that
 the account's unlimited-use terms will remain unchanged.
 
+## Multi-model collaboration
+
+The `ai_collaborate` tool is available for difficult analysis, debugging and
+review tasks, and when the user explicitly requests multiple models to work
+together. It launches independent requests for `GLM-5.3-Flash` and
+`deepseek-v4-flash` concurrently, then asks GLM to synthesize agreement,
+disagreement and uncertainty. The `debate` mode asks the second model to
+challenge assumptions rather than only provide a second solution.
+
+Setup: save an enabled provider using the exact base URL
+`https://ai.thirx.com/v1`, enter the API key in the provider editor, and ensure
+both model IDs are supported by the account. The tool makes up to three model
+requests per collaboration (two workers plus synthesis), each with an 1,800-token
+output ceiling and a 120-second request timeout. A synthesis failure returns the
+independent reports rather than discarding them. This is a request budget, not a
+guarantee that the service's own rate, concurrency or account limits are unlimited.
+The tool is analysis-only: it does not apply edits or execute returned code.
+Independent responses can still share the same provider's biases, and agreement
+is not proof of correctness; validate important conclusions with tests and source.
+
 ## Image input
 
 PNG, JPEG and WebP attachments from the web bridge are delivered as actual image
