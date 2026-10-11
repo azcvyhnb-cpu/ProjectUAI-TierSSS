@@ -43,6 +43,9 @@ jobs:
       - name: Run game analyzer evidence regression
         run: luajit test/game_analyzer.lua
 
+      - name: Run multi-model collaboration smoke test
+        run: luajit test/collaboration.lua
+
       - name: Run mobile UI and minimized launcher tests
         run: luajit test/mobile_ui.lua
 
