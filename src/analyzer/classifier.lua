@@ -1,5 +1,6 @@
 -- Multi-signal game classifier. Scores are comparative evidence, not guarantees.
 return function(env)
+    local evidenceModule = env.require("analyzer/evidence")
     local M={}
     local DEFINITIONS={
         {name="Tower Defense", required={"Stage","Wave","Enemy","Character"}, bonus={"Upgrade"}},
@@ -13,9 +14,9 @@ return function(env)
         local cand={}
         for _,d in ipairs(DEFINITIONS) do
             local sum,count=0,0
-            for _,s in ipairs(d.required) do sum=sum+(evidence.score(evidence,s)); count=count+1 end
+            for _,s in ipairs(d.required) do sum=sum+evidenceModule.score(evidence,s); count=count+1 end
             local bonus=0
-            for _,s in ipairs(d.bonus) do bonus=bonus+evidence.score(evidence,s) end
+            for _,s in ipairs(d.bonus) do bonus=bonus+evidenceModule.score(evidence,s) end
             local c=(count>0 and sum/count or 0)*0.8 + bonus*0.2/math.max(1,#d.bonus)
             cand[#cand+1]={name=d.name,confidence=math.max(0,math.min(1,c)),signals=d.required}
         end
