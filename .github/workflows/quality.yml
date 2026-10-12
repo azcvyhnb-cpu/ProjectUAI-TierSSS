@@ -43,6 +43,9 @@ jobs:
       - name: Run game analyzer evidence regression
         run: luajit test/game_analyzer.lua
 
+      - name: Run analyzer graph edge-budget regressions
+        run: luajit test/analyzer_graph.lua
+
       - name: Run multi-model collaboration smoke test
         run: luajit test/collaboration.lua
 
@@ -73,5 +76,9 @@ jobs:
             git push
           fi
 
+      # On pull requests the bundle is built and syntax-checked above, but the
+      # committed artifact is expected to be stale until the tested source merges.
+      # Main's push job generates and commits the matching bundle before this gate.
       - name: Require committed bundle to match source
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: git diff --exit-code -- dist/uai.lua dist/uai.manifest.json
