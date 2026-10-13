@@ -50,7 +50,7 @@ return function(env)
 			end
 			table.sort(selected)
 			local maxFiles = math.max(1, math.min(64, tonumber(args.max_files) or 64))
-			local rows, aliases, ambiguousAliases, totalBytes, omittedFiles, inspectionErrors = {}, {}, {}, 0, 0, 0
+			local rows, exactIds, aliases, ambiguousAliases, totalBytes, omittedFiles, inspectionErrors = {}, {}, {}, {}, 0, 0, 0
 			for _, path in ipairs(selected) do
 				if #rows >= maxFiles then omittedFiles = omittedFiles + 1
 				else
@@ -65,6 +65,7 @@ return function(env)
 							local row = { id = id, path = path, hash = outline.hash, bytes = outline.bytes, lines = outline.lines,
 								symbols = outline.symbols, imports = outline.imports, omitted = outline.omitted }
 							rows[#rows + 1] = row
+							exactIds[id] = id
 							local function addAlias(alias, target)
 								if alias == "" then return end
 								if aliases[alias] == nil then aliases[alias] = target
@@ -97,7 +98,7 @@ return function(env)
 						if dep.dynamic then
 							dynamic[#dynamic + 1] = { from = row.id, line = dep.line, column = dep.column }
 						else
-							local target = aliases[dep.id]
+							local target = exactIds[dep.id] or aliases[dep.id]
 							if target then
 								row.dependencies[#row.dependencies + 1] = target
 								incoming[target] = incoming[target] or {}; incoming[target][#incoming[target] + 1] = row.id
