@@ -79,7 +79,7 @@ return function(env)
 		-- Allow existing version-1 notebooks to migrate their old token-set keys
 		-- the next time the exact title/body pair is saved.
 		local normalized = terms(title .. " " .. body)
-		if #normalized == 0 then return (title .. "\\\\0" .. body):lower() end
+		if #normalized == 0 then return (title .. "\\0" .. body):lower() end
 		return table.concat(normalized, " ")
 	end
 
