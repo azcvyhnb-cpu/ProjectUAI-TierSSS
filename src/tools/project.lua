@@ -37,6 +37,70 @@ return function(env)
 		if not analysis.ok then return nil, "Project has syntax/dependency errors; inspect script_analyze" end
 		return analysis
 	end
+	add("project_inspect", "read", "Inspect a workspace directory of Lua/Luau files without requiring a project manifest. Returns bounded file outlines, literal dependency edges, unresolved imports, incoming/outgoing references, and scan completeness. Supports up to 64 source files and 1 MiB total; lexical hints are not type analysis. For an external phone file, paste its text into chat or save/import it into files/ first; this tool only scans files visible to UAI.",
+		{ path = { type = "string", maxLength = 220 }, max_files = { type = "integer", minimum = 1, maximum = 64 } }, {}, function(args, ctx)
+			local workspace = env.require("tools/workspace")
+			local paths, inventory = workspace.files(args.path or "", ctx)
+			if not paths then return N.fail(inventory) end
+			local selected, skipped = {}, 0
+			for _, path in ipairs(paths) do
+				local lower = path:lower()
+				if lower:match("%.lua$") or lower:match("%.luau$") then selected[#selected + 1] = path else skipped = skipped + 1 end
+			end
+			table.sort(selected)
+			local maxFiles = math.max(1, math.min(64, tonumber(args.max_files) or 64))
+			local rows, byId, aliases, totalBytes, omittedFiles = {}, {}, {}, 0, 0
+			for _, path in ipairs(selected) do
+				if #rows >= maxFiles then omittedFiles = omittedFiles + 1
+				else
+					if ctx and ctx.aborted and ctx.aborted() then return N.fail("Project inspection cancelled") end
+					local body, readErr = workspace.read(path)
+					if body and #body <= source.MAX_FILE and totalBytes + #body <= 1024 * 1024 then
+						local outline, scanErr = source.scan(body, ctx)
+						if outline then
+							local id = path:gsub("^files/", ""):gsub("%.luau?$", "")
+							local row = { id = id, path = path, hash = outline.hash, bytes = outline.bytes, lines = outline.lines,
+								symbols = outline.symbols, imports = outline.imports, omitted = outline.omitted }
+							rows[#rows + 1], byId[id] = row, row
+							aliases[id] = id
+							local withoutSrc = id:gsub("^src/", "")
+							if not aliases[withoutSrc] then aliases[withoutSrc] = id end
+							totalBytes = totalBytes + #body
+						else
+							rows[#rows + 1] = { id = path, path = path, error = scanErr }
+						end
+					else
+						rows[#rows + 1] = { id = path, path = path, error = readErr or "source exceeds per-file or total byte limit" }
+					end
+				end
+			end
+			local edges, unresolved, dynamic, incoming = {}, {}, {}, {}
+			for _, row in ipairs(rows) do
+				if row.imports then
+					row.dependencies, row.dependents = {}, {}
+					for _, dep in ipairs(row.imports) do
+						if dep.dynamic then
+							dynamic[#dynamic + 1] = { from = row.id, line = dep.line, column = dep.column }
+						else
+							local target = aliases[dep.id]
+							if target then
+								row.dependencies[#row.dependencies + 1] = target
+								incoming[target] = incoming[target] or {}; incoming[target][#incoming[target] + 1] = row.id
+								edges[#edges + 1] = { from = row.id, to = target, line = dep.line, kind = "require" }
+							else unresolved[#unresolved + 1] = { from = row.id, module = dep.id, line = dep.line } end
+						end
+					end
+				end
+			end
+			for _, row in ipairs(rows) do row.dependents = incoming[row.id] or {} end
+			local complete = inventory.complete == true and omittedFiles == 0
+			return result({ root = args.path or "files/", complete = complete, inventory = inventory, files = rows, edges = edges,
+				unresolved = unresolved, dynamicRequires = dynamic, scannedFiles = #rows, sourceFiles = #selected,
+				omittedFiles = omittedFiles, skippedNonSourceFiles = skipped, sourceBytes = totalBytes,
+				limits = { maxFiles = maxFiles, maxBytes = 1024 * 1024, maxFileBytes = source.MAX_FILE },
+				coverage = "Lexical dependency map only; dynamic requires and modules outside this directory may not resolve; no type or runtime analysis." },
+				string.format("Inspected %d source file(s), %d dependency edge(s), %d unresolved and %d dynamic require(s); inventory %s.", #rows, #edges, #unresolved, #dynamic, complete and "complete" or "partial"))
+		end)
 	add("project_map", "read", "Read a version-1 project manifest and return file hashes, lexical function/local outlines and literal require dependencies without full source. Modules map IDs to relative .lua/.luau files; entry names an ID; tests is an optional array of test IDs. Use project_scaffold for a working example. Lexical hints are not type analysis.",
 		{ manifest = str }, { "manifest" }, function(args, ctx)
 			local value, why = load(args, ctx); if not value then return N.fail(why) end
