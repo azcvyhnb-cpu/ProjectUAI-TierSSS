@@ -50,7 +50,7 @@ return function(env)
 			end
 			table.sort(selected)
 			local maxFiles = math.max(1, math.min(64, tonumber(args.max_files) or 64))
-			local rows, aliases, totalBytes, omittedFiles, inspectionErrors = {}, {}, 0, 0, 0
+			local rows, aliases, ambiguousAliases, totalBytes, omittedFiles, inspectionErrors = {}, {}, {}, 0, 0, 0
 			for _, path in ipairs(selected) do
 				if #rows >= maxFiles then omittedFiles = omittedFiles + 1
 				else
@@ -65,16 +65,21 @@ return function(env)
 							local row = { id = id, path = path, hash = outline.hash, bytes = outline.bytes, lines = outline.lines,
 								symbols = outline.symbols, imports = outline.imports, omitted = outline.omitted }
 							rows[#rows + 1] = row
-							aliases[id] = id
+							local function addAlias(alias, target)
+								if alias == "" then return end
+								if aliases[alias] == nil then aliases[alias] = target
+								elseif aliases[alias] ~= target then aliases[alias] = false; ambiguousAliases[alias] = true end
+							end
+							addAlias(id, id)
 							local withoutSrc = id:gsub("^src/", "")
-							if not aliases[withoutSrc] then aliases[withoutSrc] = id end
+							addAlias(withoutSrc, id)
 							-- Bridge uploads are stored under timestamp-UID-name in pastes/.
 							-- Recover the original filename alias so uploaded main.lua can
 							-- resolve require("settings") when settings.lua was also attached.
 							local base = id:match("([^/]+)$") or id
 							base = base:gsub("^%d%d%d%d%d%d%d%d%-%d%d%d%d%d%d%-input_%d+_%x+%-", "")
 							base = base:gsub("%.luau?$", "")
-							if base ~= "" and not aliases[base] then aliases[base] = id end
+							addAlias(base, id)
 							totalBytes = totalBytes + #body
 						else
 							rows[#rows + 1] = { id = path, path = path, error = scanErr }; inspectionErrors = inspectionErrors + 1
@@ -84,7 +89,7 @@ return function(env)
 					end
 				end
 			end
-			local edges, unresolved, dynamic, incoming = {}, {}, {}, {}
+			local edges, unresolved, ambiguousImports, dynamic, incoming = {}, {}, {}, {}, {}
 			for _, row in ipairs(rows) do
 				if row.imports then
 					row.dependencies, row.dependents = {}, {}
@@ -97,6 +102,8 @@ return function(env)
 								row.dependencies[#row.dependencies + 1] = target
 								incoming[target] = incoming[target] or {}; incoming[target][#incoming[target] + 1] = row.id
 								edges[#edges + 1] = { from = row.id, to = target, line = dep.line, kind = "require" }
+							elseif ambiguousAliases[dep.id] then
+								ambiguousImports[#ambiguousImports + 1] = { from = row.id, module = dep.id, line = dep.line, reason = "multiple files share this import alias" }
 							else unresolved[#unresolved + 1] = { from = row.id, module = dep.id, line = dep.line } end
 						end
 					end
@@ -105,11 +112,11 @@ return function(env)
 			for _, row in ipairs(rows) do row.dependents = incoming[row.id] or {} end
 			local complete = inventory.complete == true and omittedFiles == 0 and inspectionErrors == 0
 			return result({ root = args.path or "files/", complete = complete, inventory = inventory, files = rows, edges = edges,
-				unresolved = unresolved, dynamicRequires = dynamic, scannedFiles = #rows, sourceFiles = #selected,
+				unresolved = unresolved, ambiguousImports = ambiguousImports, dynamicRequires = dynamic, scannedFiles = #rows, sourceFiles = #selected,
 				omittedFiles = omittedFiles, inspectionErrors = inspectionErrors, skippedNonSourceFiles = skipped, sourceBytes = totalBytes,
 				limits = { maxFiles = maxFiles, maxBytes = 1024 * 1024, maxFileBytes = source.MAX_FILE },
 				coverage = "Lexical dependency map only; dynamic requires and modules outside this directory may not resolve; no type or runtime analysis." },
-				string.format("Inspected %d source file(s), %d dependency edge(s), %d unresolved and %d dynamic require(s); inventory %s.", #rows, #edges, #unresolved, #dynamic, complete and "complete" or "partial"))
+				string.format("Inspected %d source file(s), %d dependency edge(s), %d unresolved, %d ambiguous and %d dynamic require(s); inventory %s.", #rows, #edges, #unresolved, #ambiguousImports, #dynamic, complete and "complete" or "partial"))
 		end)
 	add("project_map", "read", "Read a version-1 project manifest and return file hashes, lexical function/local outlines and literal require dependencies without full source. Modules map IDs to relative .lua/.luau files; entry names an ID; tests is an optional array of test IDs. Use project_scaffold for a working example. Lexical hints are not type analysis.",
 		{ manifest = str }, { "manifest" }, function(args, ctx)
