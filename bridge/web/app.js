@@ -654,7 +654,9 @@ async function submit(){
     else if(text.trim())parts.push(text.trim());
     else if(!pictureIds.length)parts.push('Please read the attached input.');
     for(const file of files){
-      if(encode.encode(file.text).length>limit)parts.push(await attach(file.text,file.name));
+      // Persist multi-file selections together so project_inspect can map dependencies
+      // across the uploaded files; keep a single small attachment inline for convenience.
+      if(files.length>1||encode.encode(file.text).length>limit)parts.push(await attach(file.text,file.name));
       else parts.push(`[Attached: ${file.name}]\n${file.text}`);
     }
     setPhase('submitting');
