@@ -65,14 +65,13 @@ return function(env)
 	end
 
 	local function identity(title, body)
-		local normalized = terms(title .. " " .. body)
-		-- Lua's byte-oriented pattern classes do not reliably tokenize Thai UTF-8.
-		-- Preserve the literal text as a stable fallback rather than collapsing all
-		-- Thai-only notes to the same empty deduplication key.
-		if #normalized == 0 then
-			return (title .. "\\0" .. body):lower()
+		-- Use ordered, normalized text rather than a bag of unique tokens.
+		-- Token-set keys can merge distinct findings whose words are merely
+		-- reordered, silently replacing evidence with a different claim.
+		local function normalize(value)
+			return util.trim(tostring(value or ""):lower():gsub("%s+", " "))
 		end
-		return table.concat(normalized, " ")
+		return normalize(title) .. string.char(0) .. normalize(body)
 	end
 
 	function M.save(args)
