@@ -242,5 +242,19 @@ scenario("failed or disabled summaries preserve previous facts", function()
 	end
 end)
 
+scenario("malformed persisted context fields do not abort restoration", function()
+	local _, _, context = fixture()
+	local ctx = context.new()
+	ctx.pushUser("previous conversation")
+	check("non-table restore is rejected", ctx.restore("not a context") == false)
+	check("malformed message collection is ignored", ctx.restore({ summary = {}, messages = "truncated" }) == true)
+	check("malformed summary is ignored", ctx.summary == nil)
+	check("malformed messages leave an empty transcript", #ctx.messages == 0)
+	check("valid entries survive alongside malformed entries", ctx.restore({
+		summary = "retained facts",
+		messages = { false, { role = false, content = "bad role" }, { role = "user", content = "valid" } },
+	}) == true and #ctx.messages == 1 and ctx.messages[1].content == "valid")
+end)
+
 print(string.format("context compaction: %d checks passed, %d scenarios failed", passed, failed))
 if failed > 0 then os.exit(1) end
