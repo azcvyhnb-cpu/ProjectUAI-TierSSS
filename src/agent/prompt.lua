@@ -12,6 +12,12 @@ return function(env)
 	local M = {}
 	local SCRIPT_PROJECTS = [[
 File and script projects:
+- To understand an existing directory without a manifest, use project_inspect with path="" for
+  files/ or path="pastes" for files attached from the Bridge. It returns bounded Lua/Luau
+  outlines, literal require edges, incoming/outgoing dependencies, unresolved imports and
+  dynamic requires. The Bridge paperclip can select multiple text/code files from the device;
+  uploaded attachments are stored in pastes/. Keep source paths when possible. Inspection is
+  lexical only, capped at 64 source files/1 MiB, and never executes imported source.
 - For a modular script, use project_scaffold to stage a working starter or read an
   existing uai.project.json with project_map. The manifest has version=1, entry,
   modules (ID to relative .lua/.luau path), and optional tests (module IDs).
