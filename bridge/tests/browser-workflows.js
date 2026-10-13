@@ -179,8 +179,8 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
     const multiStart = commands.length;
     await page.locator('#fileInput').setInputFiles([
-      { name: 'main.lua', mimeType: 'text/plain', buffer: Buffer.from('return require("settings")\\n') },
-      { name: 'settings.lua', mimeType: 'text/plain', buffer: Buffer.from('return { enabled = true }\\n') },
+      { name: 'main.lua', mimeType: 'text/plain', buffer: Buffer.from('return require("settings")\n') },
+      { name: 'settings.lua', mimeType: 'text/plain', buffer: Buffer.from('return { enabled = true }\n') },
     ]);
     await page.waitForFunction(() => document.querySelectorAll('#attachments button').length === 2);
     await page.locator('#input').fill('Inspect this multi-file project and map its dependencies.');
