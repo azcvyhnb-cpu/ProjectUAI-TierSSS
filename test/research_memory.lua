@@ -47,5 +47,18 @@ check("identical findings update rather than duplicate", duplicate ~= nil and du
 check("place notebooks are isolated", #memory.search({ query = "blue switch", placeId = 987654 }).items == 0)
 check("returns a clear error for a missing note", memory.get({ id = "missing" }) == nil)
 
+-- Thai UTF-8 text must remain searchable even when Lua's %w tokenizer finds
+-- no ASCII terms, and Thai-only notes must not share an empty deduplication key.
+local thaiTitle = "ประตูฝั่งตะวันตก"
+local thaiBody = "สวิตช์สีน้ำเงินเปิดประตู"
+local thaiSaved = memory.save({ title = thaiTitle, content = thaiBody, confidence = "observed" })
+check("saves Thai-only research notes", thaiSaved ~= nil and thaiSaved.count == 2)
+local thaiFound = memory.search({ query = "สวิตช์สีน้ำเงิน" })
+check("retrieves notes by a Thai literal phrase", thaiFound ~= nil and #thaiFound.items == 1 and thaiFound.items[1].title == thaiTitle)
+local thaiDuplicate = memory.save({ title = thaiTitle, content = thaiBody, confidence = "verified" })
+check("deduplicates identical Thai-only notes", thaiDuplicate ~= nil and thaiDuplicate.updated == true and thaiDuplicate.count == 2)
+local thaiTitleFound = memory.search({ query = thaiTitle })
+check("matches Thai phrases in titles", thaiTitleFound ~= nil and #thaiTitleFound.items == 1 and thaiTitleFound.items[1].title == thaiTitle)
+
 print(string.format("Research memory: %d passed, %d failed", passed, failed))
 if failed > 0 then os.exit(1) end
