@@ -8,7 +8,7 @@ local function check(label, value)
 end
 local function fixture()
 	local h = envMock.new()
-	local env = { services = h.services, hs = h.services.HttpService, info = { folder = "UAI", version = "test" }, context = {} }
+	local env = { services = h.services, hs = h.services.HttpService, sandbox = h.sandbox, info = { folder = "UAI", version = "test" }, context = {} }
 	local loaded = {}
 	function env.require(id)
 		if loaded[id] then return loaded[id] end
