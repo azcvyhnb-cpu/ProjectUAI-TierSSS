@@ -198,6 +198,7 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
     assert.equal((multiSend.text.match(/Path: pastes\//g) || []).length, 2, 'each file reference includes its persistent path');
     assert.ok(!multiSend.text.includes('return require("settings")'), 'source bodies stay out of the chat context');
     receipts.set(multiSend.commandId, { ok: true });
+    await page.waitForFunction(() => document.querySelector('#input').value === '');
     await post({ events: [{ kind: 'turn:start', sessionId: 's1' }, { kind: 'turn:end', sessionId: 's1' }] });
     await page.waitForFunction(() => !document.querySelector('#send').disabled);
     console.log('Multi-file project imports: each selected source is persisted with a path for project_inspect');
