@@ -91,6 +91,7 @@ return function(env)
 				if type(tag) == "string" and util.trim(tag) ~= "" then tags[#tags + 1] = util.ellipsis(util.trim(tag), 40) end
 			end
 		end
+		local confidenceProvided = args.confidence ~= nil
 		local confidence = tostring(args.confidence or "observed"):lower()
 		if confidence ~= "verified" and confidence ~= "observed" and confidence ~= "hypothesis" then
 			return nil, "confidence must be verified, observed, or hypothesis"
@@ -104,6 +105,9 @@ return function(env)
 			if record.key == key then
 				record.title, record.content, record.tags = title, body, tags
 				if providedSource then record.source = providedSource end
+				-- Omitting confidence during a deduplicating refresh must not silently
+				-- demote an established note. Explicit confidence changes are respected.
+				if not confidenceProvided then confidence = record.confidence or "observed" end
 				-- "Verified" is an evidence claim, not a model preference. Require a
 				-- source pointer; otherwise retain the note as observed, not verified.
 				if confidence == "verified" and not (record.source and util.trim(record.source) ~= "") then
