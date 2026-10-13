@@ -64,14 +64,23 @@ return function(env)
 		return out
 	end
 
+	local function normalizeIdentityPart(value)
+		return util.trim(tostring(value or ""):lower():gsub("%s+", " "))
+	end
+
 	local function identity(title, body)
 		-- Use ordered, normalized text rather than a bag of unique tokens.
 		-- Token-set keys can merge distinct findings whose words are merely
 		-- reordered, silently replacing evidence with a different claim.
-		local function normalize(value)
-			return util.trim(tostring(value or ""):lower():gsub("%s+", " "))
-		end
-		return normalize(title) .. string.char(0) .. normalize(body)
+		return normalizeIdentityPart(title) .. string.char(0) .. normalizeIdentityPart(body)
+	end
+
+	local function legacyIdentity(title, body)
+		-- Allow existing version-1 notebooks to migrate their old token-set keys
+		-- the next time the exact title/body pair is saved.
+		local normalized = terms(title .. " " .. body)
+		if #normalized == 0 then return (title .. "\\\\0" .. body):lower() end
+		return table.concat(normalized, " ")
 	end
 
 	function M.save(args)
@@ -105,10 +114,12 @@ return function(env)
 		local data, loadErr = load(id)
 		if not data then return nil, loadErr end
 		local key = identity(title, body)
+		local oldKey = legacyIdentity(title, body)
 		local providedSource = type(args.source) == "string" and util.trim(args.source) ~= ""
 			and util.ellipsis(util.trim(args.source), 240) or nil
 		for _, record in ipairs(data.records) do
-			if record.key == key then
+			if record.key == key or record.key == oldKey then
+				record.key = key
 				record.title, record.content, record.tags = title, body, tags
 				if providedSource then record.source = providedSource end
 				if observedAt then record.observedAt = observedAt end
