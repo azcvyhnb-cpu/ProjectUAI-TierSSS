@@ -95,6 +95,13 @@ return function(env)
 		if confidence ~= "verified" and confidence ~= "observed" and confidence ~= "hypothesis" then
 			return nil, "confidence must be verified, observed, or hypothesis"
 		end
+		local observedAt
+		if args.observedAt ~= nil then
+			observedAt = tonumber(args.observedAt)
+			if not observedAt or observedAt ~= observedAt or observedAt == math.huge or observedAt < 0 then
+				return nil, "observedAt must be a nonnegative timestamp in milliseconds"
+			end
+		end
 		local data, loadErr = load(id)
 		if not data then return nil, loadErr end
 		local key = identity(title, body)
@@ -104,6 +111,7 @@ return function(env)
 			if record.key == key then
 				record.title, record.content, record.tags = title, body, tags
 				if providedSource then record.source = providedSource end
+				if observedAt then record.observedAt = observedAt end
 				-- Omitting confidence during a deduplicating refresh must not silently
 				-- demote an established note. Explicit confidence changes are respected.
 				if not confidenceProvided then confidence = record.confidence or "observed" end
@@ -122,6 +130,7 @@ return function(env)
 		local record = {
 			id = util.uid("note"), key = key, title = title, content = body, tags = tags,
 			confidence = confidence, source = providedSource,
+			observedAt = observedAt or clock.ms(),
 			createdAt = clock.ms(), updatedAt = clock.ms(),
 		}
 		table.insert(data.records, record)
@@ -137,8 +146,16 @@ return function(env)
 		if query == "" then return nil, "query cannot be empty" end
 		local id, why = validPlace(args.placeId == nil and place.id or args.placeId)
 		if not id then return nil, why end
+		local maxAgeMs
+		if args.maxAgeMs ~= nil then
+			maxAgeMs = tonumber(args.maxAgeMs)
+			if not maxAgeMs or maxAgeMs ~= maxAgeMs or maxAgeMs == math.huge or maxAgeMs <= 0 then
+				return nil, "maxAgeMs must be a positive number of milliseconds"
+			end
+		end
 		local data, loadErr = load(id)
 		if not data then return nil, loadErr end
+		local now = clock.ms()
 		local queryTerms, ranked = terms(query), {}
 		local literalQuery = query:lower()
 		for _, record in ipairs(data.records) do
@@ -183,8 +200,17 @@ return function(env)
 		local out = {}
 		for i = 1, math.min(limit, #ranked) do
 			local r = ranked[i].record
+			local observed = tonumber(r.observedAt or r.createdAt)
+			local ageMs = observed and math.max(0, now - observed) or nil
+			local freshness = "unevaluated"
+			if maxAgeMs then
+				if ageMs == nil then freshness = "unknown"
+				elseif ageMs > maxAgeMs then freshness = "stale"
+				else freshness = "fresh" end
+			end
 			out[#out + 1] = { id = r.id, title = r.title, content = r.content, tags = r.tags,
-				confidence = r.confidence, source = r.source, updatedAt = r.updatedAt, score = ranked[i].score }
+				confidence = r.confidence, source = r.source, updatedAt = r.updatedAt,
+				observedAt = observed, ageMs = ageMs, freshness = freshness, score = ranked[i].score }
 		end
 		return { placeId = id, query = query, items = out, totalMatches = #ranked, total = #data.records }
 	end
@@ -214,7 +240,8 @@ return function(env)
 		for _, r in ipairs(data.records) do
 			if r.id == wanted then
 				return { id = r.id, title = r.title, content = r.content, tags = r.tags, confidence = r.confidence,
-					source = r.source, createdAt = r.createdAt, updatedAt = r.updatedAt, placeId = id }
+					source = r.source, observedAt = r.observedAt or r.createdAt,
+					createdAt = r.createdAt, updatedAt = r.updatedAt, placeId = id }
 			end
 		end
 		return nil, "no research note with that id in this place"
