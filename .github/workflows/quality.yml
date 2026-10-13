@@ -40,6 +40,9 @@ jobs:
       - name: Run persistent research memory tests
         run: luajit test/research_memory.lua
 
+      - name: Run project-wide source inspection tests
+        run: luajit test/script_projects.lua
+
       - name: Run game analyzer evidence regression
         run: luajit test/game_analyzer.lua
 
