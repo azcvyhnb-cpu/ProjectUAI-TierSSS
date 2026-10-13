@@ -62,18 +62,18 @@ check("matches Thai phrases in titles", thaiTitleFound ~= nil and #thaiTitleFoun
 
 -- Tags should influence ranking, not merely make a note eligible for retrieval.
 local tagged = memory.save({
-	title = "Chest observation A",
+	title = "Chest observation alpha",
 	content = "A chest was found in the cave.",
 	tags = { "rare chest" }, confidence = "observed",
 })
 local untagged = memory.save({
-	title = "Chest observation B",
+	title = "Chest observation beta",
 	content = "A chest was found in the cave.",
 	confidence = "observed",
 })
 local ranked = memory.search({ query = "chest cave", limit = 5 })
 check("saves tagged and untagged comparison notes", tagged ~= nil and untagged ~= nil)
-check("ranks matching tags above otherwise similar notes", ranked ~= nil and #ranked.items == 2 and ranked.items[1].title == "Chest observation A")
+check("ranks matching tags above otherwise similar notes", ranked ~= nil and #ranked.items == 2 and ranked.items[1].title == "Chest observation alpha")
 
 print(string.format("Research memory: %d passed, %d failed", passed, failed))
 if failed > 0 then os.exit(1) end
