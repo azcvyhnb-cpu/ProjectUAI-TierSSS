@@ -92,5 +92,13 @@ local cited = memory.save({
 local citedNote = cited and memory.get({ id = cited.id })
 check("preserves verified status when a source pointer is present", citedNote ~= nil and citedNote.confidence == "verified" and citedNote.source == "Workspace.Map.HiddenRoom")
 
+local refreshed = memory.save({
+	title = "Cited confirmation of hidden room",
+	content = "The room was found behind the wall and confirmed by inspection.",
+})
+local refreshedNote = refreshed and memory.get({ id = refreshed.id })
+check("keeps confidence when refresh omits confidence", refreshedNote ~= nil and refreshedNote.confidence == "verified")
+check("keeps provenance when refresh omits a new source", refreshedNote ~= nil and refreshedNote.source == "Workspace.Map.HiddenRoom")
+
 print(string.format("Research memory: %d passed, %d failed", passed, failed))
 if failed > 0 then os.exit(1) end
