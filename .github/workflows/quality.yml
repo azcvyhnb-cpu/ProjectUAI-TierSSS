@@ -85,3 +85,22 @@ jobs:
       - name: Require committed bundle to match source
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: git diff --exit-code -- dist/uai.lua dist/uai.manifest.json
+
+  bridge-browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install Playwright
+        run: npm install --prefix /tmp/uai-playwright playwright
+      - name: Install Chromium
+        run: /tmp/uai-playwright/node_modules/.bin/playwright install --with-deps chromium
+      - name: Test multi-file Bridge imports
+        env:
+          PLAYWRIGHT_MODULE: /tmp/uai-playwright/node_modules/playwright
+        run: node bridge/tests/browser-workflows.js
