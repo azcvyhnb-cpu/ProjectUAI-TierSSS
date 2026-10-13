@@ -98,19 +98,27 @@ return function(env)
 		local data, loadErr = load(id)
 		if not data then return nil, loadErr end
 		local key = identity(title, body)
+		local providedSource = type(args.source) == "string" and util.trim(args.source) ~= ""
+			and util.ellipsis(util.trim(args.source), 240) or nil
 		for _, record in ipairs(data.records) do
 			if record.key == key then
 				record.title, record.content, record.tags = title, body, tags
+				if providedSource then record.source = providedSource end
+				-- "Verified" is an evidence claim, not a model preference. Require a
+				-- source pointer; otherwise retain the note as observed, not verified.
+				if confidence == "verified" and not (record.source and util.trim(record.source) ~= "") then
+					confidence = "observed"
+				end
 				record.confidence, record.updatedAt = confidence, clock.ms()
-				record.source = type(args.source) == "string" and util.ellipsis(args.source, 240) or record.source
 				local ok, saveErr = persist(id, data)
 				if not ok then return nil, saveErr end
 				return { id = record.id, updated = true, placeId = id, count = #data.records }
 			end
 		end
+		if confidence == "verified" and not providedSource then confidence = "observed" end
 		local record = {
 			id = util.uid("note"), key = key, title = title, content = body, tags = tags,
-			confidence = confidence, source = type(args.source) == "string" and util.ellipsis(args.source, 240) or nil,
+			confidence = confidence, source = providedSource,
 			createdAt = clock.ms(), updatedAt = clock.ms(),
 		}
 		table.insert(data.records, record)
