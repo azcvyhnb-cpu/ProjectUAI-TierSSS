@@ -42,6 +42,7 @@ return function(env)
 			local workspace = env.require("tools/workspace")
 			local paths, inventory = workspace.files(args.path or "", ctx)
 			if not paths then return N.fail(inventory) end
+			local rootPath = tostring(args.path or ""):gsub("\\", "/"):gsub("^files/", ""):gsub("/+$", "")
 			local selected, skipped = {}, 0
 			for _, path in ipairs(paths) do
 				local lower = path:lower()
@@ -58,7 +59,9 @@ return function(env)
 					if body and #body <= source.MAX_FILE and totalBytes + #body <= 1024 * 1024 then
 						local outline, scanErr = source.scan(body, ctx)
 						if outline then
-							local id = path:gsub("^files/", ""):gsub("%.luau?$", "")
+							local id = path:gsub("^files/", "")
+							if rootPath ~= "" and id:sub(1, #rootPath + 1) == rootPath .. "/" then id = id:sub(#rootPath + 2) end
+							id = id:gsub("%.luau?$", "")
 							local row = { id = id, path = path, hash = outline.hash, bytes = outline.bytes, lines = outline.lines,
 								symbols = outline.symbols, imports = outline.imports, omitted = outline.omitted }
 							rows[#rows + 1], byId[id] = row, row
