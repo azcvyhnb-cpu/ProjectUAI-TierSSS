@@ -168,6 +168,18 @@ suite.case("project inspection maps a source tree and its cross-file dependencie
 	f.close()
 end)
 
+suite.case("Bridge-uploaded files in pastes resolve original filename aliases", function()
+	local f = fixture()
+	local fs = f.env.require("runtime/fsx")
+	assert(fs.write("20261013-121212-input_1_abcd-main.lua", 'return require("settings")\n', { scope = "pastes" }))
+	assert(fs.write("20261013-121213-input_2_abcd-settings.lua", 'return { enabled = true }\n', { scope = "pastes" }))
+	local result = f.call("project_inspect", { path = "pastes" })
+	check("paste directory is inspectable", result.ok and result.data.scannedFiles == 2)
+	check("original attached filenames resolve literal require", #result.data.edges == 1 and result.data.edges[1].to == "20261013-121213-input_2_abcd-settings")
+	check("paste inventory path is reported", result.data.files[1].path:find("pastes/", 1, true) == 1)
+	f.close()
+end)
+
 suite.case("analysis reports syntax, missing imports and cycles without executing", function()
 	local f = fixture(); f.start()
 	f.write("Example/main.lua", '_G.projectWasExecuted = true\nlocal missing = require("missing")\nreturn missing')
@@ -222,7 +234,7 @@ end)
 suite.case("main and subagent prompts explain the project workflow and limits", function()
 	local f = fixture(); local prompt = f.env.require("agent/prompt")
 	for _, text in ipairs({ prompt.build(), prompt.subagent("Build a script") }) do
-		check("project workflow is present", text:find("project_scaffold", 1, true) and text:find("project_patch_read", 1, true) and text:find("script_test", 1, true))
+		check("project workflow is present", text:find("project_inspect", 1, true) and text:find("project_scaffold", 1, true) and text:find("project_patch_read", 1, true) and text:find("script_test", 1, true))
 		check("review and coverage limits are present", text:find("Review source changes before checks", 1, true) and text:find("not Luau type inference", 1, true) and text:find("shared native game state", 1, true))
 	end
 	f.close()
