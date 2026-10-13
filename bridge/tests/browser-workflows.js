@@ -202,7 +202,7 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
     receipts.set(multiSend.commandId, { ok: true });
     await page.waitForFunction(() => document.querySelector('#composerHint').textContent.includes('Waiting for the agent'));
     await post({ events: [{ kind: 'turn:start', sessionId: 's1' }, { kind: 'turn:end', sessionId: 's1' }] });
-    await page.waitForFunction(() => !document.querySelector('#send').disabled);
+    await page.waitForFunction(() => !document.querySelector('#composerHint').textContent.includes('Waiting for the agent'));
     console.log('Multi-file project imports: each selected source is persisted with a path for project_inspect');
 
     const longInput = 'LONG_SOURCE_START\r\n' + 'local text = "界🙂"\r\n'.repeat(6000) + 'LONG_SOURCE_END\r\n';
