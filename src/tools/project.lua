@@ -37,7 +37,7 @@ return function(env)
 		if not analysis.ok then return nil, "Project has syntax/dependency errors; inspect script_analyze" end
 		return analysis
 	end
-	add("project_inspect", "read", "Inspect a workspace directory of Lua/Luau files without requiring a project manifest. Returns bounded file outlines, literal dependency edges, unresolved imports, incoming/outgoing references, and scan completeness. Supports up to 64 source files and 1 MiB total; lexical hints are not type analysis. Scan files/ by default or path="pastes" for text/code files selected from the Bridge paperclip on a phone; this tool only scans files already visible to UAI.",
+	add("project_inspect", "read", "Inspect a workspace directory of Lua/Luau files without requiring a project manifest. Returns bounded file outlines, literal dependency edges, unresolved imports, incoming/outgoing references, and scan completeness. Supports up to 64 source files and 1 MiB total; lexical hints are not type analysis. Scan files/ by default or path=\'pastes\' for text/code files selected from the Bridge paperclip on a phone; this tool only scans files already visible to UAI.",
 		{ path = { type = "string", maxLength = 220 }, max_files = { type = "integer", minimum = 1, maximum = 64 } }, {}, function(args, ctx)
 			local workspace = env.require("tools/workspace")
 			local paths, inventory = workspace.files(args.path or "", ctx)
