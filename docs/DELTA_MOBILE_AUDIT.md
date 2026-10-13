@@ -19,6 +19,9 @@ Only report tests that were actually executed; synthetic tests and CI are not ev
 ## Verification evidence currently available
 
 - GitHub Actions run `38430970133` for PR head commit `835a3045c35d2550d7270807bb67eb8c3af03dd1` completed successfully; PR metadata says the quality and bridge-browser jobs passed.
+- GitHub Actions run `38458090741` for the audit-document commit `092b1a1763ab313b667d48186505f9d0b3068d4a` completed successfully. The `quality` and `bridge-browser` jobs both concluded `success`; two quality steps that publish/check a generated bundle on `main` were skipped. This confirms the run's reported jobs, not live executor compatibility.
+- Runtime/transport source trace: `src/net/http.lua` caps a request at 600 seconds, 8 concurrent native workers, and 8 MiB response bodies; unknown transport outcomes at deadline are reported without automatic retry. A worker whose host call never returns can remain occupied, so the cap intentionally prevents unlimited accumulation but can leave capacity degraded if the executor permanently hangs. Existing tests cover timeout-versus-refusal retry policy and duplicate billing prevention.
+- No code defect has yet been confirmed strongly enough to justify a source change in this phase; avoid changing retry/worker semantics without a regression fixture because it could duplicate billed requests or leak unbounded host calls.
 - This is CI evidence only. No test was executed on a physical Android device or inside Delta during this audit.
 
 ## Sequential work plan
