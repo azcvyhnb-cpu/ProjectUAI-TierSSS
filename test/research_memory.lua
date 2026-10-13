@@ -108,5 +108,29 @@ local orderedB = memory.save({
 })
 check("does not merge distinct claims with reordered words", orderedA ~= nil and orderedB ~= nil and orderedA.id ~= orderedB.id)
 
+local oldObservation = memory.save({
+	title = "Old observation of rotating bridge",
+	content = "The bridge rotates after the lever is pulled.",
+	confidence = "observed", observedAt = 1,
+})
+local oldResult = memory.search({ query = "rotating bridge", maxAgeMs = 1000 })
+local oldItem
+if oldResult then
+	for _, item in ipairs(oldResult.items) do
+		if item.id == (oldObservation and oldObservation.id) then oldItem = item end
+	end
+end
+check("labels observations beyond an explicit age threshold stale", oldItem ~= nil and oldItem.freshness == "stale" and oldItem.ageMs >= 1000)
+local originalObservedAt = oldItem and oldItem.observedAt
+local refreshedOld = memory.save({
+	title = "Old observation of rotating bridge",
+	content = "The bridge rotates after the lever is pulled.",
+})
+local refreshedOldNote = refreshedOld and memory.get({ id = refreshedOld.id })
+check("does not make an old observation fresh just by refreshing its note", refreshedOldNote ~= nil and refreshedOldNote.observedAt == originalObservedAt)
+local freshResult = memory.search({ query = "blue switch", maxAgeMs = 86400000 })
+check("labels recent matching evidence fresh under a suitable threshold", freshResult ~= nil and #freshResult.items > 0 and freshResult.items[1].freshness == "fresh")
+check("rejects invalid freshness thresholds", memory.search({ query = "bridge", maxAgeMs = 0 }) == nil)
+
 print(string.format("Research memory: %d passed, %d failed", passed, failed))
 if failed > 0 then os.exit(1) end
