@@ -68,6 +68,13 @@ return function(env)
 							aliases[id] = id
 							local withoutSrc = id:gsub("^src/", "")
 							if not aliases[withoutSrc] then aliases[withoutSrc] = id end
+							-- Bridge uploads are stored under timestamp-UID-name in pastes/.
+							-- Recover the original filename alias so uploaded main.lua can
+							-- resolve require("settings") when settings.lua was also attached.
+							local base = id:match("([^/]+)$") or id
+							base = base:gsub("^%d%d%d%d%d%d%d%d%-%d%d%d%d%d%d%-input_%d+_%x+%-", "")
+							base = base:gsub("%.luau?$", "")
+							if base ~= "" and not aliases[base] then aliases[base] = id end
 							totalBytes = totalBytes + #body
 						else
 							rows[#rows + 1] = { id = path, path = path, error = scanErr }
