@@ -180,6 +180,18 @@ suite.case("Bridge-uploaded files in pastes resolve original filename aliases", 
 	f.close()
 end)
 
+suite.case("ambiguous basename imports are reported instead of guessed", function()
+	local f = fixture()
+	f.write("Ambiguous/a/settings.lua", "return { source = \"a\" }\\n")
+	f.write("Ambiguous/b/settings.lua", "return { source = \"b\" }\\n")
+	f.write("Ambiguous/main.lua", 'local ambiguous = require("settings")\\nlocal explicit = require("a/settings")\\nreturn { ambiguous, explicit }\\n')
+	local result = f.call("project_inspect", { path = "Ambiguous" })
+	check("explicit relative module ID resolves", #result.data.edges == 1 and result.data.edges[1].to == "a/settings")
+	check("ambiguous basename is not silently bound", #result.data.ambiguousImports == 1 and result.data.ambiguousImports[1].module == "settings")
+	check("ambiguous alias is not mislabeled as missing", #result.data.unresolved == 0)
+	f.close()
+end)
+
 suite.case("analysis reports syntax, missing imports and cycles without executing", function()
 	local f = fixture(); f.start()
 	f.write("Example/main.lua", '_G.projectWasExecuted = true\nlocal missing = require("missing")\nreturn missing')
