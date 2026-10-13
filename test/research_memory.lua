@@ -75,5 +75,22 @@ local ranked = memory.search({ query = "chest cave", limit = 5 })
 check("saves tagged and untagged comparison notes", tagged ~= nil and untagged ~= nil)
 check("ranks matching tags above otherwise similar notes", ranked ~= nil and #ranked.items == 2 and ranked.items[1].title == "Chest observation alpha")
 
+-- Confidence is a claim about evidence. Do not allow an uncited new note to
+-- become verified merely because the model requested that label.
+local uncited = memory.save({
+	title = "Uncited claim about a hidden room",
+	content = "A hidden room may exist behind the wall.",
+	confidence = "verified",
+})
+local uncitedNote = uncited and memory.get({ id = uncited.id })
+check("downgrades verified claims without a source pointer", uncitedNote ~= nil and uncitedNote.confidence == "observed" and not uncitedNote.source)
+local cited = memory.save({
+	title = "Cited confirmation of hidden room",
+	content = "The room was found behind the wall and confirmed by inspection.",
+	confidence = "verified", source = "Workspace.Map.HiddenRoom",
+})
+local citedNote = cited and memory.get({ id = cited.id })
+check("preserves verified status when a source pointer is present", citedNote ~= nil and citedNote.confidence == "verified" and citedNote.source == "Workspace.Map.HiddenRoom")
+
 print(string.format("Research memory: %d passed, %d failed", passed, failed))
 if failed > 0 then os.exit(1) end
