@@ -37,7 +37,7 @@ return function(env)
 		if not analysis.ok then return nil, "Project has syntax/dependency errors; inspect script_analyze" end
 		return analysis
 	end
-	add("project_inspect", "read", "Inspect a workspace directory of Lua/Luau files without requiring a project manifest. Returns bounded file outlines, literal dependency edges, unresolved imports, incoming/outgoing references, and scan completeness. Supports up to 64 source files and 1 MiB total; lexical hints are not type analysis. For an external phone file, paste its text into chat or save/import it into files/ first; this tool only scans files visible to UAI.",
+	add("project_inspect", "read", "Inspect a workspace directory of Lua/Luau files without requiring a project manifest. Returns bounded file outlines, literal dependency edges, unresolved imports, incoming/outgoing references, and scan completeness. Supports up to 64 source files and 1 MiB total; lexical hints are not type analysis. Scan files/ by default or path="pastes" for text/code files selected from the Bridge paperclip on a phone; this tool only scans files already visible to UAI.",
 		{ path = { type = "string", maxLength = 220 }, max_files = { type = "integer", minimum = 1, maximum = 64 } }, {}, function(args, ctx)
 			local workspace = env.require("tools/workspace")
 			local paths, inventory = workspace.files(args.path or "", ctx)
@@ -50,7 +50,7 @@ return function(env)
 			end
 			table.sort(selected)
 			local maxFiles = math.max(1, math.min(64, tonumber(args.max_files) or 64))
-			local rows, byId, aliases, totalBytes, omittedFiles = {}, {}, {}, 0, 0
+			local rows, aliases, totalBytes, omittedFiles, inspectionErrors = {}, {}, 0, 0, 0
 			for _, path in ipairs(selected) do
 				if #rows >= maxFiles then omittedFiles = omittedFiles + 1
 				else
@@ -64,7 +64,7 @@ return function(env)
 							id = id:gsub("%.luau?$", "")
 							local row = { id = id, path = path, hash = outline.hash, bytes = outline.bytes, lines = outline.lines,
 								symbols = outline.symbols, imports = outline.imports, omitted = outline.omitted }
-							rows[#rows + 1], byId[id] = row, row
+							rows[#rows + 1] = row
 							aliases[id] = id
 							local withoutSrc = id:gsub("^src/", "")
 							if not aliases[withoutSrc] then aliases[withoutSrc] = id end
@@ -77,10 +77,10 @@ return function(env)
 							if base ~= "" and not aliases[base] then aliases[base] = id end
 							totalBytes = totalBytes + #body
 						else
-							rows[#rows + 1] = { id = path, path = path, error = scanErr }
+							rows[#rows + 1] = { id = path, path = path, error = scanErr }; inspectionErrors = inspectionErrors + 1
 						end
 					else
-						rows[#rows + 1] = { id = path, path = path, error = readErr or "source exceeds per-file or total byte limit" }
+						rows[#rows + 1] = { id = path, path = path, error = readErr or "source exceeds per-file or total byte limit" }; inspectionErrors = inspectionErrors + 1
 					end
 				end
 			end
@@ -103,10 +103,10 @@ return function(env)
 				end
 			end
 			for _, row in ipairs(rows) do row.dependents = incoming[row.id] or {} end
-			local complete = inventory.complete == true and omittedFiles == 0
+			local complete = inventory.complete == true and omittedFiles == 0 and inspectionErrors == 0
 			return result({ root = args.path or "files/", complete = complete, inventory = inventory, files = rows, edges = edges,
 				unresolved = unresolved, dynamicRequires = dynamic, scannedFiles = #rows, sourceFiles = #selected,
-				omittedFiles = omittedFiles, skippedNonSourceFiles = skipped, sourceBytes = totalBytes,
+				omittedFiles = omittedFiles, inspectionErrors = inspectionErrors, skippedNonSourceFiles = skipped, sourceBytes = totalBytes,
 				limits = { maxFiles = maxFiles, maxBytes = 1024 * 1024, maxFileBytes = source.MAX_FILE },
 				coverage = "Lexical dependency map only; dynamic requires and modules outside this directory may not resolve; no type or runtime analysis." },
 				string.format("Inspected %d source file(s), %d dependency edge(s), %d unresolved and %d dynamic require(s); inventory %s.", #rows, #edges, #unresolved, #dynamic, complete and "complete" or "partial"))
