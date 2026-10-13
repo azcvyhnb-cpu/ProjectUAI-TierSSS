@@ -100,5 +100,13 @@ local refreshedNote = refreshed and memory.get({ id = refreshed.id })
 check("keeps confidence when refresh omits confidence", refreshedNote ~= nil and refreshedNote.confidence == "verified")
 check("keeps provenance when refresh omits a new source", refreshedNote ~= nil and refreshedNote.source == "Workspace.Map.HiddenRoom")
 
+local orderedA = memory.save({
+	title = "Order-sensitive observation", content = "Switch opens door.", confidence = "observed",
+})
+local orderedB = memory.save({
+	title = "Order-sensitive observation", content = "Door opens switch.", confidence = "observed",
+})
+check("does not merge distinct claims with reordered words", orderedA ~= nil and orderedB ~= nil and orderedA.id ~= orderedB.id)
+
 print(string.format("Research memory: %d passed, %d failed", passed, failed))
 if failed > 0 then os.exit(1) end
