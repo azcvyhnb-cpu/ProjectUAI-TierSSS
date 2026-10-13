@@ -197,6 +197,8 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
     assert.equal(multiSend.files.length, 2);
     assert.equal((multiSend.text.match(/Path: pastes\//g) || []).length, 2, 'each file reference includes its persistent path');
     assert.ok(!multiSend.text.includes('return require("settings")'), 'source bodies stay out of the chat context');
+    // Let the mock /api/command handler finish its initial queued receipt before resolving it.
+    await sleep(50);
     receipts.set(multiSend.commandId, { ok: true });
     await page.waitForFunction(() => document.querySelector('#composerHint').textContent.includes('Waiting for the agent'));
     await post({ events: [{ kind: 'turn:start', sessionId: 's1' }, { kind: 'turn:end', sessionId: 's1' }] });
