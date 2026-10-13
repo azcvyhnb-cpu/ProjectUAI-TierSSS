@@ -132,5 +132,30 @@ local freshResult = memory.search({ query = "blue switch", maxAgeMs = 86400000 }
 check("labels recent matching evidence fresh under a suitable threshold", freshResult ~= nil and #freshResult.items > 0 and freshResult.items[1].freshness == "fresh")
 check("rejects invalid freshness thresholds", memory.search({ query = "bridge", maxAgeMs = 0 }) == nil)
 
+-- Version-1 notebooks used a first-seen token-set identity. Simulate an old
+-- persisted record and verify saving the same observation migrates it in place.
+local util = env.require("runtime/util")
+local legacyTitle = "Legacy migration check"
+local legacyBody = "The blue switch opens gate."
+local legacyKey = table.concat((function()
+	local seen, out = {}, {}
+	for token in (legacyTitle .. " " .. legacyBody):lower():gmatch("[%w_%-]+") do
+		if #token >= 2 and not seen[token] then seen[token] = true; out[#out + 1] = token end
+	end
+	return out
+end)(), " ")
+local legacyPath = "UAI/research/place-123456.json"
+local legacyRecord = {
+	id = "legacy-note-1", key = legacyKey, title = legacyTitle, content = legacyBody,
+	tags = { "legacy" }, confidence = "observed", source = "old notebook",
+	createdAt = 10, updatedAt = 20,
+}
+env.sandbox.writefile(legacyPath, util.encode({ version = 1, placeId = 123456, records = { legacyRecord } }))
+local migrated = memory.save({ title = legacyTitle, content = legacyBody })
+local persistedLegacy = util.decode(env.sandbox.readfile(legacyPath))
+check("refreshes a legacy token-set note in place", migrated ~= nil and migrated.updated == true and migrated.count == 1 and migrated.id == "legacy-note-1")
+check("migrates the legacy key to ordered identity", persistedLegacy.records[1].key ~= legacyKey and persistedLegacy.records[1].key == string.lower(legacyTitle) .. string.char(0) .. string.lower(legacyBody))
+check("preserves legacy note provenance during migration", persistedLegacy.records[1].source == "old notebook")
+
 print(string.format("Research memory: %d passed, %d failed", passed, failed))
 if failed > 0 then os.exit(1) end
