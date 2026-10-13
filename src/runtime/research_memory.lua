@@ -65,7 +65,14 @@ return function(env)
 	end
 
 	local function identity(title, body)
-		return table.concat(terms(title .. " " .. body), " ")
+		local normalized = terms(title .. " " .. body)
+		-- Lua's byte-oriented pattern classes do not reliably tokenize Thai UTF-8.
+		-- Preserve the literal text as a stable fallback rather than collapsing all
+		-- Thai-only notes to the same empty deduplication key.
+		if #normalized == 0 then
+			return (title .. "\\0" .. body):lower()
+		end
+		return table.concat(normalized, " ")
 	end
 
 	function M.save(args)
@@ -122,16 +129,21 @@ return function(env)
 		local data, loadErr = load(id)
 		if not data then return nil, loadErr end
 		local queryTerms, ranked = terms(query), {}
-		if #queryTerms == 0 then return { placeId = id, items = {}, total = #data.records } end
+		local literalQuery = query:lower()
 		for _, record in ipairs(data.records) do
 			local haystack = (record.title or "") .. " " .. (record.content or "") .. " " .. table.concat(record.tags or {}, " ")
 			local lower, score, matches = haystack:lower(), 0, 0
+			local titleLower = (record.title or ""):lower()
+			local phraseMatch = lower:find(literalQuery, 1, true) ~= nil
 			for _, term in ipairs(queryTerms) do
-				if lower:find(term, 1, true) then score = score + (lower:find(term, 1, true) and 1 or 0); matches = matches + 1 end
-				if (record.title or ""):lower():find(term, 1, true) then score = score + 2 end
+				if lower:find(term, 1, true) then score = score + 1; matches = matches + 1 end
+				if titleLower:find(term, 1, true) then score = score + 2 end
 			end
-			if matches > 0 then
-				score = score + matches / #queryTerms
+			-- Phrase matching provides a useful UTF-8-safe fallback for Thai and
+			-- other scripts that are not split by Lua's ASCII-oriented token pattern.
+			if phraseMatch then score = score + 3 end
+			if matches > 0 or phraseMatch then
+				if #queryTerms > 0 then score = score + matches / #queryTerms end
 				if record.confidence == "verified" then score = score + 0.15 end
 				ranked[#ranked + 1] = { record = record, score = score, matches = matches }
 			end
