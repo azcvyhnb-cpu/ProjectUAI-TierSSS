@@ -131,25 +131,41 @@ return function(env)
 		local queryTerms, ranked = terms(query), {}
 		local literalQuery = query:lower()
 		for _, record in ipairs(data.records) do
-			local haystack = (record.title or "") .. " " .. (record.content or "") .. " " .. table.concat(record.tags or {}, " ")
-			local lower, score, matches = haystack:lower(), 0, 0
 			local titleLower = (record.title or ""):lower()
+			local contentLower = (record.content or ""):lower()
+			local tags = type(record.tags) == "table" and record.tags or {}
+			local lower = (record.title or "") .. " " .. (record.content or "") .. " " .. table.concat(tags, " ")
+			lower = lower:lower()
+			local score, matches, tagMatches = 0, 0, 0
 			local phraseMatch = lower:find(literalQuery, 1, true) ~= nil
 			for _, term in ipairs(queryTerms) do
 				if lower:find(term, 1, true) then score = score + 1; matches = matches + 1 end
 				if titleLower:find(term, 1, true) then score = score + 2 end
+				for _, tag in ipairs(tags) do
+					if type(tag) == "string" and tag:lower():find(term, 1, true) then
+						score = score + 2
+						tagMatches = tagMatches + 1
+						break
+					end
+				end
 			end
 			-- Phrase matching provides a useful UTF-8-safe fallback for Thai and
 			-- other scripts that are not split by Lua's ASCII-oriented token pattern.
 			if phraseMatch then score = score + 3 end
+			if titleLower:find(literalQuery, 1, true) then score = score + 2 end
 			if matches > 0 or phraseMatch then
 				if #queryTerms > 0 then score = score + matches / #queryTerms end
 				if record.confidence == "verified" then score = score + 0.15 end
-				ranked[#ranked + 1] = { record = record, score = score, matches = matches }
+				ranked[#ranked + 1] = { record = record, score = score, matches = matches, tagMatches = tagMatches }
 			end
 		end
 		table.sort(ranked, function(a, b)
-			if a.score == b.score then return (a.record.updatedAt or 0) > (b.record.updatedAt or 0) end
+			if a.score == b.score then
+				if (a.record.updatedAt or 0) == (b.record.updatedAt or 0) then
+					return tostring(a.record.id or "") < tostring(b.record.id or "")
+				end
+				return (a.record.updatedAt or 0) > (b.record.updatedAt or 0)
+			end
 			return a.score > b.score
 		end)
 		local limit = math.max(1, math.min(math.floor(tonumber(args.limit) or 5), 10))
