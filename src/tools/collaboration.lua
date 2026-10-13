@@ -3,7 +3,6 @@
 -- reconciles their independent analyses and calls out disagreements.
 return function(env)
 	local util = env.require("runtime/util")
-	local config = env.require("runtime/config")
 	local providers = env.require("provider/registry")
 	local chat = env.require("provider/chat")
 	local H = env.require("tools/helpers")
@@ -105,11 +104,23 @@ return function(env)
 				task.wait(0.25)
 				waited = waited + 0.25
 			end
+			-- A slow worker must not erase a useful report from the other model.
+			-- Mark unfinished workers explicitly, then let the coordinator synthesize
+			-- the available evidence. The worker may finish later, but this call never
+			-- waits beyond the bounded collaboration window.
 			if pending > 0 then
-				return H.fail("Collaboration timed out while waiting for both model requests.")
+				for index, model in ipairs(MODELS) do
+					if not outputs[index] then
+						outputs[index] = {
+							model = model.model,
+							error = "request exceeded the " .. tostring(REQUEST_TIMEOUT + 5) .. "s collaboration wait limit",
+						}
+					end
+				end
 			end
-			if not outputs[1] and not outputs[2] then
-				return H.fail("Both model requests failed. GLM: " .. tostring(outputs[1] and outputs[1].error) .. "; DeepSeek: " .. tostring(outputs[2] and outputs[2].error))
+			local hasReport = (outputs[1] and outputs[1].text) or (outputs[2] and outputs[2].text)
+			if not hasReport then
+				return H.fail("Both model requests failed. GLM: " .. tostring(outputs[1] and outputs[1].error or "no result") .. "; DeepSeek: " .. tostring(outputs[2] and outputs[2].error or "no result"))
 			end
 
 			local reports = {}
