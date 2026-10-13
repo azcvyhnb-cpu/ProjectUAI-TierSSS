@@ -192,6 +192,21 @@ suite.case("ambiguous basename imports are reported instead of guessed", functio
 	f.close()
 end)
 
+suite.case("exact module IDs take precedence over colliding basename aliases", function()
+	local f = fixture()
+	f.write("Exact/settings.lua", "return { source = \"root\" }\n")
+	f.write("Exact/a/settings.lua", "return { source = \"nested\" }\n")
+	f.write("Exact/main.lua", 'local root = require("settings")\nlocal nested = require("a/settings")\nreturn { root, nested }\n')
+	local result = f.call("project_inspect", { path = "Exact" })
+	check("both exact imports resolve", #result.data.edges == 2)
+	local targets = {}
+	for _, edge in ipairs(result.data.edges) do targets[edge.to] = true end
+	check("root module wins over colliding basename", targets["settings"] == true)
+	check("nested explicit module remains resolvable", targets["a/settings"] == true)
+	check("exact root import is not reported ambiguous", #result.data.ambiguousImports == 0)
+	f.close()
+end)
+
 suite.case("analysis reports syntax, missing imports and cycles without executing", function()
 	local f = fixture(); f.start()
 	f.write("Example/main.lua", '_G.projectWasExecuted = true\nlocal missing = require("missing")\nreturn missing')
