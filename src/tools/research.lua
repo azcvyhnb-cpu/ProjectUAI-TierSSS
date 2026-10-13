@@ -17,11 +17,12 @@ return function(env)
 			name = "research_search",
 			risk = "read",
 			needs = { "fs" },
-			description = "Search persistent research notes for this Roblox place. Use this BEFORE scanning or rediscovering map systems, UI paths, object hierarchies, observed behavior, or prior test results. Returns a small relevance-ranked set, with confidence and sources; hypotheses are not facts. Notes survive client restarts when filesystem persistence is supported.",
+			description = "Search persistent research notes for this Roblox place before repeating exploration. Results include observation age; pass maxAgeMs based on how quickly the fact can change to label each match fresh, stale, or unknown. A stale note is historical evidence, not proof of current game state. Notes survive client restarts when filesystem persistence is supported.",
 			parameters = { type = "object", properties = {
 				query = { type = "string", description = "Short keyword query: feature/system/object names and the specific question." },
 				placeId = placeId,
 				limit = { type = "integer", minimum = 1, maximum = 10, description = "Maximum matching notes. Default 5." },
+				maxAgeMs = { type = "number", minimum = 1, description = "Optional freshness threshold in milliseconds; results expose freshness= fresh/stale/unknown. Choose based on how volatile the observation is." },
 			}, required = { "query" } },
 			run = function(args) return compact(memory.search(args)) end,
 		},
@@ -36,6 +37,7 @@ return function(env)
 				tags = { type = "array", items = { type = "string" }, maxItems = 12, description = "Optional topic tags." },
 				confidence = { type = "string", enum = { "verified", "observed", "hypothesis" }, description = "Evidence status; default observed." },
 				source = { type = "string", description = "Optional evidence pointer such as a source path, object path, test name, or capture id. Do not store credentials or secrets." },
+				observedAt = { type = "number", minimum = 0, description = "Optional observation timestamp in Unix epoch milliseconds. Omit for a new observation made now; on refresh, omitted values preserve the original observation time." },
 				placeId = placeId,
 			}, required = { "title", "content" } },
 			run = function(args)
