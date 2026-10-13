@@ -195,7 +195,7 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
     const multiUploads = commands.slice(multiStart).filter(command => command.type === 'attachment:upload');
     assert.equal(multiUploads.length, 2, 'every file in a multi-file selection is persisted');
     assert.equal(multiSend.files.length, 2);
-    assert.equal((multiSend.text.match(/Path: pastes\\//g) || []).length, 2, 'each file reference includes its persistent path');
+    assert.equal((multiSend.text.match(/Path: pastes\//g) || []).length, 2, 'each file reference includes its persistent path');
     assert.ok(!multiSend.text.includes('return require("settings")'), 'source bodies stay out of the chat context');
     receipts.set(multiSend.commandId, { ok: true });
     await post({ events: [{ kind: 'turn:start', sessionId: 's1' }, { kind: 'turn:end', sessionId: 's1' }] });
