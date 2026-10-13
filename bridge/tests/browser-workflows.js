@@ -176,6 +176,32 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
     console.log('Composer: IME, send acknowledgements, newer drafts and attachments, asynchronous file reads');
 
     while (await page.locator('#attachments button').count()) await page.locator('#attachments button').first().click();
+
+    const multiStart = commands.length;
+    await page.locator('#fileInput').setInputFiles([
+      { name: 'main.lua', mimeType: 'text/plain', buffer: Buffer.from('return require("settings")\\n') },
+      { name: 'settings.lua', mimeType: 'text/plain', buffer: Buffer.from('return { enabled = true }\\n') },
+    ]);
+    await page.waitForFunction(() => document.querySelectorAll('#attachments button').length === 2);
+    await page.locator('#input').fill('Inspect this multi-file project and map its dependencies.');
+    await page.locator('#send').click();
+    let multiSend;
+    const multiDeadline = Date.now() + 10000;
+    while (!multiSend && Date.now() < multiDeadline) {
+      multiSend = commands.slice(multiStart).find(command => command.type === 'send');
+      if (!multiSend) await sleep(25);
+    }
+    assert.ok(multiSend, 'multi-file import must submit after upload');
+    const multiUploads = commands.slice(multiStart).filter(command => command.type === 'attachment:upload');
+    assert.equal(multiUploads.length, 2, 'every file in a multi-file selection is persisted');
+    assert.equal(multiSend.files.length, 2);
+    assert.equal((multiSend.text.match(/Path: pastes\\//g) || []).length, 2, 'each file reference includes its persistent path');
+    assert.ok(!multiSend.text.includes('return require("settings")'), 'source bodies stay out of the chat context');
+    receipts.set(multiSend.commandId, { ok: true });
+    await post({ events: [{ kind: 'turn:start', sessionId: 's1' }, { kind: 'turn:end', sessionId: 's1' }] });
+    await page.waitForFunction(() => !document.querySelector('#send').disabled);
+    console.log('Multi-file project imports: each selected source is persisted with a path for project_inspect');
+
     const longInput = 'LONG_SOURCE_START\r\n' + 'local text = "界🙂"\r\n'.repeat(6000) + 'LONG_SOURCE_END\r\n';
     const surrounding = 'Review this:\n\nKeep the final instructions.';
     await page.locator('#input').fill(surrounding);
