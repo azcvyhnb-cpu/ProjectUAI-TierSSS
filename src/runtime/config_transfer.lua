@@ -203,6 +203,7 @@ return function(env)
 		-- values. Reject fractional or unreasonable imported limits before they
 		-- reach loops, concurrency gates, or request schedulers.
 		local integerLimits = {
+			["bridge.port"] = { 1, 65535 },
 			["agent.maxTurns"] = { 1, 10000 },
 			["agent.toolConcurrency"] = { 1, 64 },
 			["agent.toolTimeout"] = { 1, 86400 },
@@ -225,6 +226,9 @@ return function(env)
 				return nil, "config." .. path .. " must be a whole number between "
 					.. tostring(bounds[1]) .. " and " .. tostring(bounds[2])
 			end
+		end
+		if merged.ui.fontScale < 0.85 or merged.ui.fontScale > 1.4 then
+			return nil, "config.ui.fontScale must be between 0.85 and 1.4"
 		end
 		if merged.agent.contextFraction < 0.1 or merged.agent.contextFraction > 0.95 then
 			return nil, "config.agent.contextFraction must be between 0.1 and 0.95"
