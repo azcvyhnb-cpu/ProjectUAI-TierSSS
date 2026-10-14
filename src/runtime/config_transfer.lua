@@ -198,6 +198,40 @@ return function(env)
 		if merged.bridge.requestTimeout < 10 or merged.bridge.requestTimeout > 86400 then
 			return nil, "config.bridge.requestTimeout must be between 10 and 86400 seconds"
 		end
+
+		-- Resource budgets are counts/durations, not arbitrary floating-point
+		-- values. Reject fractional or unreasonable imported limits before they
+		-- reach loops, concurrency gates, or request schedulers.
+		local integerLimits = {
+			["agent.maxTurns"] = { 1, 10000 },
+			["agent.toolConcurrency"] = { 1, 64 },
+			["agent.toolTimeout"] = { 1, 86400 },
+			["agent.requestTimeout"] = { 1, 86400 },
+			["agent.contextTokens"] = { 1, 1000000 },
+			["agent.keepTurns"] = { 0, 10000 },
+			["agent.maxTokens"] = { 1, 1000000 },
+			["agent.resultCap"] = { 1, 1000000 },
+			["agent.repeatLimit"] = { 1, 100 },
+			["agent.subagentDepth"] = { 0, 32 },
+			["agent.subagentTurns"] = { 1, 10000 },
+			["agent.subagentConcurrency"] = { 1, 256 },
+			["agent.subagentBudget"] = { 1, 86400 },
+			["agent.retries"] = { 0, 100 },
+		}
+		for path, bounds in pairs(integerLimits) do
+			local value = util.get(merged, path)
+			if type(value) ~= "number" or value % 1 ~= 0
+				or value < bounds[1] or value > bounds[2] then
+				return nil, "config." .. path .. " must be a whole number between "
+					.. tostring(bounds[1]) .. " and " .. tostring(bounds[2])
+			end
+		end
+		if merged.agent.contextFraction < 0.1 or merged.agent.contextFraction > 0.95 then
+			return nil, "config.agent.contextFraction must be between 0.1 and 0.95"
+		end
+		if merged.agent.temperature < 0 or merged.agent.temperature > 2 then
+			return nil, "config.agent.temperature must be between 0 and 2"
+		end
 		ok, err = array(merged.memory.entries, "config.memory.entries", function(entry, path)
 			local valid, why = object(entry, path)
 			if not valid then return false, why end
