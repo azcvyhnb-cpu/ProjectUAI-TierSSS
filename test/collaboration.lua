@@ -30,6 +30,7 @@ local function configured(mode)
 				if mode == "synthesis_failure" then return nil, "synthetic synthesis failure" end
 				return { content = "Coordinated answer with caveats", toolCalls = {} }
 			end
+			if mode == "oversized" then return { content = string.rep("x", 13000), toolCalls = {} } end
 			return { content = "Report from " .. tostring(record.model), toolCalls = {} }
 		end,
 	}
@@ -109,6 +110,17 @@ do
 	assert(type(result) == "string" and result:find("Coordinated answer", 1, true), "timed-out worker does not discard completed report")
 	assert(#calls >= 3, "coordinator runs with the completed report")
 	assert(calls[#calls].user:find("request exceeded the 125s collaboration wait limit", 1, true), "timeout is explicit in the evidence packet")
+	f.healthy()
+	f.close()
+end
+
+-- Oversized provider content is bounded before being forwarded into synthesis.
+do
+	local f, tool, calls = configured("oversized")
+	local result = f.run(function() return tool.run({ task = "Review this design." }) end, 1)
+	assert(type(result) == "string" and result:find("Coordinated answer", 1, true), "oversized reports still produce a coordinated answer")
+	assert(calls[3].user:find("[Report truncated at 12000 characters.]", 1, true), "synthesis receives an explicit truncation marker")
+	assert(#calls[3].user < 25000, "synthesis input stays bounded")
 	f.healthy()
 	f.close()
 end
