@@ -21,10 +21,13 @@ local function configured(mode)
 				-- Virtual scheduler wait: no real network or wall-clock delay.
 				f.h.sandbox.task.wait(130)
 			end
-			if mode == "failure" and record.model == "deepseek-v4-flash" and not user:find("Independent reports", 1, true) then
-				return nil, "synthetic reviewer failure"
+			local isSynthesis = user:find("Independent reports", 1, true) ~= nil
+			if (mode == "failure" or mode == "both_failure") and not isSynthesis
+				and (mode == "both_failure" or record.model == "deepseek-v4-flash") then
+				return nil, "synthetic " .. tostring(record.model) .. " failure"
 			end
-			if user:find("Independent reports", 1, true) then
+			if isSynthesis then
+				if mode == "synthesis_failure" then return nil, "synthetic synthesis failure" end
 				return { content = "Coordinated answer with caveats", toolCalls = {} }
 			end
 			return { content = "Report from " .. tostring(record.model), toolCalls = {} }
@@ -71,6 +74,29 @@ do
 	assert(type(result) == "string" and result:find("Coordinated answer", 1, true), "partial report is still synthesized")
 	assert(#calls == 3, "coordinator still runs after one worker failure")
 	assert(calls[3].user:find("synthetic reviewer failure", 1, true), "reviewer failure is disclosed to coordinator")
+	f.healthy()
+	f.close()
+end
+
+-- If synthesis fails, return both independent reports rather than losing completed work.
+do
+	local f, tool, calls = configured("synthesis_failure")
+	local result = f.run(function() return tool.run({ task = "Review this design." }) end, 1)
+	assert(type(result) == "string" and result:find("coordinator request failed", 1, true), "synthesis failure is explicit")
+	assert(result:find("Report from GLM-5.3-Flash", 1, true), "fallback retains GLM report")
+	assert(result:find("Report from deepseek-v4-flash", 1, true), "fallback retains DeepSeek report")
+	f.healthy()
+	f.close()
+end
+
+-- If both independent workers fail, report both errors and do not make a third request.
+do
+	local f, tool, calls = configured("both_failure")
+	local result = f.run(function() return tool.run({ task = "Review this design." }) end, 1)
+	assert(type(result) == "table" and result.ok == false, "both worker failures return a tool error")
+	assert(result.text:find("synthetic GLM-5.3-Flash failure", 1, true), "GLM failure is disclosed")
+	assert(result.text:find("synthetic deepseek-v4-flash failure", 1, true), "DeepSeek failure is disclosed")
+	assert(#calls == 2, "no synthesis request runs without any independent report")
 	f.healthy()
 	f.close()
 end
