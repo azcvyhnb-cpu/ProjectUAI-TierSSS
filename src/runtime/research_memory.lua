@@ -37,6 +37,12 @@ return function(env)
 			return nil, "research notebook is invalid JSON; original file was left untouched"
 		end
 		if data.placeId ~= id then return nil, "research notebook placeId mismatch" end
+		for index, record in ipairs(data.records) do
+			if type(record) ~= "table" or type(record.id) ~= "string" or type(record.key) ~= "string"
+				or type(record.title) ~= "string" or type(record.content) ~= "string" then
+				return nil, "research notebook contains an invalid record at index " .. tostring(index) .. "; original file was left untouched"
+			end
+		end
 		return data
 	end
 
