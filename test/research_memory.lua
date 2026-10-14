@@ -157,5 +157,18 @@ check("refreshes a legacy token-set note in place", migrated ~= nil and migrated
 check("migrates the legacy key to ordered identity", persistedLegacy.records[1].key ~= legacyKey and persistedLegacy.records[1].key == string.lower(legacyTitle) .. string.char(0) .. string.lower(legacyBody))
 check("preserves legacy note provenance during migration", persistedLegacy.records[1].source == "old notebook")
 
+-- A syntactically valid notebook can still contain malformed record values.
+-- Reject it with a clear error instead of indexing a string/nil and crashing.
+do
+	local corruptPath = "UAI/research/place-654321.json"
+	local corruptRaw = util.encode({ version = 1, placeId = 654321, records = { "not-a-record" } })
+	env.sandbox.writefile(corruptPath, corruptRaw)
+	local corruptSearch, searchErr = memory.search({ query = "anything", placeId = 654321 })
+	check("rejects malformed notebook records during search", corruptSearch == nil and tostring(searchErr):find("invalid record at index 1", 1, true) ~= nil)
+	local corruptSave, saveErr = memory.save({ title = "Safe write", content = "Must not overwrite malformed data.", placeId = 654321 })
+	check("rejects malformed notebook records during save", corruptSave == nil and tostring(saveErr):find("invalid record at index 1", 1, true) ~= nil)
+	check("preserves malformed notebook bytes for recovery", env.sandbox.readfile(corruptPath) == corruptRaw)
+end
+
 print(string.format("Research memory: %d passed, %d failed", passed, failed))
 if failed > 0 then os.exit(1) end
