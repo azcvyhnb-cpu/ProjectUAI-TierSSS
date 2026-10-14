@@ -146,6 +146,7 @@ reject("reject fractional tool timeout", function(c) c.agent.toolTimeout = 1.25 
 reject("reject out-of-range UI font scale", function(c) c.ui.fontScale = 1.5 end)
 reject("reject fractional bridge port", function(c) c.bridge.port = 8790.5 end)
 reject("reject out-of-range bridge port", function(c) c.bridge.port = 65536 end)
+reject("reject fractional bridge request timeout", function(c) c.bridge.requestTimeout = 10.5 end)
 reject("reject out-of-range context fraction", function(c) c.agent.contextFraction = 1 end)
 reject("reject out-of-range model temperature", function(c) c.agent.temperature = 2.1 end)
 reject("reject invalid permissions mode", function(c) c.permissions.mode = "sometimes" end)
