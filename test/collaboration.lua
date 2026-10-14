@@ -73,7 +73,7 @@ do
 	local result = f.run(function() return tool.run({ task = "Review this design." }) end, 1)
 	assert(type(result) == "string" and result:find("Coordinated answer", 1, true), "partial report is still synthesized")
 	assert(#calls == 3, "coordinator still runs after one worker failure")
-	assert(calls[3].user:find("synthetic reviewer failure", 1, true), "reviewer failure is disclosed to coordinator")
+	assert(calls[3].user:find("synthetic deepseek-v4-flash failure", 1, true), "reviewer failure is disclosed to coordinator")
 	f.healthy()
 	f.close()
 end
