@@ -198,6 +198,9 @@ return function(env)
 		if merged.bridge.requestTimeout < 10 or merged.bridge.requestTimeout > 86400 then
 			return nil, "config.bridge.requestTimeout must be between 10 and 86400 seconds"
 		end
+		if merged.bridge.requestTimeout % 1 ~= 0 then
+			return nil, "config.bridge.requestTimeout must be a whole number of seconds"
+		end
 
 		-- Resource budgets are counts/durations, not arbitrary floating-point
 		-- values. Reject fractional or unreasonable imported limits before they
