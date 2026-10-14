@@ -14,6 +14,7 @@ return function(env)
 	}
 	local MAX_TASK_CHARS = 12000
 	local MAX_REPLY_TOKENS = 1800
+	local MAX_REPORT_CHARS = 12000
 	local REQUEST_TIMEOUT = 120
 
 	local function thirxRecord(model)
@@ -47,6 +48,9 @@ return function(env)
 		end
 		local content = util.trim(tostring(result.content or ""))
 		if content == "" then return nil, "model returned an empty report" end
+		if #content > MAX_REPORT_CHARS then
+			content = content:sub(1, MAX_REPORT_CHARS) .. "\n[Report truncated at " .. tostring(MAX_REPORT_CHARS) .. " characters.]"
+		end
 		return content
 	end
 
