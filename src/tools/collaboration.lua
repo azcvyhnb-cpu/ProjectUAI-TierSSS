@@ -67,7 +67,7 @@ return function(env)
 		usage.record(result and result.usage or nil, result and (result.model or record.model) or record.model, {
 			prompt = accounting.estimate,
 			completion = result and (usage.estimateText(result.content) + usage.estimateText(result.reasoning)) or 0,
-		}, record)
+		}, record, budget)
 		if budget then usage.releaseTaskBudget(budget, reservation) end
 		if not result then return nil, tostring(err or "request failed") end
 		if type(result.toolCalls) == "table" and #result.toolCalls > 0 then
