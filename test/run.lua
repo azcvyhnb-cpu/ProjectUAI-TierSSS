@@ -450,12 +450,14 @@ scenario("cumulative task token budget stops before dispatching more tools", fun
 	local harness, handle = bootWith({
 		handler = function(entry)
 			if not tostring(entry.url):find("/chat/completions") then return { StatusCode = 404, Body = "{}" } end
-			return { StatusCode = 200, Body = chatBody({
+			local body = json.decode(chatBody({
 				toolCalls = { toolCall("budget_call", "game_info", {}) },
-			}) }
+			}))
+			body.usage = { prompt_tokens = 120000, completion_tokens = 40000, total_tokens = 160000 }
+			return { StatusCode = 200, Body = json.encode(body) }
 		end,
 	})
-	handle.config.set("agent.maxTaskTokens", 100)
+	handle.config.set("agent.maxTaskTokens", 100000)
 	local session = handle.sessions.current()
 	session.send("inspect this game")
 	harness.settle(10)
