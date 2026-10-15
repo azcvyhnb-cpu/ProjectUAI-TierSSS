@@ -21,8 +21,18 @@ Only report tests that were actually executed; synthetic tests and CI are not ev
 - GitHub Actions run `38430970133` for PR head commit `835a3045c35d2550d7270807bb67eb8c3af03dd1` completed successfully; PR metadata says the quality and bridge-browser jobs passed.
 - GitHub Actions run `38458090741` for the audit-document commit `092b1a1763ab313b667d48186505f9d0b3068d4a` completed successfully. The `quality` and `bridge-browser` jobs both concluded `success`; two quality steps that publish/check a generated bundle on `main` were skipped. This confirms the run's reported jobs, not live executor compatibility.
 - Runtime/transport source trace: `src/net/http.lua` caps a request at 600 seconds, 8 concurrent native workers, and 8 MiB response bodies; unknown transport outcomes at deadline are reported without automatic retry. A worker whose host call never returns can remain occupied, so the cap intentionally prevents unlimited accumulation but can leave capacity degraded if the executor permanently hangs. Existing tests cover timeout-versus-refusal retry policy and duplicate billing prevention.
-- No code defect has yet been confirmed strongly enough to justify a source change in this phase; avoid changing retry/worker semantics without a regression fixture because it could duplicate billed requests or leak unbounded host calls.
-- This is CI evidence only. No test was executed on a physical Android device or inside Delta during this audit.
+- Confirmed gaps addressed on the current PR branch: delegated agents now share a per-task token ledger; model requests reserve both prompt estimates and bounded reply ceilings; direct GLM/DeepSeek collaboration requests are included in usage and task accounting; repeated exact-source lexical outlines use a bounded cache whose counters are returned by `project_inspect`.
+- A synthetic graph benchmark now exercises 301 nodes and the 12,000-edge ceiling and reports elapsed time without making a machine-specific timing assertion.
+- Agent settings now offer explicit **Mobile Safe**, **Balanced**, and **Performance** presets. The default remains **Custom**, so existing saved settings are not silently overwritten. Mobile Safe limits tool/subagent concurrency, context, reply size, task tokens, and request deadlines.
+- This is CI evidence only. No test has been executed on a physical Android device or inside Delta during this audit. The native checklist below is prepared for execution, not a report of completed testing.
+
+## Current PR implementation update (2026-10-15)
+
+1. **Task budget:** accounting is stored on the task ledger instead of inferred solely from global session totals, preventing unrelated simultaneous conversations from charging each other's budget. Nested workers share the parent ledger. Requests reserve their estimated prompt and a reply ceiling based on the remaining budget.
+2. **Multi-model calls:** the collaboration tool records all worker and synthesis requests, attributes estimates/reported usage by model, reserves capacity before concurrent calls, and refuses calls that cannot fit the remaining budget.
+3. **Project-source reuse:** exact unchanged source is cached with a 16-entry / 512 KiB retained-source limit. Returned outlines are copied, changed source is rescanned, and cancelled inspections still honor cancellation.
+4. **Measurement:** the existing small/medium/large context benchmark reports token pressure, removals, estimator calls and time. The graph suite reports node/edge count, truncation and elapsed time for a large synthetic map. These are synthetic baselines; no live model accuracy or real-device memory improvement is claimed.
+5. **Mobile controls:** users can explicitly select Mobile Safe when investigating freezes. The preset is not automatically enabled, and native Android/Delta acceptance remains **NOT RUN** until a real device session is recorded.
 
 ## Sequential work plan
 
