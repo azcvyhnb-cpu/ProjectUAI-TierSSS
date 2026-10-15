@@ -233,7 +233,7 @@ return function(env)
 			toolConcurrency = 2, subagentConcurrency = 2, subagentDepth = 2,
 			subagentTurns = 12, subagentBudget = 180, subagentUnlimited = false,
 			unlimitedTurns = false, requestTimeout = 120, requestUnlimited = false,
-			contextTokens = 16000, contextFraction = 0.45, keepTurns = 8,
+			contextTokens = 16000, contextFraction = 0.5, keepTurns = 8,
 			maxTaskTokens = 100000, resultCap = 12000, maxTokens = 8192, compaction = true,
 		},
 		balanced = {
