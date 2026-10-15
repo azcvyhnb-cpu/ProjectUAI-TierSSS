@@ -68,6 +68,10 @@ return function(env)
 			-- Hard cap for cumulative prompt/completion tokens spent on one top-level task.
 			-- Prevents unlimited turns from running away on repeated map/source analysis.
 			maxTaskTokens = 250000,
+			-- Profiles are explicit presets. "custom" preserves every existing setting;
+			-- selecting another profile writes its values into the ordinary settings so
+			-- sliders, config exports and the runtime all agree about the effective limits.
+			resourceProfile = "custom",
 			-- Lifts the step limit and the turn deadline for the top-level
 			-- conversation, so a long job runs until the model answers in prose
 			-- instead of stopping mid-way with "I reached this session's step limit".
@@ -224,6 +228,34 @@ return function(env)
 		},
 	}
 
+	local RESOURCE_PROFILES = {
+		["mobile-safe"] = {
+			toolConcurrency = 2, subagentConcurrency = 2, subagentDepth = 2,
+			subagentTurns = 12, subagentBudget = 180, subagentUnlimited = false,
+			unlimitedTurns = false, requestTimeout = 120, requestUnlimited = false,
+			contextTokens = 16000, contextFraction = 0.45, keepTurns = 8,
+			maxTaskTokens = 100000, resultCap = 12000, maxTokens = 8192, compaction = true,
+		},
+		balanced = {
+			toolConcurrency = 4, subagentConcurrency = 4, subagentDepth = 3,
+			subagentTurns = 20, subagentBudget = 300, subagentUnlimited = false,
+			unlimitedTurns = false, requestTimeout = 240, requestUnlimited = false,
+			contextTokens = 32000, contextFraction = 0.55, keepTurns = 10,
+			maxTaskTokens = 250000, resultCap = 24000, maxTokens = 16000, compaction = true,
+		},
+		performance = {
+			toolConcurrency = 8, subagentConcurrency = 8, subagentDepth = 4,
+			subagentTurns = 30, subagentBudget = 900, subagentUnlimited = true,
+			unlimitedTurns = true, requestTimeout = 600, requestUnlimited = true,
+			contextTokens = 48000, contextFraction = 0.7, keepTurns = 14,
+			maxTaskTokens = 600000, resultCap = 32000, maxTokens = 32000, compaction = true,
+		},
+	}
+	local PROFILE_KEYS = {}
+	for _, values in pairs(RESOURCE_PROFILES) do
+		for key in pairs(values) do PROFILE_KEYS[key] = true end
+	end
+
 	local M = {
 		defaults = DEFAULTS,
 		data = util.deepCopy(DEFAULTS),
@@ -294,6 +326,23 @@ return function(env)
 	-- rebuilding on every keystroke of an unrelated field.
 	function M.set(path, value, opts)
 		opts = opts or {}
+		if path == "agent.resourceProfile" and value ~= "custom" then
+			local profile = RESOURCE_PROFILES[value]
+			if not profile then return nil, "unknown resource profile" end
+			util.set(M.data, path, value)
+			for key, presetValue in pairs(profile) do
+				util.set(M.data, "agent." .. key, presetValue)
+				if not opts.quiet then M.changed:fire("agent." .. key, presetValue) end
+			end
+			if not opts.quiet then M.changed:fire(path, value) end
+			if not opts.transient then M.save() end
+			return value
+		end
+		if path:sub(1, 6) == "agent." and PROFILE_KEYS[path:sub(7)]
+			and M.get("agent.resourceProfile", "custom") ~= "custom" then
+			util.set(M.data, "agent.resourceProfile", "custom")
+			if not opts.quiet then M.changed:fire("agent.resourceProfile", "custom") end
+		end
 		util.set(M.data, path, value)
 		if not opts.quiet then M.changed:fire(path, value) end
 		if not opts.transient then M.save() end
