@@ -256,5 +256,20 @@ scenario("malformed persisted context fields do not abort restoration", function
 	}) == true and #ctx.messages == 1 and ctx.messages[1].content == "valid")
 end)
 
+scenario("compaction transcript is bounded before calling the summariser", function()
+	local _, _, context = fixture()
+	local ctx, seen = context.new(), nil
+	for index = 1, 40 do
+		ctx.pushUser(("question " .. index .. " "):rep(40))
+		ctx.pushAssistant({ content = ("answer " .. index .. " "):rep(40) })
+	end
+	ctx.compact(function(transcript)
+		seen = transcript
+		return "bounded summary"
+	end, { force = true })
+	check("the summariser received a bounded transcript", type(seen) == "string" and #seen <= 12000)
+	check("the summary input discloses omitted history", has(seen, "compaction transcript capped"))
+end)
+
 print(string.format("context compaction: %d checks passed, %d scenarios failed", passed, failed))
 if failed > 0 then os.exit(1) end
