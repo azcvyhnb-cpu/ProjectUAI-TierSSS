@@ -94,7 +94,7 @@ return function(env)
 				},
 				required = { "task" },
 			},
-			run = function(args)
+			run = function(args, ctx)
 				local taskText = util.trim(tostring(args.task or ""))
 				if taskText == "" then return H.fail("task is required") end
 				if #taskText > MAX_TASK_CHARS then
