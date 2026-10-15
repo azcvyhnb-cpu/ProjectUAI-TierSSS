@@ -1141,7 +1141,8 @@ return function(env)
 			"Mobile Safe reduces parallel work, context size, output size and deadlines to limit memory pressure. Balanced is a moderate preset; Performance permits larger budgets and more concurrency. Selecting a preset replaces its listed Agent settings; changing one of those settings afterward switches the label to Custom.",
 			"agent.resourceProfile",
 			{ "custom", "mobile-safe", "balanced", "performance" },
-			{ "Custom", "Mobile Safe", "Balanced", "Performance" })
+			{ "Custom", "Mobile Safe", "Balanced", "Performance" },
+			{ "Lower memory", "Higher throughput" })
 		R.number(agent, "Step limit", "Tool rounds allowed in one turn, unless the switch below removes it.",
 			"agent.maxTurns", 4, 60, 1)
 		R.toggle(agent, {
