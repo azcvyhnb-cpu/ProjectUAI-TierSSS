@@ -111,7 +111,7 @@ do
 	end
 	f.healthy()
 	f.close()
-end)
+eend
 
 -- One model failure must not discard the other model's successful report.
 do
