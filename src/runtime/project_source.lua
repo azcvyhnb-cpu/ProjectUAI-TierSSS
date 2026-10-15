@@ -2,6 +2,47 @@
 return function(env)
 	local util = env.require("runtime/util")
 	local M = { MAX_FILE = 256000, MAX_TOKENS = 50000 }
+	-- Repeated project inspections commonly revisit the same files. Keep a small
+	-- exact-source cache so unchanged files skip lexical tokenization, while the
+	-- byte and entry ceilings prevent the cache itself becoming a mobile memory leak.
+	local CACHE_ENTRIES, CACHE_SOURCE_BYTES = 16, 512 * 1024
+	local cache, cacheOrder, cacheBytes, cacheHits, cacheMisses = {}, {}, 0, 0, 0
+	local function touch(hash)
+		for i, item in ipairs(cacheOrder) do
+			if item == hash then table.remove(cacheOrder, i); break end
+		end
+		cacheOrder[#cacheOrder + 1] = hash
+	end
+	local function cacheRead(hash, source)
+		local entry = cache[hash]
+		if entry and entry.source == source then
+			cacheHits = cacheHits + 1
+			touch(hash)
+			return util.deepCopy(entry.result)
+		end
+		cacheMisses = cacheMisses + 1
+		return nil
+	end
+	local function cacheWrite(hash, source, result)
+		local prior = cache[hash]
+		if prior then cacheBytes = cacheBytes - #prior.source end
+		cache[hash] = { source = source, result = util.deepCopy(result) }
+		cacheBytes = cacheBytes + #source
+		touch(hash)
+		while #cacheOrder > CACHE_ENTRIES or cacheBytes > CACHE_SOURCE_BYTES do
+			local oldest = table.remove(cacheOrder, 1)
+			local evicted = cache[oldest]
+			if evicted then cacheBytes = cacheBytes - #evicted.source; cache[oldest] = nil end
+		end
+	end
+	function M.cacheStats()
+		local entries = 0
+		for _ in pairs(cache) do entries = entries + 1 end
+		return { hits = cacheHits, misses = cacheMisses, entries = entries, sourceBytes = cacheBytes }
+	end
+	function M.clearCache()
+		cache, cacheOrder, cacheBytes, cacheHits, cacheMisses = {}, {}, 0, 0, 0
+	end
 	function M.hash(source)
 		local value = 5381
 		for i = 1, #source do value = (value * 33 + source:byte(i)) % 4294967296 end
@@ -20,6 +61,10 @@ return function(env)
 	end
 	function M.scan(source, ctx)
 		if not M.valid(source) then return nil, "Source must be UTF-8 text without NUL, at most 256000 bytes" end
+		if ctx and ctx.aborted and ctx.aborted() then return nil, "Inspection cancelled" end
+		local hash = M.hash(source)
+		local cached = cacheRead(hash, source)
+		if cached then return cached end
 		local tokens, at, line, column = {}, 1, 1, 1
 		local function consume(last, kind)
 			local raw = source:sub(at, last)
@@ -85,8 +130,10 @@ return function(env)
 				end
 			end
 		end
-		return { hash = M.hash(source), bytes = #source, lines = line, symbols = symbols, imports = imports,
+		local result = { hash = hash, bytes = #source, lines = line, symbols = symbols, imports = imports,
 			omitted = omitted, coverage = "lexical hints; no scope/type inference; interpolated string expressions are opaque" }
+		cacheWrite(hash, source, result)
+		return util.deepCopy(result)
 	end
 	return M
 end
