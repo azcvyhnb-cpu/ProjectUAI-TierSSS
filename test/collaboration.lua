@@ -68,6 +68,36 @@ do
 	f.close()
 end
 
+-- Direct worker/coordinator calls must appear in global usage and share the caller's
+-- task budget, rather than being invisible side requests outside the main agent loop.
+do
+	local f, tool, calls = configured("success")
+	local usage = f.env.require("agent/usage")
+	local budget = { startTokens = 0, retryStartExposure = 0, limit = 200000, reserved = 0 }
+	local ctx = { session = { taskBudget = budget }, aborted = function() return false end }
+	local result = f.run(function() return tool.run({ task = "Review this design." }, ctx) end, 1)
+	assert(type(result) == "string" and #calls == 3, "budgeted collaboration still runs all three requests")
+	assert(usage.session.requests == 3 and usage.session.total > 0, "worker and synthesis token usage is counted")
+	assert(usage.providerSnapshot()["thirx|GLM-5.3-Flash"] ~= nil, "GLM usage is attributed to its model")
+	assert(usage.providerSnapshot()["thirx|deepseek-v4-flash"] ~= nil, "DeepSeek usage is attributed to its model")
+	assert(budget.reserved == 0, "in-flight reservations are released after the calls")
+	f.healthy()
+	f.close()
+end)
+
+-- A budget too small for even the first bounded worker prevents any provider request.
+do
+	local f, tool, calls = configured("success")
+	local budget = { startTokens = 0, retryStartExposure = 0, limit = 100, reserved = 0 }
+	local ctx = { session = { taskBudget = budget }, aborted = function() return false end }
+	local result = f.run(function() return tool.run({ task = "Review this design." }, ctx) end, 1)
+	assert(type(result) == "table" and result.ok == false, "insufficient budget is returned as a tool failure")
+	assert(#calls == 0, "no model call is sent when the shared task budget cannot reserve it")
+	assert(budget.reserved == 0, "rejected calls leave no reservation behind")
+	f.healthy()
+	f.close()
+end)
+
 -- One model failure must not discard the other model's successful report.
 do
 	local f, tool, calls = configured("failure")
