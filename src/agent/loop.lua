@@ -41,9 +41,7 @@ return function(env)
 	end
 
 	local function sharedTaskTokensSpent(budget)
-		local current = tonumber(usage.session and usage.session.total) or budget.startTokens
-		return math.max(0, current - budget.startTokens)
-			+ math.max(0, retryExposureTotal() - budget.retryStartExposure)
+		return usage.taskBudgetSpent(budget)
 	end
 
 	local function taskTokensAvailable(budget)
@@ -152,7 +150,7 @@ return function(env)
 					aborted = aborted,
 					onRetry = function(info)
 						if aborted() then return end
-						usage.observeRetry(record, record.model, accounting, info.reason or info.status)
+						usage.observeRetry(record, record.model, accounting, info.reason or info.status, session.taskBudget)
 						session.emit("request:retry", {
 							provider = record.label,
 							attempt = info.attempt,
@@ -249,7 +247,7 @@ return function(env)
 					prompt = accounting.estimate,
 					completion = usage.estimateText(result.content) + usage.estimateText(result.reasoning),
 					background = true,
-				}, record)
+				}, record, budget)
 			end
 			if session.toolEpoch ~= epoch or session.aborted() then return nil end
 			return result and result.content or nil
@@ -303,6 +301,8 @@ return function(env)
 			taskBudget = {
 				startTokens = tonumber(usage.session and usage.session.total) or 0,
 				retryStartExposure = retryExposureTotal(),
+				spent = 0,
+				retryExposure = 0,
 				limit = taskTokenLimit,
 				reserved = 0,
 			}
@@ -433,7 +433,7 @@ return function(env)
 			local spent = usage.record(result.usage, result.model or (record and record.model), {
 				prompt = accounting and (accounting.history + accounting.estimate) or usage.estimateMessages(request.messages),
 				completion = usage.estimateText(result.content) + usage.estimateText(result.reasoning),
-			}, record)
+			}, record, taskBudget)
 			session.emit("usage", { session = usage.session, turn = usage.turn })
 
 			if util.trim(result.reasoning) ~= "" then
