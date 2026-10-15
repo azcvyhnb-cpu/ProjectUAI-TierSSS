@@ -446,6 +446,31 @@ scenario("tool calls in one turn run together", function()
 	check("nothing errored", #harness.errors(), 0)
 end)
 
+scenario("cumulative task token budget stops before dispatching more tools", function()
+	local harness, handle = bootWith({
+		handler = function(entry)
+			if not tostring(entry.url):find("/chat/completions") then return { StatusCode = 404, Body = "{}" } end
+			return { StatusCode = 200, Body = chatBody({
+				toolCalls = { toolCall("budget_call", "game_info", {}) },
+			}) }
+		end,
+	})
+	handle.config.set("agent.maxTaskTokens", 100)
+	local session = handle.sessions.current()
+	session.send("inspect this game")
+	harness.settle(10)
+
+	local toolResults = 0
+	for _, event in ipairs(session.log) do
+		if event.kind == "tool:result" then toolResults = toolResults + 1 end
+	end
+	check("the tool batch was not dispatched after the budget was spent", toolResults, 0)
+	local last = session.ctx.messages[#session.ctx.messages]
+	check("an explicit not-run result preserves tool-call pairing", last and last.role, "tool")
+	contains("the transcript explains the budget stop", last and last.content, "reached its cumulative token budget")
+	contains("the turn reports that it stopped", session.log[#session.log] and session.log[#session.log].text, "token budget")
+end)
+
 -- 7. Streaming -------------------------------------------------------------
 
 scenario("a streamed body is assembled", function()
