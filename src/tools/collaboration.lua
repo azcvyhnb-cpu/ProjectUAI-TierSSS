@@ -132,8 +132,14 @@ return function(env)
 
 				local waited = 0
 			while pending > 0 and waited < REQUEST_TIMEOUT + 5 do
+				if ctx and ctx.aborted and ctx.aborted() then
+					return H.fail("Collaboration cancelled because the parent task was stopped.")
+				end
 				task.wait(0.25)
 				waited = waited + 0.25
+			end
+			if ctx and ctx.aborted and ctx.aborted() then
+				return H.fail("Collaboration cancelled because the parent task was stopped.")
 			end
 			-- A slow worker must not erase a useful report from the other model.
 			-- Mark unfinished workers explicitly, then let the coordinator synthesize
