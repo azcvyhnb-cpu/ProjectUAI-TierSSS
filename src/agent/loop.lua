@@ -246,6 +246,27 @@ return function(env)
 		-- showing, and a batch of them reset it repeatedly, mid-turn, to whatever the
 		-- last child happened to have spent.
 		if not session.headless then usage.startTurn() end
+		-- Bound cumulative usage for this task, including nested agent calls and
+		-- estimated prompt exposure from retries. Unlimited turns must not mean
+		-- unlimited token spend.
+		local taskStartTokens = tonumber(usage.session and usage.session.total) or 0
+		local retryStartExposure = 0
+		for _, stats in pairs(usage.providerSnapshot()) do
+			retryStartExposure = retryStartExposure + (tonumber(stats.retryPromptExposure) or 0)
+		end
+		local taskTokenLimit = tonumber(config.get("agent.maxTaskTokens", 250000)) or 250000
+		if taskTokenLimit ~= taskTokenLimit or taskTokenLimit == math.huge or taskTokenLimit < 1 then
+			taskTokenLimit = 250000
+		end
+		taskTokenLimit = math.floor(taskTokenLimit)
+		local function taskTokensSpent()
+			local current = tonumber(usage.session and usage.session.total) or taskStartTokens
+			local retries = 0
+			for _, stats in pairs(usage.providerSnapshot()) do
+				retries = retries + (tonumber(stats.retryPromptExposure) or 0)
+			end
+			return math.max(0, current - taskStartTokens) + math.max(0, retries - retryStartExposure)
+		end
 		ctx.pushUser(text, images)
 		session.emit("turn:start", { turns = unlimited and 0 or maxTurns, unlimited = unlimited })
 
@@ -367,6 +388,23 @@ return function(env)
 
 			if #result.toolCalls == 0 then
 				finalText = displayed
+				break
+			end
+
+			-- Stop before dispatching another tool batch when this task has exhausted
+			-- its budget. Return a result for every call so the saved transcript remains
+			-- a valid tool-call exchange if the user resumes the conversation later.
+			if taskTokensSpent() >= taskTokenLimit then
+				for _, call in ipairs(result.toolCalls) do
+					local name = (call["function"] or {}).name or "tool"
+					ctx.pushToolResult(call.id, name,
+						"Not run: this task reached its cumulative token budget of "
+							.. tostring(taskTokenLimit) .. ". Continue with a narrower task or raise agent.maxTaskTokens.")
+				end
+				finalText = "I stopped before running more tools because this task reached its cumulative token budget ("
+					.. tostring(taskTokenLimit) .. " tokens). The work completed so far is preserved; ask me to continue with a narrower scope."
+				session.emit("error", { message = "Task token budget reached (" .. tostring(taskTokenLimit) .. ").", fatal = false })
+				session.emit("status", { text = "Stopped at token budget" })
 				break
 			end
 
