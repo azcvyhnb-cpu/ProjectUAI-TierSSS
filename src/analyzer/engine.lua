@@ -28,7 +28,12 @@ return function(env)
         state.model.entities=entityMap
         state.graph=graph.update(state.graph,snapshot,entityMap)
         classifier.run(state.model,ledger,state.graph)
-        state.model.graph={nodes=state.graph.nodes,edges=state.graph.edges,revision=state.graph.revision}
+        state.model.graph={
+            nodes=state.graph.nodes,edges=state.graph.edges,revision=state.graph.revision,
+            nodeCount=state.graph.nodeCount,edgeCount=state.graph.edgeCount,
+            edgeLimit=state.graph.edgeLimit,truncated=state.graph.truncated,
+            omittedEdgesLowerBound=state.graph.omittedEdgesLowerBound,
+        }
         state.model.timeline={events=state.timeline.events,revision=state.timeline.revision}
         state.model.adaptive=adaptive.plan(state.model,snapshot,25)
         knowledge.observe(state.knowledge,state.model)
@@ -36,8 +41,9 @@ return function(env)
         state.model.analysisRevision=state.revision
         state.model.stats.entityCount=0
         for _ in pairs(entityMap) do state.model.stats.entityCount=state.model.stats.entityCount+1 end
-        state.model.stats.graphNodes=0; for _ in pairs(state.graph.nodes) do state.model.stats.graphNodes=state.model.stats.graphNodes+1 end
-        state.model.stats.graphEdges=#state.graph.edges
+        state.model.stats.graphNodes=state.graph.nodeCount
+        state.model.stats.graphEdges=state.graph.edgeCount
+        state.model.stats.graphTruncated=state.graph.truncated
         return state.model
     end
     function M.getEvidence(state,system) return evidence.top(state.evidence,system,10) end

@@ -446,6 +446,42 @@ scenario("tool calls in one turn run together", function()
 	check("nothing errored", #harness.errors(), 0)
 end)
 
+scenario("cumulative task token budget stops before dispatching more tools", function()
+	local requestedReplyCeiling
+	local harness, handle = bootWith({
+		handler = function(entry)
+			if not tostring(entry.url):find("/chat/completions") then return { StatusCode = 404, Body = "{}" } end
+			local sent = json.decode(entry.body or "{}")
+			requestedReplyCeiling = tonumber(sent.max_tokens or sent.max_completion_tokens)
+			local body = json.decode(chatBody({
+				toolCalls = { toolCall("budget_call", "game_info", {}) },
+			}))
+			body.usage = { prompt_tokens = 120000, completion_tokens = 40000, total_tokens = 160000 }
+			return { StatusCode = 200, Body = json.encode(body) }
+		end,
+	})
+	handle.config.set("agent.maxTaskTokens", 100000)
+	local session = handle.sessions.current()
+	session.send("inspect this game")
+	harness.settle(10)
+
+	local toolResults = 0
+	for _, event in ipairs(session.log) do
+		if event.kind == "tool:result" then toolResults = toolResults + 1 end
+	end
+	check("the tool batch was not dispatched after the budget was spent", toolResults, 0)
+	truthy("the reply ceiling is limited by remaining task budget", requestedReplyCeiling ~= nil
+		and requestedReplyCeiling > 0 and requestedReplyCeiling < 100000, tostring(requestedReplyCeiling))
+	local last = session.ctx.messages[#session.ctx.messages]
+	check("an explicit not-run result preserves tool-call pairing", last and last.role, "tool")
+	contains("the transcript explains the budget stop", last and last.content, "reached its cumulative token budget")
+	local turnEnd
+	for _, event in ipairs(session.log) do
+		if event.kind == "turn:end" then turnEnd = event; break end
+	end
+	contains("the turn reports that it stopped", turnEnd and turnEnd.text, "token budget")
+end)
+
 -- 7. Streaming -------------------------------------------------------------
 
 scenario("a streamed body is assembled", function()
@@ -1972,6 +2008,11 @@ scenario("the new agent switches are reachable from Settings", function()
 	contains("and it says what still stops one", shown, "Stop still apply")
 
 	local config = handle.config
+	contains("the resource profile selector is visible", shown, "Resource profile")
+	truthy("resource presets have their own selector", harness.byName("Slider_agent.resourceProfile") ~= nil)
+	contains("the cumulative token budget is visible", shown, "Task token budget")
+	truthy("the task budget has its own slider", harness.byName("Slider_agent.maxTaskTokens") ~= nil)
+	check("the task budget defaults to 250000 tokens", config.get("agent.maxTaskTokens"), 250000)
 	check("the switch ships on", config.get("agent.unlimitedTurns"), true)
 	config.set("agent.unlimitedTurns", false)
 	check("and persists when turned off", config.get("agent.unlimitedTurns"), false)
@@ -4698,6 +4739,8 @@ scenario("a dispatch is registered, watched and stopped", function()
 	contains("labelled with its task", record.label, "sweep the place")
 	check("marked as running", record.status, "running")
 	check("attributed to the conversation that asked", record.parentTitle, session.title)
+	truthy("the child shares the parent's cumulative token budget", record.session.taskBudget ~= nil
+		and record.session.taskBudget == session.taskBudget and record.session.taskBudgetShared == true)
 	truthy("with the tools it has called", #record.tools > 0, tostring(#record.tools))
 
 	-- The panel is the register, drawn.

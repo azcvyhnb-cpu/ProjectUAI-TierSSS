@@ -37,6 +37,12 @@ return function(env)
 			return nil, "research notebook is invalid JSON; original file was left untouched"
 		end
 		if data.placeId ~= id then return nil, "research notebook placeId mismatch" end
+		for index, record in ipairs(data.records) do
+			if type(record) ~= "table" or type(record.id) ~= "string" or type(record.key) ~= "string"
+				or type(record.title) ~= "string" or type(record.content) ~= "string" then
+				return nil, "research notebook contains an invalid record at index " .. tostring(index) .. "; original file was left untouched"
+			end
+		end
 		return data
 	end
 
@@ -64,8 +70,23 @@ return function(env)
 		return out
 	end
 
+	local function normalizeIdentityPart(value)
+		return util.trim(tostring(value or ""):lower():gsub("%s+", " "))
+	end
+
 	local function identity(title, body)
-		return table.concat(terms(title .. " " .. body), " ")
+		-- Use ordered, normalized text rather than a bag of unique tokens.
+		-- Token-set keys can merge distinct findings whose words are merely
+		-- reordered, silently replacing evidence with a different claim.
+		return normalizeIdentityPart(title) .. string.char(0) .. normalizeIdentityPart(body)
+	end
+
+	local function legacyIdentity(title, body)
+		-- Allow existing version-1 notebooks to migrate their old token-set keys
+		-- the next time the exact title/body pair is saved.
+		local normalized = terms(title .. " " .. body)
+		if #normalized == 0 then return (title .. "\\0" .. body):lower() end
+		return table.concat(normalized, " ")
 	end
 
 	function M.save(args)
@@ -84,26 +105,49 @@ return function(env)
 				if type(tag) == "string" and util.trim(tag) ~= "" then tags[#tags + 1] = util.ellipsis(util.trim(tag), 40) end
 			end
 		end
+		local confidenceProvided = args.confidence ~= nil
 		local confidence = tostring(args.confidence or "observed"):lower()
 		if confidence ~= "verified" and confidence ~= "observed" and confidence ~= "hypothesis" then
 			return nil, "confidence must be verified, observed, or hypothesis"
 		end
+		local observedAt
+		if args.observedAt ~= nil then
+			observedAt = tonumber(args.observedAt)
+			if not observedAt or observedAt ~= observedAt or observedAt == math.huge or observedAt < 0 then
+				return nil, "observedAt must be a nonnegative timestamp in milliseconds"
+			end
+		end
 		local data, loadErr = load(id)
 		if not data then return nil, loadErr end
 		local key = identity(title, body)
+		local oldKey = legacyIdentity(title, body)
+		local providedSource = type(args.source) == "string" and util.trim(args.source) ~= ""
+			and util.ellipsis(util.trim(args.source), 240) or nil
 		for _, record in ipairs(data.records) do
-			if record.key == key then
+			if record.key == key or record.key == oldKey then
+				record.key = key
 				record.title, record.content, record.tags = title, body, tags
+				if providedSource then record.source = providedSource end
+				if observedAt then record.observedAt = observedAt end
+				-- Omitting confidence during a deduplicating refresh must not silently
+				-- demote an established note. Explicit confidence changes are respected.
+				if not confidenceProvided then confidence = record.confidence or "observed" end
+				-- "Verified" is an evidence claim, not a model preference. Require a
+				-- source pointer; otherwise retain the note as observed, not verified.
+				if confidence == "verified" and not (record.source and util.trim(record.source) ~= "") then
+					confidence = "observed"
+				end
 				record.confidence, record.updatedAt = confidence, clock.ms()
-				record.source = type(args.source) == "string" and util.ellipsis(args.source, 240) or record.source
 				local ok, saveErr = persist(id, data)
 				if not ok then return nil, saveErr end
 				return { id = record.id, updated = true, placeId = id, count = #data.records }
 			end
 		end
+		if confidence == "verified" and not providedSource then confidence = "observed" end
 		local record = {
 			id = util.uid("note"), key = key, title = title, content = body, tags = tags,
-			confidence = confidence, source = type(args.source) == "string" and util.ellipsis(args.source, 240) or nil,
+			confidence = confidence, source = providedSource,
+			observedAt = observedAt or clock.ms(),
 			createdAt = clock.ms(), updatedAt = clock.ms(),
 		}
 		table.insert(data.records, record)
@@ -119,33 +163,71 @@ return function(env)
 		if query == "" then return nil, "query cannot be empty" end
 		local id, why = validPlace(args.placeId == nil and place.id or args.placeId)
 		if not id then return nil, why end
+		local maxAgeMs
+		if args.maxAgeMs ~= nil then
+			maxAgeMs = tonumber(args.maxAgeMs)
+			if not maxAgeMs or maxAgeMs ~= maxAgeMs or maxAgeMs == math.huge or maxAgeMs <= 0 then
+				return nil, "maxAgeMs must be a positive number of milliseconds"
+			end
+		end
 		local data, loadErr = load(id)
 		if not data then return nil, loadErr end
+		local now = clock.ms()
 		local queryTerms, ranked = terms(query), {}
-		if #queryTerms == 0 then return { placeId = id, items = {}, total = #data.records } end
+		local literalQuery = query:lower()
 		for _, record in ipairs(data.records) do
-			local haystack = (record.title or "") .. " " .. (record.content or "") .. " " .. table.concat(record.tags or {}, " ")
-			local lower, score, matches = haystack:lower(), 0, 0
+			local titleLower = (record.title or ""):lower()
+			local contentLower = (record.content or ""):lower()
+			local tags = type(record.tags) == "table" and record.tags or {}
+			local lower = (record.title or "") .. " " .. (record.content or "") .. " " .. table.concat(tags, " ")
+			lower = lower:lower()
+			local score, matches, tagMatches = 0, 0, 0
+			local phraseMatch = lower:find(literalQuery, 1, true) ~= nil
 			for _, term in ipairs(queryTerms) do
-				if lower:find(term, 1, true) then score = score + (lower:find(term, 1, true) and 1 or 0); matches = matches + 1 end
-				if (record.title or ""):lower():find(term, 1, true) then score = score + 2 end
+				if lower:find(term, 1, true) then score = score + 1; matches = matches + 1 end
+				if titleLower:find(term, 1, true) then score = score + 2 end
+				for _, tag in ipairs(tags) do
+					if type(tag) == "string" and tag:lower():find(term, 1, true) then
+						score = score + 2
+						tagMatches = tagMatches + 1
+						break
+					end
+				end
 			end
-			if matches > 0 then
-				score = score + matches / #queryTerms
+			-- Phrase matching provides a useful UTF-8-safe fallback for Thai and
+			-- other scripts that are not split by Lua's ASCII-oriented token pattern.
+			if phraseMatch then score = score + 3 end
+			if titleLower:find(literalQuery, 1, true) then score = score + 2 end
+			if matches > 0 or phraseMatch then
+				if #queryTerms > 0 then score = score + matches / #queryTerms end
 				if record.confidence == "verified" then score = score + 0.15 end
-				ranked[#ranked + 1] = { record = record, score = score, matches = matches }
+				ranked[#ranked + 1] = { record = record, score = score, matches = matches, tagMatches = tagMatches }
 			end
 		end
 		table.sort(ranked, function(a, b)
-			if a.score == b.score then return (a.record.updatedAt or 0) > (b.record.updatedAt or 0) end
+			if a.score == b.score then
+				if (a.record.updatedAt or 0) == (b.record.updatedAt or 0) then
+					return tostring(a.record.id or "") < tostring(b.record.id or "")
+				end
+				return (a.record.updatedAt or 0) > (b.record.updatedAt or 0)
+			end
 			return a.score > b.score
 		end)
 		local limit = math.max(1, math.min(math.floor(tonumber(args.limit) or 5), 10))
 		local out = {}
 		for i = 1, math.min(limit, #ranked) do
 			local r = ranked[i].record
+			local observed = tonumber(r.observedAt or r.createdAt)
+			local ageMs = observed and math.max(0, now - observed) or nil
+			local freshness = "unevaluated"
+			if maxAgeMs then
+				if ageMs == nil then freshness = "unknown"
+				elseif ageMs > maxAgeMs then freshness = "stale"
+				else freshness = "fresh" end
+			end
 			out[#out + 1] = { id = r.id, title = r.title, content = r.content, tags = r.tags,
-				confidence = r.confidence, source = r.source, updatedAt = r.updatedAt, score = ranked[i].score }
+				confidence = r.confidence, source = r.source, updatedAt = r.updatedAt,
+				observedAt = observed, ageMs = ageMs, freshness = freshness, score = ranked[i].score }
 		end
 		return { placeId = id, query = query, items = out, totalMatches = #ranked, total = #data.records }
 	end
@@ -175,7 +257,8 @@ return function(env)
 		for _, r in ipairs(data.records) do
 			if r.id == wanted then
 				return { id = r.id, title = r.title, content = r.content, tags = r.tags, confidence = r.confidence,
-					source = r.source, createdAt = r.createdAt, updatedAt = r.updatedAt, placeId = id }
+					source = r.source, observedAt = r.observedAt or r.createdAt,
+					createdAt = r.createdAt, updatedAt = r.updatedAt, placeId = id }
 			end
 		end
 		return nil, "no research note with that id in this place"

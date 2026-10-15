@@ -23,6 +23,41 @@ local function fixture()
 	return env, config, context
 end
 
+scenario("resource profiles apply coherent limits and manual tuning becomes Custom", function()
+	local _, config = fixture()
+	check("new installs start without overriding existing settings", config.get("agent.resourceProfile") == "custom")
+	config.set("agent.resourceProfile", "mobile-safe")
+	check("Mobile Safe bounds parallel tools", config.get("agent.toolConcurrency") == 2)
+	check("Mobile Safe bounds the subagent tree", config.get("agent.subagentConcurrency") == 2 and config.get("agent.subagentDepth") == 2)
+	check("Mobile Safe disables unlimited loops and requests", config.get("agent.unlimitedTurns") == false and config.get("agent.requestUnlimited") == false)
+	check("Mobile Safe uses a smaller task and context budget", config.get("agent.maxTaskTokens") == 100000 and config.get("agent.contextTokens") == 16000)
+	check("Mobile Safe bounds retained results", config.get("agent.resultCap") == 12000 and config.get("agent.maxTokens") == 8192)
+	config.set("agent.toolConcurrency", 3)
+	check("manual tuning marks the profile Custom", config.get("agent.resourceProfile") == "custom" and config.get("agent.toolConcurrency") == 3)
+	config.set("agent.resourceProfile", "performance")
+	check("Performance applies its explicit higher ceilings", config.get("agent.subagentConcurrency") == 8 and config.get("agent.maxTaskTokens") == 600000)
+	local profile, err = config.set("agent.resourceProfile", "unknown-profile")
+	check("unknown profiles are rejected without changing settings", profile == nil and err and config.get("agent.resourceProfile") == "performance")
+end)
+
+scenario("task usage is attributed to its own budget instead of other conversations", function()
+	local env = fixture()
+	local usage = env.require("agent/usage")
+	usage.reset()
+	local first = { spent = 0, retryExposure = 0, limit = 1000, reserved = 0 }
+	local second = { spent = 0, retryExposure = 0, limit = 1000, reserved = 0 }
+	local recordA = { id = "task-a", model = "fixture-a" }
+	local recordB = { id = "task-b", model = "fixture-b" }
+	usage.record({ prompt_tokens = 100, completion_tokens = 20 }, "fixture-a",
+		{ prompt = 100, completion = 20 }, recordA, first)
+	usage.record({ prompt_tokens = 50, completion_tokens = 5 }, "fixture-b",
+		{ prompt = 50, completion = 5 }, recordB, second)
+	check("each model response is charged to its own task", first.spent == 120 and second.spent == 55)
+	usage.observeRetry(recordA, "fixture-a", { history = 10, estimate = 5 }, "request timeout", first)
+	check("retry exposure is isolated to the originating task", first.retryExposure == 15 and second.retryExposure == 0)
+	check("budget totals exclude unrelated conversation usage", usage.taskBudgetSpent(first) == 135 and usage.taskBudgetSpent(second) == 55)
+end)
+
 scenario("trimming estimates each removed turn once instead of rescanning history", function()
 	local env, config, context = fixture()
 	local ctx = context.new()
@@ -240,6 +275,35 @@ scenario("failed or disabled summaries preserve previous facts", function()
 		check("the missing newer summary is disclosed", has(result, "8") and has(result, "dropped"))
 		check("fallback compaction is counted", ctx.compactions == 1)
 	end
+end)
+
+scenario("malformed persisted context fields do not abort restoration", function()
+	local _, _, context = fixture()
+	local ctx = context.new()
+	ctx.pushUser("previous conversation")
+	check("non-table restore is rejected", ctx.restore("not a context") == false)
+	check("malformed message collection is ignored", ctx.restore({ summary = {}, messages = "truncated" }) == true)
+	check("malformed summary is ignored", ctx.summary == nil)
+	check("malformed messages leave an empty transcript", #ctx.messages == 0)
+	check("valid entries survive alongside malformed entries", ctx.restore({
+		summary = "retained facts",
+		messages = { false, { role = false, content = "bad role" }, { role = "user", content = "valid" } },
+	}) == true and #ctx.messages == 1 and ctx.messages[1].content == "valid")
+end)
+
+scenario("compaction transcript is bounded before calling the summariser", function()
+	local _, _, context = fixture()
+	local ctx, seen = context.new(), nil
+	for index = 1, 40 do
+		ctx.pushUser(("question " .. index .. " "):rep(40))
+		ctx.pushAssistant({ content = ("answer " .. index .. " "):rep(40) })
+	end
+	ctx.compact(function(transcript)
+		seen = transcript
+		return "bounded summary"
+	end, { force = true })
+	check("the summariser received a bounded transcript", type(seen) == "string" and #seen <= 12000)
+	check("the summary input discloses omitted history", has(seen, "compaction transcript capped"))
 end)
 
 print(string.format("context compaction: %d checks passed, %d scenarios failed", passed, failed))

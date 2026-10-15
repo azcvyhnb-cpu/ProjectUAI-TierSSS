@@ -32,6 +32,22 @@ return function(env)
 		return text
 	end
 
+	local function retryExposureTotal()
+		local total = 0
+		for _, stats in pairs(usage.providerSnapshot()) do
+			total = total + (tonumber(stats.retryPromptExposure) or 0)
+		end
+		return total
+	end
+
+	local function sharedTaskTokensSpent(budget)
+		return usage.taskBudgetSpent(budget)
+	end
+
+	local function taskTokensAvailable(budget)
+		return budget.limit - sharedTaskTokensSpent(budget) - math.max(0, tonumber(budget.reserved) or 0)
+	end
+
 	-- Canonicalise parsed argument objects before repeat detection. JSON key order and
 	-- insignificant whitespace must not let an identical tool batch evade the breaker.
 	local function canonicalValue(value, depth)
@@ -134,7 +150,7 @@ return function(env)
 					aborted = aborted,
 					onRetry = function(info)
 						if aborted() then return end
-						usage.observeRetry(record, record.model, accounting, info.reason or info.status)
+						usage.observeRetry(record, record.model, accounting, info.reason or info.status, session.taskBudget)
 						session.emit("request:retry", {
 							provider = record.label,
 							attempt = info.attempt,
@@ -199,16 +215,40 @@ return function(env)
 			local epoch = session.toolEpoch
 			local record = providers.active()
 			if not record then return nil end
+			local messages = {
+				{ role = "system", content = prompt.compaction() },
+				{ role = "user", content = transcript },
+			}
+			local accounting = {
+				history = 0,
+				estimate = usage.estimateMessages(messages),
+				system = usage.estimateMessages(messages),
+				schema = 0,
+			}
+			local budget = session.taskBudget
+			local reserved = accounting.estimate + 512
+			if budget then
+				if taskTokensAvailable(budget) <= reserved then return nil end
+				budget.reserved = math.max(0, tonumber(budget.reserved) or 0) + reserved
+			end
+			-- Compaction is a real model request too. Count it in session totals so
+			-- the task budget and usage panel do not silently omit summary traffic.
+			usage.observeRequest(record, record.model, accounting)
 			local result = chat.complete(record, { session = session,
-				messages = {
-					{ role = "system", content = prompt.compaction() },
-					{ role = "user", content = transcript },
-				},
+				messages = messages,
 				temperature = 0,
 				maxTokens = 512,
 				attempts = 1,
 				aborted = session.aborted,
 			})
+			if budget then budget.reserved = math.max(0, (tonumber(budget.reserved) or 0) - reserved) end
+			if result then
+				usage.record(result.usage, result.model or record.model, {
+					prompt = accounting.estimate,
+					completion = usage.estimateText(result.content) + usage.estimateText(result.reasoning),
+					background = true,
+				}, record, budget)
+			end
 			if session.toolEpoch ~= epoch or session.aborted() then return nil end
 			return result and result.content or nil
 		end
@@ -246,6 +286,36 @@ return function(env)
 		-- showing, and a batch of them reset it repeatedly, mid-turn, to whatever the
 		-- last child happened to have spent.
 		if not session.headless then usage.startTurn() end
+		-- Bound cumulative usage for this task, including nested agent calls and
+		-- estimated prompt exposure from retries. Unlimited turns must not mean
+		-- unlimited token spend.
+		local taskTokenLimit = tonumber(config.get("agent.maxTaskTokens", 250000)) or 250000
+		if taskTokenLimit ~= taskTokenLimit or taskTokenLimit == math.huge or taskTokenLimit < 1 then
+			taskTokenLimit = 250000
+		end
+		taskTokenLimit = math.floor(taskTokenLimit)
+		-- A top-level send starts a fresh budget. Every delegated child inherits the
+		-- same ledger, so parallel/nested workers cannot each spend a separate full cap.
+		local taskBudget = session.taskBudget
+		if not session.taskBudgetShared or type(taskBudget) ~= "table" then
+			taskBudget = {
+				startTokens = tonumber(usage.session and usage.session.total) or 0,
+				retryStartExposure = retryExposureTotal(),
+				spent = 0,
+				retryExposure = 0,
+				limit = taskTokenLimit,
+				reserved = 0,
+			}
+			session.taskBudget = taskBudget
+			session.taskBudgetShared = false
+		else
+			taskBudget.limit = math.min(tonumber(taskBudget.limit) or taskTokenLimit, taskTokenLimit)
+			taskBudget.reserved = math.max(0, tonumber(taskBudget.reserved) or 0)
+		end
+		taskTokenLimit = taskBudget.limit
+		local function taskTokensSpent()
+			return sharedTaskTokensSpent(taskBudget)
+		end
 		ctx.pushUser(text, images)
 		session.emit("turn:start", { turns = unlimited and 0 or maxTurns, unlimited = unlimited })
 
@@ -319,6 +389,27 @@ return function(env)
 			if summary then session.emit("compact", { summary = summary, before = before, after = ctx.tokens() }) end
 			request.messages = ctx.wire(systemText)
 
+			-- Reserve both the prompt and the reply ceiling before dispatch. This
+			-- keeps concurrent subagents from all seeing the same balance and then each
+			-- producing a large completion that multiplies the task budget.
+			local projectedPromptTokens = usage.estimateMessages(request.messages)
+				+ usage.estimateText(util.encode(request.tools or {}))
+			local available = taskTokensAvailable(taskBudget)
+			local configuredReplyLimit = tonumber(config.get("agent.maxTokens", 128000)) or 128000
+			if configuredReplyLimit ~= configuredReplyLimit or configuredReplyLimit == math.huge or configuredReplyLimit < 1 then
+				configuredReplyLimit = 128000
+			end
+			local outputCeiling = math.floor(math.min(configuredReplyLimit, available - projectedPromptTokens))
+			if available <= projectedPromptTokens or outputCeiling < 1 then
+				finalText = "I stopped before sending another model request because the estimated prompt would exhaust this task's cumulative token budget ("
+					.. tostring(taskTokenLimit) .. " tokens). Narrow the task or raise agent.maxTaskTokens."
+				session.emit("error", { message = "Task token budget would be exceeded by the next prompt.", fatal = false })
+				session.emit("status", { text = "Stopped at token budget" })
+				break
+			end
+			request.maxTokens = outputCeiling
+			local reservation = projectedPromptTokens + outputCeiling
+			taskBudget.reserved = math.max(0, tonumber(taskBudget.reserved) or 0) + reservation
 			local result, err, usedRecord, accounting = complete(session, request, function(refusedRecord)
 				if session.aborted() then return false end
 				local prior = ctx.tokens()
@@ -328,6 +419,7 @@ return function(env)
 				request.messages = ctx.wire(systemText)
 				return true
 			end)
+			taskBudget.reserved = math.max(0, (tonumber(taskBudget.reserved) or 0) - reservation)
 			record = usedRecord or record
 
 			if not result then
@@ -341,7 +433,7 @@ return function(env)
 			local spent = usage.record(result.usage, result.model or (record and record.model), {
 				prompt = accounting and (accounting.history + accounting.estimate) or usage.estimateMessages(request.messages),
 				completion = usage.estimateText(result.content) + usage.estimateText(result.reasoning),
-			}, record)
+			}, record, taskBudget)
 			session.emit("usage", { session = usage.session, turn = usage.turn })
 
 			if util.trim(result.reasoning) ~= "" then
@@ -367,6 +459,23 @@ return function(env)
 
 			if #result.toolCalls == 0 then
 				finalText = displayed
+				break
+			end
+
+			-- Stop before dispatching another tool batch when this task has exhausted
+			-- its budget. Return a result for every call so the saved transcript remains
+			-- a valid tool-call exchange if the user resumes the conversation later.
+			if taskTokensSpent() >= taskTokenLimit then
+				for _, call in ipairs(result.toolCalls) do
+					local name = (call["function"] or {}).name or "tool"
+					ctx.pushToolResult(call.id, name,
+						"Not run: this task reached its cumulative token budget of "
+							.. tostring(taskTokenLimit) .. ". Continue with a narrower task or raise agent.maxTaskTokens.")
+				end
+				finalText = "I stopped before running more tools because this task reached its cumulative token budget ("
+					.. tostring(taskTokenLimit) .. " tokens). The work completed so far is preserved; ask me to continue with a narrower scope."
+				session.emit("error", { message = "Task token budget reached (" .. tostring(taskTokenLimit) .. ").", fatal = false })
+				session.emit("status", { text = "Stopped at token budget" })
 				break
 			end
 

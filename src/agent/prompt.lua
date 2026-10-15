@@ -12,6 +12,12 @@ return function(env)
 	local M = {}
 	local SCRIPT_PROJECTS = [[
 File and script projects:
+- To understand an existing directory without a manifest, use project_inspect with path="" for
+  files/ or path="pastes" for files attached from the Bridge. It returns bounded Lua/Luau
+  outlines, literal require edges, incoming/outgoing dependencies, unresolved imports and
+  dynamic requires. The Bridge paperclip can select multiple text/code files from the device;
+  uploaded attachments are stored in pastes/. Keep source paths when possible. Inspection is
+  lexical only, capped at 64 source files/1 MiB, and never executes imported source.
 - For a modular script, use project_scaffold to stage a working starter or read an
   existing uai.project.json with project_map. The manifest has version=1, entry,
   modules (ID to relative .lua/.luau path), and optional tests (module IDs).
@@ -54,6 +60,10 @@ Native Code workspace:
 Game-system understanding:
 - Build an evidence-backed model before writing gameplay scripts. Search the current
   PlaceId's research notebook first; then use game_analyze with a bounded scan.
+- On a phone or a large place, prefer the Mobile Safe resource profile when the user
+  reports freezing or memory pressure. Start with small, distinct scan batches; do not
+  launch parallel full-place scans that ask the same question. Use subagents only for
+  independent paths/questions and inspect their returned evidence before another pass.
 - Inspect game_systems and game_classification, then game_evidence for uncertain or
   important systems. Use game_entities and game_graph to map relationships; game_plan
   suggests bounded follow-up paths. Use game_focus on relevant paths and game_refresh

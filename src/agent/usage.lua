@@ -129,12 +129,15 @@ return function(env)
 		return stats
 	end
 
-	function M.observeRetry(record, model, accounting, reason)
+	function M.observeRetry(record, model, accounting, reason, taskBudget)
 		local stats = providerStats(record, model)
 		local prompt = math.max(0, tonumber(accounting and accounting.history) or 0)
 			+ math.max(0, tonumber(accounting and accounting.estimate) or 0)
 		stats.retries = stats.retries + 1
 		stats.retryPromptExposure = stats.retryPromptExposure + prompt
+		if type(taskBudget) == "table" then
+			taskBudget.retryExposure = math.max(0, tonumber(taskBudget.retryExposure) or 0) + prompt
+		end
 		if tostring(reason or ""):lower():find("timeout", 1, true)
 			or tostring(reason or ""):lower():find("deadline", 1, true) then
 			stats.timeouts = stats.timeouts + 1
@@ -152,13 +155,58 @@ return function(env)
 		return out
 	end
 
+	-- Shared task budget primitives are used by the agent loop and tools that
+	-- make their own model requests (for example multi-model collaboration). The
+	-- reserved amount covers concurrent in-flight prompts/reply ceilings until
+	-- their actual usage is recorded.
+	function M.retryExposureTotal()
+		local total = 0
+		for _, stats in pairs(M.providers) do
+			total = total + (tonumber(stats.retryPromptExposure) or 0)
+		end
+		return total
+	end
+
+	function M.taskBudgetSpent(budget)
+		if type(budget) ~= "table" then return 0 end
+		-- New task ledgers are charged directly, so simultaneous unrelated
+		-- conversations do not consume one another's budgets. Keep the global-delta
+		-- fallback for older callers that still provide only start counters.
+		if budget.spent ~= nil or budget.retryExposure ~= nil then
+			return math.max(0, tonumber(budget.spent) or 0)
+				+ math.max(0, tonumber(budget.retryExposure) or 0)
+		end
+		local current = tonumber(M.session and M.session.total) or tonumber(budget.startTokens) or 0
+		return math.max(0, current - (tonumber(budget.startTokens) or 0))
+			+ math.max(0, M.retryExposureTotal() - (tonumber(budget.retryStartExposure) or 0))
+	end
+
+	function M.taskBudgetAvailable(budget)
+		if type(budget) ~= "table" then return math.huge end
+		return (tonumber(budget.limit) or 0) - M.taskBudgetSpent(budget)
+			- math.max(0, tonumber(budget.reserved) or 0)
+	end
+
+	function M.reserveTaskBudget(budget, amount)
+		amount = math.max(0, tonumber(amount) or 0)
+		if type(budget) ~= "table" then return true end
+		if M.taskBudgetAvailable(budget) <= amount then return false end
+		budget.reserved = math.max(0, tonumber(budget.reserved) or 0) + amount
+		return true
+	end
+
+	function M.releaseTaskBudget(budget, amount)
+		if type(budget) ~= "table" then return end
+		budget.reserved = math.max(0, (tonumber(budget.reserved) or 0) - math.max(0, tonumber(amount) or 0))
+	end
+
 	function M.startTurn()
 		M.turn = { prompt = 0, completion = 0, total = 0, cost = 0 }
 	end
 
 	-- `usage` is the provider block when it exists. `fallback` supplies estimates
 	-- so a provider that reports nothing still moves the counters.
-	function M.record(usage, model, fallback, record)
+	function M.record(usage, model, fallback, record, taskBudget)
 		local prompt, completion, estimated
 		if type(usage) == "table" and (usage.prompt_tokens or usage.completion_tokens) then
 			prompt = tonumber(usage.prompt_tokens) or 0
@@ -186,6 +234,9 @@ return function(env)
 		M.session.prompt = M.session.prompt + prompt
 		M.session.completion = M.session.completion + completion
 		M.session.total = M.session.prompt + M.session.completion
+		if type(taskBudget) == "table" then
+			taskBudget.spent = math.max(0, tonumber(taskBudget.spent) or 0) + prompt + completion
+		end
 		M.session.cost = M.session.cost + cost
 		M.session.requests = M.session.requests + 1
 		if estimated then M.session.estimated = true end

@@ -307,7 +307,14 @@ return function(env)
 				transcript[#transcript + 1] = label .. ": " .. util.ellipsis(text, 700)
 			end
 
-			local ok, note = pcall(summarise, table.concat(transcript, "\n"))
+			local compactTranscript = table.concat(transcript, "\n")
+			if #compactTranscript > 12000 then
+				-- util.truncate reserves space for a short marker; keep its input
+				-- ceiling below the public cap so the explanatory note fits too.
+				compactTranscript = util.truncate(compactTranscript, 11800,
+					"compaction transcript capped at 12000 characters; older details omitted")
+			end
+			local ok, note = pcall(summarise, compactTranscript)
 			if ok and type(note) == "string" and util.trim(note) ~= "" then
 				ctx.summary = util.trim(note)
 			elseif previousSummary ~= "" then
@@ -458,9 +465,15 @@ return function(env)
 		function ctx.restore(data)
 			if type(data) ~= "table" then return false end
 			ctx.clear()
-			ctx.summary = data.summary
-			for _, message in ipairs(data.messages or {}) do
-				if type(message) == "table" and message.role then ctx.push(message) end
+			-- Persisted conversation files may be truncated or edited by an external
+			-- tool. Treat malformed optional fields as absent rather than letting
+			-- ipairs/string operations abort session restoration.
+			ctx.summary = type(data.summary) == "string" and data.summary or nil
+			local messages = type(data.messages) == "table" and data.messages or {}
+			for _, message in ipairs(messages) do
+				if type(message) == "table" and type(message.role) == "string" then
+					ctx.push(message)
+				end
 			end
 			return true
 		end

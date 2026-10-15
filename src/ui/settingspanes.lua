@@ -54,6 +54,7 @@ return function(env)
 		4000, 8000, 12000, 16000, 24000, 32000, 48000, 64000, 96000,
 		128000, 160000, 200000, 256000, 320000, 400000, 512000, 750000, 1000000,
 	}
+	local TASK_BUDGET_STOPS = { 25000, 50000, 75000, 100000, 150000, 250000, 400000, 600000, 800000, 1000000 }
 	local REPLY_STOPS = { 256, 512, 1024, 2048, 4096, 8192, 16000, 24000, 32000, 64000, 96000, 128000 }
 	local RESULT_STOPS = { 1000, 2000, 4000, 6000, 8000, 12000, 16000, 24000, 32000, 48000, 64000, 96000, 128000 }
 
@@ -1136,6 +1137,12 @@ return function(env)
 		local build = builder(container)
 
 		local agent = build.section("Agent", "How hard it works before it stops and answers.")
+		R.choice(agent, "Resource profile",
+			"Mobile Safe reduces parallel work, context size, output size and deadlines to limit memory pressure. Balanced is a moderate preset; Performance permits larger budgets and more concurrency. Selecting a preset replaces its listed Agent settings; changing one of those settings afterward switches the label to Custom.",
+			"agent.resourceProfile",
+			{ "custom", "mobile-safe", "balanced", "performance" },
+			{ "Custom", "Mobile Safe", "Balanced", "Performance" },
+			{ "Lower memory", "Higher throughput" })
 		R.number(agent, "Step limit", "Tool rounds allowed in one turn, unless the switch below removes it.",
 			"agent.maxTurns", 4, 60, 1)
 		R.toggle(agent, {
@@ -1184,6 +1191,9 @@ return function(env)
 		R.number(agent, "Context budget",
 			"Hard ceiling on tokens kept before older turns are summarised. When the model's context window is known, compaction begins at the Compact-at fraction of it, so this mainly caps models with very large or unknown windows.",
 			"agent.contextTokens", BUDGET_STOPS)
+		R.number(agent, "Task token budget",
+			"Maximum cumulative tokens spent on one task across model calls, compaction and estimated retry exposure. Stops before further tools when exhausted; actual provider usage can overshoot by one request if it exceeds the estimate.",
+			"agent.maxTaskTokens", TASK_BUDGET_STOPS)
 		R.number(agent, "Compact at",
 			"Share of the model's context window at which older turns are summarised, when the window is known. Lower compacts sooner and cheaper; higher keeps more history in view. The Context budget above is still a hard ceiling.",
 			"agent.contextFraction", 0.5, 0.95, 0.05)

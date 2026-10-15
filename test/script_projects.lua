@@ -18,6 +18,28 @@ local function fixture()
 	return f
 end
 
+suite.case("lexical source cache reuses exact unchanged files and stays bounded", function()
+	local f = fixture()
+	local scanner = f.env.require("runtime/project_source")
+	scanner.clearCache()
+	local source = 'local settings = require("settings")\nfunction M.run() return true end\n'
+	local first = assert(scanner.scan(source, f.ctx))
+	first.symbols[1].name = "mutated by caller"
+	local second = assert(scanner.scan(source, f.ctx))
+	local stats = scanner.cacheStats()
+	check("repeated source is a cache hit", stats.hits == 1 and stats.misses == 1)
+	check("cached outlines are copied before returning", second.symbols[1].name ~= "mutated by caller")
+	local changed = assert(scanner.scan(source .. "-- changed\n", f.ctx))
+	check("changed bytes produce a new outline", changed.hash ~= second.hash and scanner.cacheStats().misses == 2)
+	local cancelled = { aborted = function() return true end }
+	check("cached results still honor cancellation", scanner.scan(source, cancelled) == nil)
+	for index = 1, 24 do assert(scanner.scan("local value" .. index .. " = " .. index .. "\\n", f.ctx)) end
+	stats = scanner.cacheStats()
+	check("cache entry count stays capped", stats.entries <= 16)
+	check("retained source bytes stay capped", stats.sourceBytes <= 512 * 1024)
+	f.close()
+end)
+
 suite.case("scaffold, map, review, apply, compile, build and test a complete project", function()
 	local f = fixture()
 	local staged = f.call("project_scaffold", { directory = "Example" })
@@ -153,6 +175,65 @@ suite.case("lexical maps skip strings/comments and retain source locations", fun
 	f.close()
 end)
 
+suite.case("project inspection maps a source tree and its cross-file dependencies", function()
+	local f = fixture()
+	f.write("Inspect/main.lua", 'local settings = require("settings")\nlocal missing = require("not_here")\nlocal dyn = require(moduleName)\nfunction Main.start() return settings.value end\n')
+	f.write("Inspect/src/settings.lua", 'return { value = 42 }\n')
+	f.write("Inspect/readme.txt", "not source")
+	local result = f.call("project_inspect", { path = "Inspect" })
+	check("directory inspection succeeds without manifest", result.ok and result.data.scannedFiles == 2)
+	check("cache counters are included in inspection metadata", result.data.cache and result.data.cache.entries >= 2)
+	local cacheHits = result.data.cache and result.data.cache.hits or 0
+	local repeated = f.call("project_inspect", { path = "Inspect" })
+	check("repeated inspection reuses unchanged source outlines", repeated.ok and repeated.data.cache
+		and repeated.data.cache.hits >= cacheHits + 2)
+	check("literal module path resolves across src prefix", #result.data.edges == 1 and result.data.edges[1].to == "src/settings")
+	check("incoming and outgoing relationships are returned", result.data.files[1].dependencies and #result.data.files[1].dependencies == 1)
+	check("unresolved and dynamic imports are distinct", #result.data.unresolved == 1 and #result.data.dynamicRequires == 1)
+	check("scan reports lexical-only coverage", result.data.coverage:find("no type or runtime analysis", 1, true) ~= nil)
+	check("non-source files are skipped", result.data.skippedNonSourceFiles == 1)
+	f.close()
+end)
+
+suite.case("Bridge-uploaded files in pastes resolve original filename aliases", function()
+	local f = fixture()
+	local fs = f.env.require("runtime/fsx")
+	assert(fs.write("20261013-121212-input_1_abcd-main.lua", 'return require("settings")\n', { scope = "pastes" }))
+	assert(fs.write("20261013-121213-input_2_abcd-settings.lua", 'return { enabled = true }\n', { scope = "pastes" }))
+	local result = f.call("project_inspect", { path = "pastes" })
+	check("paste directory is inspectable", result.ok and result.data.scannedFiles == 2)
+	check("original attached filenames resolve literal require", #result.data.edges == 1 and result.data.edges[1].to == "20261013-121213-input_2_abcd-settings")
+	check("paste inventory path is reported", result.data.files[1].path:find("pastes/", 1, true) == 1)
+	f.close()
+end)
+
+suite.case("ambiguous basename imports are reported instead of guessed", function()
+	local f = fixture()
+	f.write("Ambiguous/a/settings.lua", "return { source = \"a\" }\n")
+	f.write("Ambiguous/b/settings.lua", "return { source = \"b\" }\n")
+	f.write("Ambiguous/main.lua", 'local ambiguous = require("settings")\nlocal explicit = require("a/settings")\nreturn { ambiguous, explicit }\n')
+	local result = f.call("project_inspect", { path = "Ambiguous" })
+	check("explicit relative module ID resolves", #result.data.edges == 1 and result.data.edges[1].to == "a/settings")
+	check("ambiguous basename is not silently bound", #result.data.ambiguousImports == 1 and result.data.ambiguousImports[1].module == "settings")
+	check("ambiguous alias is not mislabeled as missing", #result.data.unresolved == 0)
+	f.close()
+end)
+
+suite.case("exact module IDs take precedence over colliding basename aliases", function()
+	local f = fixture()
+	f.write("Exact/settings.lua", "return { source = \"root\" }\n")
+	f.write("Exact/a/settings.lua", "return { source = \"nested\" }\n")
+	f.write("Exact/main.lua", 'local root = require("settings")\nlocal nested = require("a/settings")\nreturn { root, nested }\n')
+	local result = f.call("project_inspect", { path = "Exact" })
+	check("both exact imports resolve", #result.data.edges == 2)
+	local targets = {}
+	for _, edge in ipairs(result.data.edges) do targets[edge.to] = true end
+	check("root module wins over colliding basename", targets["settings"] == true)
+	check("nested explicit module remains resolvable", targets["a/settings"] == true)
+	check("exact root import is not reported ambiguous", #result.data.ambiguousImports == 0)
+	f.close()
+end)
+
 suite.case("analysis reports syntax, missing imports and cycles without executing", function()
 	local f = fixture(); f.start()
 	f.write("Example/main.lua", '_G.projectWasExecuted = true\nlocal missing = require("missing")\nreturn missing')
@@ -207,7 +288,7 @@ end)
 suite.case("main and subagent prompts explain the project workflow and limits", function()
 	local f = fixture(); local prompt = f.env.require("agent/prompt")
 	for _, text in ipairs({ prompt.build(), prompt.subagent("Build a script") }) do
-		check("project workflow is present", text:find("project_scaffold", 1, true) and text:find("project_patch_read", 1, true) and text:find("script_test", 1, true))
+		check("project workflow is present", text:find("project_inspect", 1, true) and text:find("project_scaffold", 1, true) and text:find("project_patch_read", 1, true) and text:find("script_test", 1, true))
 		check("review and coverage limits are present", text:find("Review source changes before checks", 1, true) and text:find("not Luau type inference", 1, true) and text:find("shared native game state", 1, true))
 	end
 	f.close()
