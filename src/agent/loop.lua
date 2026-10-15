@@ -340,6 +340,19 @@ return function(env)
 			if summary then session.emit("compact", { summary = summary, before = before, after = ctx.tokens() }) end
 			request.messages = ctx.wire(systemText)
 
+			-- Avoid paying for a request whose estimated prompt alone would exhaust
+			-- the remaining task budget. Provider-reported usage below still wins
+			-- when estimates differ from the gateway's actual accounting.
+			local projectedPromptTokens = usage.estimateMessages(request.messages)
+				+ usage.estimateText(util.encode(request.tools or {}))
+			if taskTokensSpent() + projectedPromptTokens >= taskTokenLimit then
+				finalText = "I stopped before sending another model request because the estimated prompt would exhaust this task's cumulative token budget ("
+					.. tostring(taskTokenLimit) .. " tokens). Narrow the task or raise agent.maxTaskTokens."
+				session.emit("error", { message = "Task token budget would be exceeded by the next prompt.", fatal = false })
+				session.emit("status", { text = "Stopped at token budget" })
+				break
+			end
+
 			local result, err, usedRecord, accounting = complete(session, request, function(refusedRecord)
 				if session.aborted() then return false end
 				local prior = ctx.tokens()
