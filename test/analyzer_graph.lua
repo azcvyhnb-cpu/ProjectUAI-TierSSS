@@ -74,7 +74,7 @@ local large = module.update(module.new(), { nodes = largeNodes }, largeEntities)
 local elapsedMs = (os.clock() - started) * 1000
 check("large graph stays under the hard edge ceiling", large.edgeCount <= module.MAX_GRAPH_EDGES)
 check("large graph exposes partial coverage", large.truncated == true and large.omittedEdgesLowerBound >= 1)
-print(string.format("graph_benchmark\\tlarge\\tnodes=%d\\tedges=%d\\tlimit=%d\\ttruncated=%s\\tms=%.3f",
+print(string.format("graph_benchmark\tlarge\tnodes=%d\tedges=%d\tlimit=%d\ttruncated=%s\tms=%.3f",
     large.nodeCount, large.edgeCount, large.edgeLimit, tostring(large.truncated), elapsedMs))
 
 print(string.format("Analyzer graph: %d checks passed", passed))
