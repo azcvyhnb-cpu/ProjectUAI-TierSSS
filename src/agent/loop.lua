@@ -32,6 +32,24 @@ return function(env)
 		return text
 	end
 
+	local function retryExposureTotal()
+		local total = 0
+		for _, stats in pairs(usage.providerSnapshot()) do
+			total = total + (tonumber(stats.retryPromptExposure) or 0)
+		end
+		return total
+	end
+
+	local function sharedTaskTokensSpent(budget)
+		local current = tonumber(usage.session and usage.session.total) or budget.startTokens
+		return math.max(0, current - budget.startTokens)
+			+ math.max(0, retryExposureTotal() - budget.retryStartExposure)
+	end
+
+	local function taskTokensAvailable(budget)
+		return budget.limit - taskTokensSpent(budget) - math.max(0, tonumber(budget.reserved) or 0)
+	end
+
 	-- Canonicalise parsed argument objects before repeat detection. JSON key order and
 	-- insignificant whitespace must not let an identical tool batch evade the breaker.
 	local function canonicalValue(value, depth)
@@ -209,6 +227,12 @@ return function(env)
 				system = usage.estimateMessages(messages),
 				schema = 0,
 			}
+			local budget = session.taskBudget
+			local reserved = accounting.estimate
+			if budget then
+				if taskTokensAvailable(budget) <= reserved then return nil end
+				budget.reserved = math.max(0, tonumber(budget.reserved) or 0) + reserved
+			end
 			-- Compaction is a real model request too. Count it in session totals so
 			-- the task budget and usage panel do not silently omit summary traffic.
 			usage.observeRequest(record, record.model, accounting)
@@ -219,6 +243,7 @@ return function(env)
 				attempts = 1,
 				aborted = session.aborted,
 			})
+			if budget then budget.reserved = math.max(0, (tonumber(budget.reserved) or 0) - reserved) end
 			if result then
 				usage.record(result.usage, result.model or record.model, {
 					prompt = accounting.estimate,
@@ -266,23 +291,30 @@ return function(env)
 		-- Bound cumulative usage for this task, including nested agent calls and
 		-- estimated prompt exposure from retries. Unlimited turns must not mean
 		-- unlimited token spend.
-		local taskStartTokens = tonumber(usage.session and usage.session.total) or 0
-		local retryStartExposure = 0
-		for _, stats in pairs(usage.providerSnapshot()) do
-			retryStartExposure = retryStartExposure + (tonumber(stats.retryPromptExposure) or 0)
-		end
 		local taskTokenLimit = tonumber(config.get("agent.maxTaskTokens", 250000)) or 250000
 		if taskTokenLimit ~= taskTokenLimit or taskTokenLimit == math.huge or taskTokenLimit < 1 then
 			taskTokenLimit = 250000
 		end
 		taskTokenLimit = math.floor(taskTokenLimit)
+		-- A top-level send starts a fresh budget. Every delegated child inherits the
+		-- same ledger, so parallel/nested workers cannot each spend a separate full cap.
+		local taskBudget = session.taskBudget
+		if not session.taskBudgetShared or type(taskBudget) ~= "table" then
+			taskBudget = {
+				startTokens = tonumber(usage.session and usage.session.total) or 0,
+				retryStartExposure = retryExposureTotal(),
+				limit = taskTokenLimit,
+				reserved = 0,
+			}
+			session.taskBudget = taskBudget
+			session.taskBudgetShared = false
+		else
+			taskBudget.limit = math.min(tonumber(taskBudget.limit) or taskTokenLimit, taskTokenLimit)
+			taskBudget.reserved = math.max(0, tonumber(taskBudget.reserved) or 0)
+		end
+		taskTokenLimit = taskBudget.limit
 		local function taskTokensSpent()
-			local current = tonumber(usage.session and usage.session.total) or taskStartTokens
-			local retries = 0
-			for _, stats in pairs(usage.providerSnapshot()) do
-				retries = retries + (tonumber(stats.retryPromptExposure) or 0)
-			end
-			return math.max(0, current - taskStartTokens) + math.max(0, retries - retryStartExposure)
+			return sharedTaskTokensSpent(taskBudget)
 		end
 		ctx.pushUser(text, images)
 		session.emit("turn:start", { turns = unlimited and 0 or maxTurns, unlimited = unlimited })
@@ -362,7 +394,7 @@ return function(env)
 			-- when estimates differ from the gateway's actual accounting.
 			local projectedPromptTokens = usage.estimateMessages(request.messages)
 				+ usage.estimateText(util.encode(request.tools or {}))
-			if taskTokensSpent() + projectedPromptTokens >= taskTokenLimit then
+			if taskTokensAvailable(taskBudget) <= projectedPromptTokens then
 				finalText = "I stopped before sending another model request because the estimated prompt would exhaust this task's cumulative token budget ("
 					.. tostring(taskTokenLimit) .. " tokens). Narrow the task or raise agent.maxTaskTokens."
 				session.emit("error", { message = "Task token budget would be exceeded by the next prompt.", fatal = false })
@@ -370,6 +402,7 @@ return function(env)
 				break
 			end
 
+			taskBudget.reserved = math.max(0, tonumber(taskBudget.reserved) or 0) + projectedPromptTokens
 			local result, err, usedRecord, accounting = complete(session, request, function(refusedRecord)
 				if session.aborted() then return false end
 				local prior = ctx.tokens()
@@ -379,6 +412,7 @@ return function(env)
 				request.messages = ctx.wire(systemText)
 				return true
 			end)
+			taskBudget.reserved = math.max(0, (tonumber(taskBudget.reserved) or 0) - projectedPromptTokens)
 			record = usedRecord or record
 
 			if not result then
