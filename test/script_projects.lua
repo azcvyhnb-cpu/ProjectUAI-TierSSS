@@ -18,6 +18,28 @@ local function fixture()
 	return f
 end
 
+suite.case("lexical source cache reuses exact unchanged files and stays bounded", function()
+	local f = fixture()
+	local scanner = f.env.require("runtime/project_source")
+	scanner.clearCache()
+	local source = 'local settings = require("settings")\nfunction M.run() return true end\n'
+	local first = assert(scanner.scan(source, f.ctx))
+	first.symbols[1].name = "mutated by caller"
+	local second = assert(scanner.scan(source, f.ctx))
+	local stats = scanner.cacheStats()
+	check("repeated source is a cache hit", stats.hits == 1 and stats.misses == 1)
+	check("cached outlines are copied before returning", second.symbols[1].name ~= "mutated by caller")
+	local changed = assert(scanner.scan(source .. "-- changed\n", f.ctx))
+	check("changed bytes produce a new outline", changed.hash ~= second.hash and scanner.cacheStats().misses == 2)
+	local cancelled = { aborted = function() return true end }
+	check("cached results still honor cancellation", scanner.scan(source, cancelled) == nil)
+	for index = 1, 24 do assert(scanner.scan("local value" .. index .. " = " .. index .. "\\n", f.ctx)) end
+	stats = scanner.cacheStats()
+	check("cache entry count stays capped", stats.entries <= 16)
+	check("retained source bytes stay capped", stats.sourceBytes <= 512 * 1024)
+	f.close()
+end)
+
 suite.case("scaffold, map, review, apply, compile, build and test a complete project", function()
 	local f = fixture()
 	local staged = f.call("project_scaffold", { directory = "Example" })
