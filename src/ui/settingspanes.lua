@@ -1137,6 +1137,11 @@ return function(env)
 		local build = builder(container)
 
 		local agent = build.section("Agent", "How hard it works before it stops and answers.")
+		R.choice(agent, "Resource profile",
+			"Mobile Safe reduces parallel work, context size, output size and deadlines to limit memory pressure. Balanced is a moderate preset; Performance permits larger budgets and more concurrency. Selecting a preset replaces its listed Agent settings; changing one of those settings afterward switches the label to Custom.",
+			"agent.resourceProfile",
+			{ "custom", "mobile-safe", "balanced", "performance" },
+			{ "Custom", "Mobile Safe", "Balanced", "Performance" })
 		R.number(agent, "Step limit", "Tool rounds allowed in one turn, unless the switch below removes it.",
 			"agent.maxTurns", 4, 60, 1)
 		R.toggle(agent, {
