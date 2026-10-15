@@ -468,7 +468,11 @@ scenario("cumulative task token budget stops before dispatching more tools", fun
 	local last = session.ctx.messages[#session.ctx.messages]
 	check("an explicit not-run result preserves tool-call pairing", last and last.role, "tool")
 	contains("the transcript explains the budget stop", last and last.content, "reached its cumulative token budget")
-	contains("the turn reports that it stopped", session.log[#session.log] and session.log[#session.log].text, "token budget")
+	local turnEnd
+	for _, event in ipairs(session.log) do
+		if event.kind == "turn:end" then turnEnd = event; break end
+	end
+	contains("the turn reports that it stopped", turnEnd and turnEnd.text, "token budget")
 end)
 
 -- 7. Streaming -------------------------------------------------------------
