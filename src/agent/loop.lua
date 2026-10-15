@@ -199,16 +199,33 @@ return function(env)
 			local epoch = session.toolEpoch
 			local record = providers.active()
 			if not record then return nil end
+			local messages = {
+				{ role = "system", content = prompt.compaction() },
+				{ role = "user", content = transcript },
+			}
+			local accounting = {
+				history = 0,
+				estimate = usage.estimateMessages(messages),
+				system = usage.estimateMessages(messages),
+				schema = 0,
+			}
+			-- Compaction is a real model request too. Count it in session totals so
+			-- the task budget and usage panel do not silently omit summary traffic.
+			usage.observeRequest(record, record.model, accounting)
 			local result = chat.complete(record, { session = session,
-				messages = {
-					{ role = "system", content = prompt.compaction() },
-					{ role = "user", content = transcript },
-				},
+				messages = messages,
 				temperature = 0,
 				maxTokens = 512,
 				attempts = 1,
 				aborted = session.aborted,
 			})
+			if result then
+				usage.record(result.usage, result.model or record.model, {
+					prompt = accounting.estimate,
+					completion = usage.estimateText(result.content) + usage.estimateText(result.reasoning),
+					background = true,
+				}, record)
+			end
 			if session.toolEpoch ~= epoch or session.aborted() then return nil end
 			return result and result.content or nil
 		end
