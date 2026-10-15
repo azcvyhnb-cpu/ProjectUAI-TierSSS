@@ -47,7 +47,7 @@ return function(env)
 	end
 
 	local function taskTokensAvailable(budget)
-		return budget.limit - taskTokensSpent(budget) - math.max(0, tonumber(budget.reserved) or 0)
+		return budget.limit - sharedTaskTokensSpent(budget) - math.max(0, tonumber(budget.reserved) or 0)
 	end
 
 	-- Canonicalise parsed argument objects before repeat detection. JSON key order and
