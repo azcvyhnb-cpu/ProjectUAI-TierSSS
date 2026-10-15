@@ -5,6 +5,7 @@ return function(env)
 	local util = env.require("runtime/util")
 	local providers = env.require("provider/registry")
 	local chat = env.require("provider/chat")
+	local usage = env.require("agent/usage")
 	local H = env.require("tools/helpers")
 
 	local BASE_URL = "https://ai.thirx.com/v1"
@@ -31,17 +32,43 @@ return function(env)
 		return nil
 	end
 
-	local function ask(record, systemText, userText)
-		local result, err = chat.complete(record, {
-			messages = {
-				{ role = "system", content = systemText },
-				{ role = "user", content = userText },
-			},
+	local function ask(record, systemText, userText, ctx)
+		local messages = {
+			{ role = "system", content = systemText },
+			{ role = "user", content = userText },
+		}
+		local accounting = {
+			history = 0,
+			estimate = usage.estimateMessages(messages),
+			system = usage.estimateMessages(messages),
+			schema = 0,
+		}
+		local budget = ctx and ctx.session and ctx.session.taskBudget
+		-- Reserve the prompt estimate and reply ceiling before yielding. Both workers
+		-- share the same parent ledger, so a parallel collaboration cannot bypass the
+		-- task cap simply because its requests originate inside a tool.
+		local reservation = accounting.estimate + MAX_REPLY_TOKENS
+		if budget and not usage.reserveTaskBudget(budget, reservation) then
+			return nil, "task token budget leaves insufficient room for this collaboration request"
+		end
+		usage.observeRequest(record, record.model, accounting)
+		local ok, result, err = pcall(chat.complete, record, {
+			session = ctx and ctx.session,
+			aborted = ctx and ctx.aborted,
+			messages = messages,
 			stream = false,
 			temperature = 0.2,
 			maxTokens = MAX_REPLY_TOKENS,
 			timeout = REQUEST_TIMEOUT,
 		})
+		if not ok then err, result = result, nil end
+		-- This tool makes provider calls outside the main loop; record them explicitly
+		-- so the usage panel, per-provider diagnostics and shared task budget see them.
+		usage.record(result and result.usage or nil, result and (result.model or record.model) or record.model, {
+			prompt = accounting.estimate,
+			completion = result and (usage.estimateText(result.content) + usage.estimateText(result.reasoning)) or 0,
+		}, record)
+		if budget then usage.releaseTaskBudget(budget, reservation) end
 		if not result then return nil, tostring(err or "request failed") end
 		if type(result.toolCalls) == "table" and #result.toolCalls > 0 then
 			return nil, "model returned tool calls where a text report was required"
@@ -87,7 +114,7 @@ return function(env)
 				local pending = 2
 				local function launch(index, record, systemText)
 					task.spawn(function()
-						local ok, value, err = pcall(ask, record, systemText, taskText)
+						local ok, value, err = pcall(ask, record, systemText, taskText, ctx)
 						if ok and value then
 							outputs[index] = { model = record.model, text = value }
 						else
@@ -138,7 +165,7 @@ return function(env)
 			end
 			local synthesisPrompt = "You are the coordinator for a multi-model AI team. Synthesize the reports into one precise answer to the original task. Separate agreement from disagreement, resolve disagreements only when evidence supports it, preserve important caveats, and state explicitly if one model failed. Never claim external checks or tests were run unless a report contains evidence that they were. Output the answer directly."
 			local synthesis, synthesisError = ask(glm, synthesisPrompt,
-				"Original task:\n" .. taskText .. "\n\nIndependent reports:\n" .. table.concat(reports, "\n\n"))
+				"Original task:\n" .. taskText .. "\n\nIndependent reports:\n" .. table.concat(reports, "\n\n"), ctx)
 			if synthesis then return synthesis end
 			return "The coordinator request failed (" .. tostring(synthesisError) .. "). Returning independent reports without synthesis:\n\n" .. table.concat(reports, "\n\n")
 			end,
