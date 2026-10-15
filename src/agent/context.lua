@@ -309,7 +309,9 @@ return function(env)
 
 			local compactTranscript = table.concat(transcript, "\n")
 			if #compactTranscript > 12000 then
-				compactTranscript = util.truncate(compactTranscript, 12000,
+				-- util.truncate reserves space for a short marker; keep its input
+				-- ceiling below the public cap so the explanatory note fits too.
+				compactTranscript = util.truncate(compactTranscript, 11800,
 					"compaction transcript capped at 12000 characters; older details omitted")
 			end
 			local ok, note = pcall(summarise, compactTranscript)
