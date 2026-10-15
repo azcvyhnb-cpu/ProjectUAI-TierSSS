@@ -53,4 +53,28 @@ end
 check("truncated output is deterministic", signature(bounded) == signature(again))
 check("global hard ceiling is exposed", module.MAX_GRAPH_EDGES == 12000)
 
+-- Deterministic growth benchmark: many Wave/Enemy siblings create a large
+-- cross-product, which must stop at the hard edge ceiling rather than expanding
+-- quadratically without a bound. Time is reported for comparison, not asserted.
+local largeNodes, largeEntities = {
+    { id = "large-stage", name = "Stage", path = "Workspace/LargeStage" },
+}, { ["large-stage"] = { type = "Stage", confidence = .9 } }
+for i = 1, 200 do
+    local id = "large-wave-" .. i
+    largeNodes[#largeNodes + 1] = { id = id, name = id, path = "Workspace/LargeStage/" .. id, parentPath = "Workspace/LargeStage" }
+    largeEntities[id] = { type = "Wave", confidence = .8 }
+end
+for i = 1, 100 do
+    local id = "large-enemy-" .. i
+    largeNodes[#largeNodes + 1] = { id = id, name = id, path = "Workspace/LargeStage/" .. id, parentPath = "Workspace/LargeStage" }
+    largeEntities[id] = { type = "Enemy", confidence = .8 }
+end
+local started = os.clock()
+local large = module.update(module.new(), { nodes = largeNodes }, largeEntities)
+local elapsedMs = (os.clock() - started) * 1000
+check("large graph stays under the hard edge ceiling", large.edgeCount <= module.MAX_GRAPH_EDGES)
+check("large graph exposes partial coverage", large.truncated == true and large.omittedEdgesLowerBound >= 1)
+print(string.format("graph_benchmark\\tlarge\\tnodes=%d\\tedges=%d\\tlimit=%d\\ttruncated=%s\\tms=%.3f",
+    large.nodeCount, large.edgeCount, large.edgeLimit, tostring(large.truncated), elapsedMs))
+
 print(string.format("Analyzer graph: %d checks passed", passed))
