@@ -40,6 +40,24 @@ scenario("resource profiles apply coherent limits and manual tuning becomes Cust
 	check("unknown profiles are rejected without changing settings", profile == nil and err and config.get("agent.resourceProfile") == "performance")
 end)
 
+scenario("task usage is attributed to its own budget instead of other conversations", function()
+	local env = fixture()
+	local usage = env.require("agent/usage")
+	usage.reset()
+	local first = { spent = 0, retryExposure = 0, limit = 1000, reserved = 0 }
+	local second = { spent = 0, retryExposure = 0, limit = 1000, reserved = 0 }
+	local recordA = { id = "task-a", model = "fixture-a" }
+	local recordB = { id = "task-b", model = "fixture-b" }
+	usage.record({ prompt_tokens = 100, completion_tokens = 20 }, "fixture-a",
+		{ prompt = 100, completion = 20 }, recordA, first)
+	usage.record({ prompt_tokens = 50, completion_tokens = 5 }, "fixture-b",
+		{ prompt = 50, completion = 5 }, recordB, second)
+	check("each model response is charged to its own task", first.spent == 120 and second.spent == 55)
+	usage.observeRetry(recordA, "fixture-a", { history = 10, estimate = 5 }, "request timeout", first)
+	check("retry exposure is isolated to the originating task", first.retryExposure == 15 and second.retryExposure == 0)
+	check("budget totals exclude unrelated conversation usage", usage.taskBudgetSpent(first) == 135 and usage.taskBudgetSpent(second) == 55)
+end)
+
 scenario("trimming estimates each removed turn once instead of rescanning history", function()
 	local env, config, context = fixture()
 	local ctx = context.new()
