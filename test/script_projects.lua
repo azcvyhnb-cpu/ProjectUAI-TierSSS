@@ -182,6 +182,11 @@ suite.case("project inspection maps a source tree and its cross-file dependencie
 	f.write("Inspect/readme.txt", "not source")
 	local result = f.call("project_inspect", { path = "Inspect" })
 	check("directory inspection succeeds without manifest", result.ok and result.data.scannedFiles == 2)
+	check("cache counters are included in inspection metadata", result.data.cache and result.data.cache.entries >= 2)
+	local cacheHits = result.data.cache and result.data.cache.hits or 0
+	local repeated = f.call("project_inspect", { path = "Inspect" })
+	check("repeated inspection reuses unchanged source outlines", repeated.ok and repeated.data.cache
+		and repeated.data.cache.hits >= cacheHits + 2)
 	check("literal module path resolves across src prefix", #result.data.edges == 1 and result.data.edges[1].to == "src/settings")
 	check("incoming and outgoing relationships are returned", result.data.files[1].dependencies and #result.data.files[1].dependencies == 1)
 	check("unresolved and dynamic imports are distinct", #result.data.unresolved == 1 and #result.data.dynamicRequires == 1)
