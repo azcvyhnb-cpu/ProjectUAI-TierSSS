@@ -65,6 +65,9 @@ return function(env)
 		},
 		agent = {
 			maxTurns = 60,
+			-- Hard cap for cumulative prompt/completion tokens spent on one top-level task.
+			-- Prevents unlimited turns from running away on repeated map/source analysis.
+			maxTaskTokens = 250000,
 			-- Lifts the step limit and the turn deadline for the top-level
 			-- conversation, so a long job runs until the model answers in prose
 			-- instead of stopping mid-way with "I reached this session's step limit".
