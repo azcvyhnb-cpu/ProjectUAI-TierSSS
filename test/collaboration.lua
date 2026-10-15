@@ -99,6 +99,20 @@ do
 	f.close()
 end
 
+-- Stop is checked while the coordinator waits, and prevents a synthesis request.
+do
+	local f, tool, calls = configured("success")
+	local ctx = { aborted = function() return true end }
+	local result = f.run(function() return tool.run({ task = "Review this design." }, ctx) end, 1)
+	assert(type(result) == "table" and result.ok == false, "stopped collaboration returns a structured failure")
+	assert(result.text:find("cancelled", 1, true), "stop reason is reported")
+	for _, call in ipairs(calls) do
+		assert(not call.user:find("Independent reports", 1, true), "cancelled collaboration does not start synthesis")
+	end
+	f.healthy()
+	f.close()
+end)
+
 -- One model failure must not discard the other model's successful report.
 do
 	local f, tool, calls = configured("failure")
