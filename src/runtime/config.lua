@@ -338,12 +338,13 @@ return function(env)
 			if not opts.transient then M.save() end
 			return value
 		end
-		if path:sub(1, 6) == "agent." and PROFILE_KEYS[path:sub(7)]
-			and M.get("agent.resourceProfile", "custom") ~= "custom" then
-			util.set(M.data, "agent.resourceProfile", "custom")
-			if not opts.quiet then M.changed:fire("agent.resourceProfile", "custom") end
-		end
+		local profileChanged = path:sub(1, 6) == "agent." and PROFILE_KEYS[path:sub(7)]
+			and M.get("agent.resourceProfile", "custom") ~= "custom"
+		if profileChanged then util.set(M.data, "agent.resourceProfile", "custom") end
 		util.set(M.data, path, value)
+		-- Notify only after both fields are coherent so synchronous listeners never
+		-- render a Custom label alongside the old setting value.
+		if profileChanged and not opts.quiet then M.changed:fire("agent.resourceProfile", "custom") end
 		if not opts.quiet then M.changed:fire(path, value) end
 		if not opts.transient then M.save() end
 		return value
