@@ -447,9 +447,12 @@ scenario("tool calls in one turn run together", function()
 end)
 
 scenario("cumulative task token budget stops before dispatching more tools", function()
+	local requestedReplyCeiling
 	local harness, handle = bootWith({
 		handler = function(entry)
 			if not tostring(entry.url):find("/chat/completions") then return { StatusCode = 404, Body = "{}" } end
+			local sent = json.decode(entry.body or "{}")
+			requestedReplyCeiling = tonumber(sent.max_tokens or sent.max_completion_tokens)
 			local body = json.decode(chatBody({
 				toolCalls = { toolCall("budget_call", "game_info", {}) },
 			}))
@@ -467,6 +470,8 @@ scenario("cumulative task token budget stops before dispatching more tools", fun
 		if event.kind == "tool:result" then toolResults = toolResults + 1 end
 	end
 	check("the tool batch was not dispatched after the budget was spent", toolResults, 0)
+	truthy("the reply ceiling is limited by remaining task budget", requestedReplyCeiling ~= nil
+		and requestedReplyCeiling > 0 and requestedReplyCeiling < 100000, tostring(requestedReplyCeiling))
 	local last = session.ctx.messages[#session.ctx.messages]
 	check("an explicit not-run result preserves tool-call pairing", last and last.role, "tool")
 	contains("the transcript explains the budget stop", last and last.content, "reached its cumulative token budget")
