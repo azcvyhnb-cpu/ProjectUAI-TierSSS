@@ -307,7 +307,12 @@ return function(env)
 				transcript[#transcript + 1] = label .. ": " .. util.ellipsis(text, 700)
 			end
 
-			local ok, note = pcall(summarise, table.concat(transcript, "\n"))
+			local compactTranscript = table.concat(transcript, "\n")
+			if #compactTranscript > 12000 then
+				compactTranscript = util.truncate(compactTranscript, 12000,
+					"compaction transcript capped at 12000 characters; older details omitted")
+			end
+			local ok, note = pcall(summarise, compactTranscript)
 			if ok and type(note) == "string" and util.trim(note) ~= "" then
 				ctx.summary = util.trim(note)
 			elseif previousSummary ~= "" then
