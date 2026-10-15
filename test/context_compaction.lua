@@ -23,6 +23,23 @@ local function fixture()
 	return env, config, context
 end
 
+scenario("resource profiles apply coherent limits and manual tuning becomes Custom", function()
+	local _, config = fixture()
+	check("new installs start without overriding existing settings", config.get("agent.resourceProfile") == "custom")
+	config.set("agent.resourceProfile", "mobile-safe")
+	check("Mobile Safe bounds parallel tools", config.get("agent.toolConcurrency") == 2)
+	check("Mobile Safe bounds the subagent tree", config.get("agent.subagentConcurrency") == 2 and config.get("agent.subagentDepth") == 2)
+	check("Mobile Safe disables unlimited loops and requests", config.get("agent.unlimitedTurns") == false and config.get("agent.requestUnlimited") == false)
+	check("Mobile Safe uses a smaller task and context budget", config.get("agent.maxTaskTokens") == 100000 and config.get("agent.contextTokens") == 16000)
+	check("Mobile Safe bounds retained results", config.get("agent.resultCap") == 12000 and config.get("agent.maxTokens") == 8192)
+	config.set("agent.toolConcurrency", 3)
+	check("manual tuning marks the profile Custom", config.get("agent.resourceProfile") == "custom" and config.get("agent.toolConcurrency") == 3)
+	config.set("agent.resourceProfile", "performance")
+	check("Performance applies its explicit higher ceilings", config.get("agent.subagentConcurrency") == 8 and config.get("agent.maxTaskTokens") == 600000)
+	local profile, err = config.set("agent.resourceProfile", "unknown-profile")
+	check("unknown profiles are rejected without changing settings", profile == nil and err and config.get("agent.resourceProfile") == "performance")
+end)
+
 scenario("trimming estimates each removed turn once instead of rescanning history", function()
 	local env, config, context = fixture()
 	local ctx = context.new()
