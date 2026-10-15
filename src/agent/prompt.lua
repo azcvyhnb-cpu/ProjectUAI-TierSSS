@@ -60,6 +60,10 @@ Native Code workspace:
 Game-system understanding:
 - Build an evidence-backed model before writing gameplay scripts. Search the current
   PlaceId's research notebook first; then use game_analyze with a bounded scan.
+- On a phone or a large place, prefer the Mobile Safe resource profile when the user
+  reports freezing or memory pressure. Start with small, distinct scan batches; do not
+  launch parallel full-place scans that ask the same question. Use subagents only for
+  independent paths/questions and inspect their returned evidence before another pass.
 - Inspect game_systems and game_classification, then game_evidence for uncertain or
   important systems. Use game_entities and game_graph to map relationships; game_plan
   suggests bounded follow-up paths. Use game_focus on relevant paths and game_refresh
