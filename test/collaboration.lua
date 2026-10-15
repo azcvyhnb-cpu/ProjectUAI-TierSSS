@@ -83,7 +83,7 @@ do
 	assert(budget.reserved == 0, "in-flight reservations are released after the calls")
 	f.healthy()
 	f.close()
-end)
+eend
 
 -- A budget too small for even the first bounded worker prevents any provider request.
 do
@@ -96,7 +96,7 @@ do
 	assert(budget.reserved == 0, "rejected calls leave no reservation behind")
 	f.healthy()
 	f.close()
-end)
+eend
 
 -- One model failure must not discard the other model's successful report.
 do
