@@ -584,6 +584,14 @@ return function(env)
 			-- Keep the provider's stream setting: buffered HTTP can carry reasoning and
 			-- usage metadata, while a compatible socket can also deliver live previews.
 		})
+		-- Share the parent task's budget ledger across every nested worker. A
+		-- separate per-child cap lets a parallel batch multiply total spend by the
+		-- concurrency limit, which defeats the top-level guard on large game scans.
+		if record.parent and type(record.parent.taskBudget) == "table" then
+			child.taskBudget = record.parent.taskBudget
+			child.taskBudgetShared = true
+		end
+
 		-- The record is what the Subagents panel reads, so it is kept whether or not
 		-- there is a parent transcript to narrate into. The wiring below is therefore
 		-- unconditional; only the forwarding inside it is not.
