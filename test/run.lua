@@ -4732,6 +4732,8 @@ scenario("a dispatch is registered, watched and stopped", function()
 	contains("labelled with its task", record.label, "sweep the place")
 	check("marked as running", record.status, "running")
 	check("attributed to the conversation that asked", record.parentTitle, session.title)
+	truthy("the child shares the parent's cumulative token budget", record.session.taskBudget ~= nil
+		and record.session.taskBudget == session.taskBudget and record.session.taskBudgetShared == true)
 	truthy("with the tools it has called", #record.tools > 0, tostring(#record.tools))
 
 	-- The panel is the register, drawn.
