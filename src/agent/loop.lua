@@ -228,7 +228,7 @@ return function(env)
 				schema = 0,
 			}
 			local budget = session.taskBudget
-			local reserved = accounting.estimate
+			local reserved = accounting.estimate + 512
 			if budget then
 				if taskTokensAvailable(budget) <= reserved then return nil end
 				budget.reserved = math.max(0, tonumber(budget.reserved) or 0) + reserved
@@ -389,20 +389,27 @@ return function(env)
 			if summary then session.emit("compact", { summary = summary, before = before, after = ctx.tokens() }) end
 			request.messages = ctx.wire(systemText)
 
-			-- Avoid paying for a request whose estimated prompt alone would exhaust
-			-- the remaining task budget. Provider-reported usage below still wins
-			-- when estimates differ from the gateway's actual accounting.
+			-- Reserve both the prompt and the reply ceiling before dispatch. This
+			-- keeps concurrent subagents from all seeing the same balance and then each
+			-- producing a large completion that multiplies the task budget.
 			local projectedPromptTokens = usage.estimateMessages(request.messages)
 				+ usage.estimateText(util.encode(request.tools or {}))
-			if taskTokensAvailable(taskBudget) <= projectedPromptTokens then
+			local available = taskTokensAvailable(taskBudget)
+			local configuredReplyLimit = tonumber(config.get("agent.maxTokens", 128000)) or 128000
+			if configuredReplyLimit ~= configuredReplyLimit or configuredReplyLimit == math.huge or configuredReplyLimit < 1 then
+				configuredReplyLimit = 128000
+			end
+			local outputCeiling = math.floor(math.min(configuredReplyLimit, available - projectedPromptTokens))
+			if available <= projectedPromptTokens or outputCeiling < 1 then
 				finalText = "I stopped before sending another model request because the estimated prompt would exhaust this task's cumulative token budget ("
 					.. tostring(taskTokenLimit) .. " tokens). Narrow the task or raise agent.maxTaskTokens."
 				session.emit("error", { message = "Task token budget would be exceeded by the next prompt.", fatal = false })
 				session.emit("status", { text = "Stopped at token budget" })
 				break
 			end
-
-			taskBudget.reserved = math.max(0, tonumber(taskBudget.reserved) or 0) + projectedPromptTokens
+			request.maxTokens = outputCeiling
+			local reservation = projectedPromptTokens + outputCeiling
+			taskBudget.reserved = math.max(0, tonumber(taskBudget.reserved) or 0) + reservation
 			local result, err, usedRecord, accounting = complete(session, request, function(refusedRecord)
 				if session.aborted() then return false end
 				local prior = ctx.tokens()
@@ -412,7 +419,7 @@ return function(env)
 				request.messages = ctx.wire(systemText)
 				return true
 			end)
-			taskBudget.reserved = math.max(0, (tonumber(taskBudget.reserved) or 0) - projectedPromptTokens)
+			taskBudget.reserved = math.max(0, (tonumber(taskBudget.reserved) or 0) - reservation)
 			record = usedRecord or record
 
 			if not result then
