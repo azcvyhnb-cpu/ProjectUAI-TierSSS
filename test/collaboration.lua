@@ -73,7 +73,7 @@ end
 do
 	local f, tool, calls = configured("success")
 	local usage = f.env.require("agent/usage")
-	local budget = { startTokens = 0, retryStartExposure = 0, limit = 200000, reserved = 0 }
+	local budget = { startTokens = 0, retryStartExposure = 0, spent = 0, retryExposure = 0, limit = 200000, reserved = 0 }
 	local ctx = { session = { taskBudget = budget }, aborted = function() return false end }
 	local result = f.run(function() return tool.run({ task = "Review this design." }, ctx) end, 1)
 	assert(type(result) == "string" and #calls == 3, "budgeted collaboration still runs all three requests")
@@ -88,7 +88,7 @@ end
 -- A budget too small for even the first bounded worker prevents any provider request.
 do
 	local f, tool, calls = configured("success")
-	local budget = { startTokens = 0, retryStartExposure = 0, limit = 100, reserved = 0 }
+	local budget = { startTokens = 0, retryStartExposure = 0, spent = 0, retryExposure = 0, limit = 100, reserved = 0 }
 	local ctx = { session = { taskBudget = budget }, aborted = function() return false end }
 	local result = f.run(function() return tool.run({ task = "Review this design." }, ctx) end, 1)
 	assert(type(result) == "table" and result.ok == false, "insufficient budget is returned as a tool failure")
