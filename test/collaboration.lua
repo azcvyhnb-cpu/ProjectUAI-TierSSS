@@ -80,6 +80,7 @@ do
 	assert(usage.session.requests == 3 and usage.session.total > 0, "worker and synthesis token usage is counted")
 	assert(usage.providerSnapshot()["thirx|GLM-5.3-Flash"] ~= nil, "GLM usage is attributed to its model")
 	assert(usage.providerSnapshot()["thirx|deepseek-v4-flash"] ~= nil, "DeepSeek usage is attributed to its model")
+	assert(budget.spent == usage.session.total, "all collaboration tokens are charged to the task ledger")
 	assert(budget.reserved == 0, "in-flight reservations are released after the calls")
 	f.healthy()
 	f.close()
