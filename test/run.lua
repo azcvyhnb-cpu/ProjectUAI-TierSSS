@@ -2003,6 +2003,9 @@ scenario("the new agent switches are reachable from Settings", function()
 	contains("and it says what still stops one", shown, "Stop still apply")
 
 	local config = handle.config
+	contains("the cumulative token budget is visible", shown, "Task token budget")
+	truthy("the task budget has its own slider", harness.byName("Slider_agent.maxTaskTokens") ~= nil)
+	check("the task budget defaults to 250000 tokens", config.get("agent.maxTaskTokens"), 250000)
 	check("the switch ships on", config.get("agent.unlimitedTurns"), true)
 	config.set("agent.unlimitedTurns", false)
 	check("and persists when turned off", config.get("agent.unlimitedTurns"), false)
