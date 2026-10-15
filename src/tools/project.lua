@@ -116,6 +116,7 @@ return function(env)
 				unresolved = unresolved, ambiguousImports = ambiguousImports, dynamicRequires = dynamic, scannedFiles = #rows, sourceFiles = #selected,
 				omittedFiles = omittedFiles, inspectionErrors = inspectionErrors, skippedNonSourceFiles = skipped, sourceBytes = totalBytes,
 				limits = { maxFiles = maxFiles, maxBytes = 1024 * 1024, maxFileBytes = source.MAX_FILE },
+				cache = source.cacheStats and source.cacheStats() or nil,
 				coverage = "Lexical dependency map only; dynamic requires and modules outside this directory may not resolve; no type or runtime analysis." },
 				string.format("Inspected %d source file(s), %d dependency edge(s), %d unresolved, %d ambiguous and %d dynamic require(s); inventory %s.", #rows, #edges, #unresolved, #ambiguousImports, #dynamic, complete and "complete" or "partial"))
 		end)
