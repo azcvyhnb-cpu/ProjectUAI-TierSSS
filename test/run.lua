@@ -2003,6 +2003,8 @@ scenario("the new agent switches are reachable from Settings", function()
 	contains("and it says what still stops one", shown, "Stop still apply")
 
 	local config = handle.config
+	contains("the resource profile selector is visible", shown, "Resource profile")
+	truthy("resource presets have their own selector", harness.byName("Slider_agent.resourceProfile") ~= nil)
 	contains("the cumulative token budget is visible", shown, "Task token budget")
 	truthy("the task budget has its own slider", harness.byName("Slider_agent.maxTaskTokens") ~= nil)
 	check("the task budget defaults to 250000 tokens", config.get("agent.maxTaskTokens"), 250000)
